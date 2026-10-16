@@ -194,6 +194,19 @@ mod section_7_2 {
         resolver.handle_timeout(resolver.poll_timeout().unwrap());
         assert_eq!(resolver.poll_transmit().unwrap().payload, first.payload);
     }
+
+    #[test]
+    fn timeout_too_large_for_instant_waits_forever() {
+        let mut config = sansio_dns::Config::new(S1, []);
+        config.timeout = std::time::Duration::MAX;
+        let mut r = Resolver::new(config);
+        let now = Instant::now();
+        let sent = start(&mut r, now);
+
+        assert_eq!(r.poll_timeout(), None);
+        r.handle_datagram(S1, &encode(&reply(&sent)), now);
+        assert!(is_response(r.poll_event()));
+    }
 }
 
 /// §7.3: a datagram that isn't a reply to our query is discarded.

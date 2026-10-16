@@ -42,7 +42,8 @@ const EDNS_PAYLOAD: u16 = 1232;
 pub struct Config {
     /// Name servers, tried in order and rotated on each retry. Never empty.
     servers: Vec<SocketAddr>,
-    /// How long to wait for a response before retrying.
+    /// How long to wait for a response before retrying. A value too large
+    /// to add to an `Instant`, such as `Duration::MAX`, means wait forever.
     pub timeout: Duration,
     /// Total number of datagrams sent per query, across all servers.
     pub attempts: NonZeroUsize,
@@ -131,7 +132,8 @@ struct Pending {
     payload: Vec<u8>,
     attempt: usize,
     server: SocketAddr,
-    deadline: Instant,
+    /// `None` if `now + timeout` overflows: the query then waits forever.
+    deadline: Option<Instant>,
 }
 
 /// The resolver state machine. See the crate docs for how to drive it.
@@ -185,7 +187,7 @@ impl Resolver {
                 payload: payload.clone(),
                 attempt: 0,
                 server,
-                deadline: now + self.config.timeout,
+                deadline: now.checked_add(self.config.timeout),
             },
         );
         self.transmits.push_back(Transmit {
@@ -250,7 +252,7 @@ impl Resolver {
         let expired: Vec<QueryId> = self
             .pending
             .iter()
-            .filter(|(_, p)| p.deadline <= now)
+            .filter(|(_, p)| p.deadline.is_some_and(|d| d <= now))
             .map(|(id, _)| *id)
             .collect();
         for id in expired {
@@ -265,7 +267,7 @@ impl Resolver {
 
     /// Earliest instant at which [`Resolver::handle_timeout`] must be called.
     pub fn poll_timeout(&self) -> Option<Instant> {
-        self.pending.values().map(|p| p.deadline).min()
+        self.pending.values().filter_map(|p| p.deadline).min()
     }
 
     /// Next completed query, if any.
@@ -289,7 +291,7 @@ impl Resolver {
             return;
         }
         pending.server = self.config.server(pending.attempt);
-        pending.deadline = now + self.config.timeout;
+        pending.deadline = now.checked_add(self.config.timeout);
         self.transmits.push_back(Transmit {
             query: id,
             destination: pending.server,
@@ -312,7 +314,7 @@ impl Resolver {
             return;
         };
         pending.payload = payload;
-        pending.deadline = now + self.config.timeout;
+        pending.deadline = now.checked_add(self.config.timeout);
         self.transmits.push_back(Transmit {
             query: id,
             destination: pending.server,
