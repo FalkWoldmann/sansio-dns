@@ -17,7 +17,7 @@ pub const ADDR: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 7);
 
 #[fixture]
 pub fn resolver() -> Resolver {
-    Resolver::new(Config::new(vec![S1, S2]))
+    Resolver::new(Config::new(S1, [S2]))
 }
 
 /// Start an `example.com. A` lookup and return the first datagram.

@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = args.next().unwrap_or("1.1.1.1:53".into()).parse()?;
 
     let socket = UdpSocket::bind("0.0.0.0:0")?;
-    let mut resolver = Resolver::new(Config::new(vec![server]));
+    let mut resolver = Resolver::new(Config::new(server, []));
     resolver.query(name, RecordType::A, Instant::now())?;
 
     let mut buf = [0; 1232];

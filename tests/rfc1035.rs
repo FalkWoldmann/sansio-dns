@@ -114,10 +114,9 @@ mod section_4_1_1 {
     fn last_server_rcode_is_reported(
         #[values(ResponseCode::ServFail, ResponseCode::Refused)] code: ResponseCode,
     ) {
-        let mut r = Resolver::new(sansio_dns::Config {
-            attempts: 1,
-            ..sansio_dns::Config::new(vec![S1])
-        });
+        let mut config = sansio_dns::Config::new(S1, []);
+        config.attempts = std::num::NonZeroUsize::MIN;
+        let mut r = Resolver::new(config);
         let now = Instant::now();
         let sent = start(&mut r, now);
 

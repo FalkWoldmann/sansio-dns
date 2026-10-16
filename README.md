@@ -5,7 +5,7 @@ It owns no sockets, timers or tasks, so the same state machine runs on blocking 
 Tokio, compio, or an embedded event loop.
 
 ```rust
-let mut resolver = Resolver::new(Config::new(vec!["1.1.1.1:53".parse()?]));
+let mut resolver = Resolver::new(Config::new("1.1.1.1:53".parse()?, []));
 resolver.query(Name::from_ascii("example.com")?, RecordType::A, Instant::now())?;
 
 loop {

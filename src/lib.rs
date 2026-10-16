@@ -26,6 +26,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 pub use hickory_proto;
@@ -39,18 +40,19 @@ const EDNS_PAYLOAD: u16 = 1232;
 /// Resolver settings.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Name servers, tried in order and rotated on each retry.
-    pub servers: Vec<SocketAddr>,
+    /// Name servers, tried in order and rotated on each retry. Never empty.
+    servers: Vec<SocketAddr>,
     /// How long to wait for a response before retrying.
     pub timeout: Duration,
     /// Total number of datagrams sent per query, across all servers.
-    pub attempts: usize,
+    pub attempts: NonZeroUsize,
 }
 
 impl Config {
-    /// Two attempts per server, two seconds each.
-    pub fn new(servers: Vec<SocketAddr>) -> Self {
-        let attempts = servers.len() * 2;
+    /// `first` and then `more`, two attempts per server, two seconds each.
+    pub fn new(first: SocketAddr, more: impl IntoIterator<Item = SocketAddr>) -> Self {
+        let servers: Vec<SocketAddr> = std::iter::once(first).chain(more).collect();
+        let attempts = NonZeroUsize::new(servers.len() * 2).expect("at least one server");
         Self {
             servers,
             timeout: Duration::from_secs(2),
@@ -123,12 +125,7 @@ pub struct Resolver {
 }
 
 impl Resolver {
-    /// # Panics
-    ///
-    /// If `config.servers` is empty or `config.attempts` is zero.
     pub fn new(config: Config) -> Self {
-        assert!(!config.servers.is_empty(), "no name servers configured");
-        assert!(config.attempts > 0, "attempts must be at least 1");
         Self {
             config,
             next_query: 0,
@@ -266,7 +263,7 @@ impl Resolver {
             return;
         };
         pending.attempt += 1;
-        if pending.attempt >= self.config.attempts {
+        if pending.attempt >= self.config.attempts.get() {
             self.fail(id, error);
             return;
         }
