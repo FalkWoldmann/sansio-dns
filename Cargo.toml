@@ -48,6 +48,7 @@ proptest = "1"
 rstest.workspace = true
 tokio = { workspace = true, features = ["net", "time", "rt", "macros", "io-util"] }
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+insta = "1"
 
 # Adapted from https://github.com/otto-de/rust-ecosystem (lints.toml), trimmed
 # for a sans-IO library: no async or web lints; documentation lints added.

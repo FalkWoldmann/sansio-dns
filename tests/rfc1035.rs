@@ -6,7 +6,8 @@ use std::time::Instant;
 use crate::common::*;
 use hickory_proto::op::{MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::A;
-use hickory_proto::rr::{Name, RData};
+use hickory_proto::rr::{Name, RData, RecordType};
+use insta::assert_snapshot;
 use proptest::prelude::*;
 use rstest::rstest;
 use sansio_dns::{Error, Event, Resolver};
@@ -96,17 +97,27 @@ mod section_4_1_1 {
     #[case::server_failure(ResponseCode::ServFail)]
     #[case::not_implemented(ResponseCode::NotImp)]
     #[case::refused(ResponseCode::Refused)]
-    fn server_rcodes_fail_over(mut resolver: Resolver, #[case] code: ResponseCode) {
-        let now = Instant::now();
-        let sent = start(&mut resolver, now);
+    fn server_rcodes_fail_over(mut trace: Trace, #[case] code: ResponseCode) {
+        trace.query("example.com.", RecordType::A);
+        let sent = trace.last();
+        trace.answer(&sent, &with_code(reply(&sent), code));
+        let retry = trace.last();
+        trace.answer(&retry, &reply(&retry));
 
-        resolver.handle_datagram(udp(&sent), S1, &encode(&with_code(reply(&sent), code)), now);
-
-        assert!(resolver.poll_event().is_none());
-        let retry = resolver.poll_transmit().unwrap();
-        assert_eq!(retry.destination, S2);
-        resolver.handle_datagram(udp(&retry), S2, &encode(&reply(&retry)), now);
-        assert!(is_response(resolver.poll_event()));
+        let trace = trace.to_string().replace(&format!("{code:?}"), "<code>");
+        insta::allow_duplicates! {
+            assert_snapshot!(trace, @"
+            t=0s query q0 example.com. A
+              -> S1 udp q0: example.com. A
+              next t=2s
+            t=0s <- S1 udp q0: example.com. A: <code>, 0 answers
+              -> S2 udp q0: example.com. A
+              next t=2s
+            t=0s <- S2 udp q0: example.com. A: NoError, 1 answer
+              => q0 Response example.com. A: NoError, 1 answer
+              next none
+            ");
+        }
     }
 
     #[rstest]
@@ -134,16 +145,20 @@ mod section_4_2_1 {
     use super::*;
 
     #[rstest]
-    fn truncated_response_is_retried_over_tcp(mut resolver: Resolver) {
-        let now = Instant::now();
-        let sent = start(&mut resolver, now);
-        let mut response = reply(&sent);
-        response.metadata.truncation = true;
+    fn truncated_response_is_retried_over_tcp(mut trace: Trace) {
+        trace.query("example.com.", RecordType::A);
+        let sent = trace.last();
 
-        resolver.handle_datagram(udp(&sent), S1, &encode(&response), now);
+        trace.answer(&sent, &truncated(reply(&sent)));
 
-        assert!(resolver.poll_event().is_none());
-        assert!(is_connect(&resolver.poll_transmit().unwrap()));
+        assert_snapshot!(trace, @"
+        t=0s query q0 example.com. A
+          -> S1 udp q0: example.com. A
+          next t=2s
+        t=0s <- S1 udp q0: example.com. A: NoError, 1 answer, TC
+          -> S1 connect c0: example.com. A
+          next t=2s
+        ");
     }
 }
 
@@ -152,25 +167,28 @@ mod section_7_2 {
     use super::*;
 
     #[rstest]
-    fn timeouts_rotate_servers_then_fail(mut resolver: Resolver) {
-        let mut now = Instant::now();
-        start(&mut resolver, now);
+    fn timeouts_rotate_servers_then_fail(mut trace: Trace) {
+        trace.query("example.com.", RecordType::A);
 
-        let destinations: Vec<_> = std::iter::from_fn(|| {
-            now = resolver.poll_timeout()?;
-            resolver.handle_timeout(now);
-            resolver.poll_transmit().map(|t| t.destination)
-        })
-        .collect();
+        trace.timeouts();
 
-        assert_eq!(destinations, [S2, S1, S2]);
-        assert_matches!(
-            resolver.poll_event(),
-            Some(Event::Failed {
-                error: Error::Timeout,
-                ..
-            })
-        );
+        assert_snapshot!(trace, @"
+        t=0s query q0 example.com. A
+          -> S1 udp q0: example.com. A
+          next t=2s
+        t=2s timeout
+          -> S2 udp q0: example.com. A
+          next t=4s
+        t=4s timeout
+          -> S1 udp q0: example.com. A
+          next t=6s
+        t=6s timeout
+          -> S2 udp q0: example.com. A
+          next t=8s
+        t=8s timeout
+          => q0 Failed Timeout
+          next none
+        ");
     }
 
     #[rstest]

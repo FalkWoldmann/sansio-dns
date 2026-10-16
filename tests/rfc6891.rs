@@ -5,6 +5,8 @@ use std::time::Instant;
 
 use crate::common::*;
 use hickory_proto::op::ResponseCode;
+use hickory_proto::rr::RecordType;
+use insta::assert_snapshot;
 use rstest::rstest;
 use sansio_dns::Resolver;
 
@@ -29,57 +31,73 @@ mod section_7 {
     use super::*;
 
     #[rstest]
-    fn formerr_without_opt_retries_same_server_without_edns(mut resolver: Resolver) {
-        let now = Instant::now();
-        let sent = start(&mut resolver, now);
+    fn formerr_without_opt_retries_same_server_without_edns(mut trace: Trace) {
+        trace.query("example.com.", RecordType::A);
+        let sent = trace.last();
         let mut response = with_code(reply(&sent), ResponseCode::FormErr);
         response.edns = None;
 
-        resolver.handle_datagram(udp(&sent), S1, &encode(&response), now);
+        trace.answer(&sent, &response);
+        let retry = trace.last();
+        trace.answer(&retry, &reply(&retry));
 
-        let retry = resolver.poll_transmit().unwrap();
-        assert_eq!(retry.destination, S1);
-        assert!(decode(&retry).edns.is_none());
         assert_eq!(decode(&retry).metadata.id, decode(&sent).metadata.id);
-        resolver.handle_datagram(udp(&retry), S1, &encode(&reply(&retry)), now);
-        assert!(is_response(resolver.poll_event()));
+        assert_snapshot!(trace, @"
+        t=0s query q0 example.com. A
+          -> S1 udp q0: example.com. A
+          next t=2s
+        t=0s <- S1 udp q0: example.com. A: FormErr, 0 answers, no EDNS
+          -> S1 udp q0: example.com. A, no EDNS
+          next t=2s
+        t=0s <- S1 udp q0: example.com. A: NoError, 1 answer, no EDNS
+          => q0 Response example.com. A: NoError, 1 answer, no EDNS
+          next none
+        ");
     }
 
     #[rstest]
-    fn formerr_with_opt_fails_over(mut resolver: Resolver) {
-        let now = Instant::now();
-        let sent = start(&mut resolver, now);
+    fn formerr_with_opt_fails_over(mut trace: Trace) {
+        trace.query("example.com.", RecordType::A);
+        let sent = trace.last();
 
-        resolver.handle_datagram(
-            udp(&sent),
-            S1,
-            &encode(&with_code(reply(&sent), ResponseCode::FormErr)),
-            now,
-        );
+        trace.answer(&sent, &with_code(reply(&sent), ResponseCode::FormErr));
 
-        let retry = resolver.poll_transmit().unwrap();
-        assert_eq!(retry.destination, S2);
-        assert!(decode(&retry).edns.is_some());
+        assert_snapshot!(trace, @"
+        t=0s query q0 example.com. A
+          -> S1 udp q0: example.com. A
+          next t=2s
+        t=0s <- S1 udp q0: example.com. A: FormErr, 0 answers
+          -> S2 udp q0: example.com. A
+          next t=2s
+        ");
     }
 
     /// The downgrade happens once; FORMERR to the plain query is final for
     /// that server, so a broken server can't keep the query alive forever.
     #[rstest]
-    fn edns_is_dropped_only_once(mut resolver: Resolver) {
-        let now = Instant::now();
-        let mut sent = start(&mut resolver, now);
-        let mut destinations = Vec::new();
+    fn edns_is_dropped_only_once(mut trace: Trace) {
+        trace.query("example.com.", RecordType::A);
+
         for _ in 0..3 {
+            let sent = trace.last();
             let mut response = with_code(reply(&sent), ResponseCode::FormErr);
             response.edns = None;
-            resolver.handle_datagram(udp(&sent), sent.destination, &encode(&response), now);
-            let Some(next) = resolver.poll_transmit() else {
-                break;
-            };
-            destinations.push(next.destination);
-            sent = next;
+            trace.answer(&sent, &response);
         }
 
-        assert_eq!(destinations, [S1, S2, S1]);
+        assert_snapshot!(trace, @"
+        t=0s query q0 example.com. A
+          -> S1 udp q0: example.com. A
+          next t=2s
+        t=0s <- S1 udp q0: example.com. A: FormErr, 0 answers, no EDNS
+          -> S1 udp q0: example.com. A, no EDNS
+          next t=2s
+        t=0s <- S1 udp q0: example.com. A: FormErr, 0 answers, no EDNS
+          -> S2 udp q0: example.com. A, no EDNS
+          next t=2s
+        t=0s <- S2 udp q0: example.com. A: FormErr, 0 answers, no EDNS
+          -> S1 udp q0: example.com. A, no EDNS
+          next t=2s
+        ");
     }
 }

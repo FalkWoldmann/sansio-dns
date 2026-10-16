@@ -1,10 +1,13 @@
-//! Shared fixtures: two fake name servers and a reply builder.
+//! Shared fixtures: two fake name servers, a reply builder, and a trace of
+//! a resolver's inputs and outputs for snapshots.
 
+use std::fmt;
+use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use hickory_proto::op::{Message, ResponseCode};
+use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use rstest::fixture;
@@ -97,6 +100,11 @@ pub fn reply_to(request: &Message) -> Message {
     response
 }
 
+pub fn truncated(mut response: Message) -> Message {
+    response.metadata.truncation = true;
+    response
+}
+
 pub fn with_code(mut response: Message, code: ResponseCode) -> Message {
     response.metadata.response_code = code;
     if code != ResponseCode::NoError {
@@ -111,4 +119,238 @@ pub fn encode(message: &Message) -> Vec<u8> {
 
 pub fn is_response(event: Option<Event>) -> bool {
     event.is_some_and(|e| matches!(e, Event::Response { .. }))
+}
+
+#[fixture]
+pub fn trace(resolver: Resolver) -> Trace {
+    Trace::new(resolver)
+}
+
+/// A resolver driven by a test, recording what goes in and what comes out
+/// as text: queries and connections as `q0` and `c0` in order of first
+/// appearance, servers as `S1` and `S2`, times relative to the start. Each
+/// input line is followed by the events it caused (`=>`), then the
+/// transmits (`->`), then the next deadline (`next`). The resolver keeps
+/// events and transmits in separate queues, so that order says nothing
+/// about which came first within one input.
+#[derive(Debug)]
+pub struct Trace {
+    resolver: Resolver,
+    start: Instant,
+    now: Instant,
+    queries: Vec<QueryId>,
+    connections: Vec<ConnectionId>,
+    sent: Vec<Transmit>,
+    events: Vec<Event>,
+    lines: Vec<String>,
+}
+
+impl Trace {
+    pub fn new(resolver: Resolver) -> Self {
+        let start = Instant::now();
+        Self {
+            resolver,
+            start,
+            now: start,
+            queries: Vec::new(),
+            connections: Vec::new(),
+            sent: Vec::new(),
+            events: Vec::new(),
+            lines: Vec::new(),
+        }
+    }
+
+    /// Set the clock to `offset` after the start, for the inputs that follow.
+    pub fn at(&mut self, offset: Duration) {
+        self.now = self.start + offset;
+    }
+
+    pub fn query(&mut self, name: &str, record_type: RecordType) -> QueryId {
+        let name = Name::from_ascii(name).unwrap();
+        let id = self
+            .resolver
+            .query(name.clone(), record_type, self.now)
+            .unwrap();
+        let line = format!(
+            "query {} {} {record_type}",
+            self.query_name(id),
+            name.to_ascii()
+        );
+        self.record(&line);
+        id
+    }
+
+    /// Answer `to` with `response`: as a datagram from its destination to
+    /// its query's socket, or as bytes on its connection.
+    pub fn answer(&mut self, to: &Transmit, response: &Message) {
+        let bytes = encode(response);
+        let via = if let Transport::Udp(query) = to.transport {
+            self.resolver
+                .handle_datagram(query, to.destination, &bytes, self.now);
+            format!("udp {}", self.query_name(query))
+        } else {
+            self.resolver
+                .handle_stream_data(conn(to), &frame(&bytes), self.now);
+            self.conn_name(conn(to))
+        };
+        let line = format!(
+            "<- {} {via}: {}",
+            server(to.destination),
+            describe(response)
+        );
+        self.record(&line);
+    }
+
+    /// The server closed the connection `on` was sent over.
+    pub fn close(&mut self, on: &Transmit) {
+        self.resolver.handle_stream_closed(conn(on), self.now);
+        let line = format!("{} closed", self.conn_name(conn(on)));
+        self.record(&line);
+    }
+
+    pub fn error(&mut self, on: &Transmit, error: ErrorKind) {
+        self.resolver.handle_stream_error(conn(on), error, self.now);
+        let line = format!("{} error {error:?}", self.conn_name(conn(on)));
+        self.record(&line);
+    }
+
+    pub fn cancel(&mut self, query: QueryId) {
+        self.resolver.cancel(query, self.now);
+        let line = format!("cancel {}", self.query_name(query));
+        self.record(&line);
+    }
+
+    /// Move the clock to the next deadline and handle it.
+    pub fn timeout(&mut self) {
+        let deadline = self.resolver.poll_timeout().unwrap();
+        self.timeout_at(deadline.duration_since(self.start));
+    }
+
+    pub fn timeout_at(&mut self, offset: Duration) {
+        self.at(offset);
+        self.resolver.handle_timeout(self.now);
+        self.record("timeout");
+    }
+
+    /// Handle every deadline in turn until none is left.
+    pub fn timeouts(&mut self) {
+        for _ in 0..100 {
+            if self.resolver.poll_timeout().is_none() {
+                return;
+            }
+            self.timeout();
+        }
+        panic!("deadlines never ran out:\n{self}");
+    }
+
+    /// What the latest input sent.
+    pub fn sent(&self) -> &[Transmit] {
+        &self.sent
+    }
+
+    /// The last DNS message the latest input sent.
+    pub fn last(&self) -> Transmit {
+        self.sent
+            .iter()
+            .rfind(|t| !matches!(t.transport, Transport::TcpClose(_)))
+            .cloned()
+            .unwrap_or_else(|| panic!("nothing sent:\n{self}"))
+    }
+
+    /// Every event so far.
+    pub fn events(&self) -> &[Event] {
+        &self.events
+    }
+
+    fn record(&mut self, input: &str) {
+        let t = self.now.duration_since(self.start).as_secs_f64();
+        self.lines.push(format!("t={t}s {input}"));
+        while let Some(event) = self.resolver.poll_event() {
+            let line = match &event {
+                Event::Response { query, response } => {
+                    format!(
+                        "  => {} Response {}",
+                        self.query_name(*query),
+                        describe(response)
+                    )
+                }
+                Event::Failed { query, error } => {
+                    format!("  => {} Failed {error:?}", self.query_name(*query))
+                }
+            };
+            self.lines.push(line);
+            self.events.push(event);
+        }
+        self.sent = std::iter::from_fn(|| self.resolver.poll_transmit()).collect();
+        for transmit in self.sent.clone() {
+            let line = match transmit.transport {
+                Transport::Udp(query) => format!("udp {}", self.query_name(query)),
+                Transport::TcpConnect(c) => format!("connect {}", self.conn_name(c)),
+                Transport::TcpWrite(c) => format!("write {}", self.conn_name(c)),
+                Transport::TcpClose(c) => format!("close {}", self.conn_name(c)),
+            };
+            let to = server(transmit.destination);
+            let line = match transmit.transport {
+                Transport::TcpClose(_) => format!("  -> {to} {line}"),
+                _ => format!("  -> {to} {line}: {}", describe(&decode(&transmit))),
+            };
+            self.lines.push(line);
+        }
+        let next = self.resolver.poll_timeout().map_or_else(
+            || "none".to_owned(),
+            |d| format!("t={}s", d.duration_since(self.start).as_secs_f64()),
+        );
+        self.lines.push(format!("  next {next}"));
+    }
+
+    /// `q0`, `q1`, ... by first appearance.
+    fn query_name(&mut self, id: QueryId) -> String {
+        format!("q{}", position(&mut self.queries, id))
+    }
+
+    fn conn_name(&mut self, id: ConnectionId) -> String {
+        format!("c{}", position(&mut self.connections, id))
+    }
+}
+
+impl fmt::Display for Trace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.lines.join("\n"))
+    }
+}
+
+fn position<T: PartialEq>(seen: &mut Vec<T>, item: T) -> usize {
+    seen.iter().position(|s| *s == item).unwrap_or_else(|| {
+        seen.push(item);
+        seen.len() - 1
+    })
+}
+
+fn server(address: SocketAddr) -> String {
+    match address {
+        S1 => "S1".to_owned(),
+        S2 => "S2".to_owned(),
+        other => other.to_string(),
+    }
+}
+
+/// The question, and for a response its code and answer count, plus the
+/// flags a lifecycle depends on.
+fn describe(message: &Message) -> String {
+    let mut text = message.queries.first().map_or_else(
+        || "no question".to_owned(),
+        |q| format!("{} {}", q.name().to_ascii(), q.query_type()),
+    );
+    if message.metadata.message_type == MessageType::Response {
+        let n = message.answers.len();
+        let code = message.metadata.response_code;
+        text += &format!(": {code:?}, {n} answer{}", if n == 1 { "" } else { "s" });
+    }
+    if message.metadata.truncation {
+        text += ", TC";
+    }
+    if message.edns.is_none() {
+        text += ", no EDNS";
+    }
+    text
 }
