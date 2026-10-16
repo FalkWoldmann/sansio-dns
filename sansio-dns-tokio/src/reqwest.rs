@@ -12,12 +12,7 @@ impl Resolve for Resolver {
         let resolver = self.clone();
         Box::pin(async move {
             let addresses = resolver.lookup_ip(name.as_str()).await?;
-            let addrs: Addrs = Box::new(
-                addresses
-                    .into_iter()
-                    .map(|address| SocketAddr::new(address, 0)),
-            );
-            Ok(addrs)
+            Ok(Box::new(addresses.into_iter().map(|ip| SocketAddr::new(ip, 0))) as Addrs)
         })
     }
 }
