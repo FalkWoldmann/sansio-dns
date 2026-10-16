@@ -308,13 +308,19 @@ struct Pending {
     server: SocketAddr,
     /// `None` if `now + timeout` overflows: the query then waits forever.
     deadline: Option<Instant>,
-    /// Whether the query goes over a stream: after a truncated UDP answer,
-    /// or always with DNS over TLS.
-    stream: bool,
-    /// The connection the current stream attempt was written to.
-    connection: Option<ConnectionId>,
+    route: Route,
     /// Search candidates still to try if this name doesn't exist.
     rest: VecDeque<Name>,
+}
+
+/// How a query's current attempt travels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    /// As a datagram, from the query's own socket.
+    Udp,
+    /// Over a stream: after a truncated UDP answer, or always with DNS over
+    /// TLS. Names the connection once the attempt has been written to one.
+    Stream(Option<ConnectionId>),
 }
 
 /// A stream connection to one server, shared by its queries.
@@ -493,8 +499,11 @@ impl Resolver {
             attempt: 0,
             server: self.config.server(0),
             deadline: now.checked_add(self.config.timeout),
-            stream: self.config.uses_tls(),
-            connection: None,
+            route: if self.config.uses_tls() {
+                Route::Stream(None)
+            } else {
+                Route::Udp
+            },
             rest,
         })
     }
@@ -532,7 +541,10 @@ impl Resolver {
         let Some(pending) = self.pending.get(&query) else {
             return;
         };
-        if pending.stream || pending.server != from || !is_reply(&pending.request, &response) {
+        if pending.route != Route::Udp
+            || pending.server != from
+            || !is_reply(&pending.request, &response)
+        {
             return;
         }
         self.handle_response(query, response, now);
@@ -586,7 +598,9 @@ impl Resolver {
             let id = self
                 .pending
                 .iter()
-                .find(|(_, p)| p.connection == Some(connection) && is_reply(&p.request, &response))
+                .find(|(_, p)| {
+                    p.route == Route::Stream(Some(connection)) && is_reply(&p.request, &response)
+                })
                 .map(|(id, _)| *id);
             if let Some(id) = id {
                 self.handle_response(id, response, now);
@@ -646,12 +660,11 @@ impl Resolver {
             if !pending.deadline.is_some_and(|d| d <= now) {
                 continue;
             }
-            match pending
-                .connection
-                .filter(|c| self.connections.contains_key(c))
-            {
-                Some(connection) => self.close(connection, now, &Error::Timeout),
-                None => self.retry(id, now, Error::Timeout),
+            match pending.route {
+                Route::Stream(Some(connection)) if self.connections.contains_key(&connection) => {
+                    self.close(connection, now, &Error::Timeout);
+                }
+                _ => self.retry(id, now, Error::Timeout),
             }
         }
         let idle: Vec<ConnectionId> = self
@@ -693,7 +706,7 @@ impl Resolver {
         if self
             .pending
             .values()
-            .any(|p| p.connection == Some(connection))
+            .any(|p| p.route == Route::Stream(Some(connection)))
         {
             return None;
         }
@@ -730,7 +743,7 @@ impl Resolver {
         let affected: Vec<QueryId> = self
             .pending
             .iter()
-            .filter(|(_, p)| p.connection == Some(connection))
+            .filter(|(_, p)| p.route == Route::Stream(Some(connection)))
             .map(|(id, _)| *id)
             .collect();
         for id in affected {
@@ -758,10 +771,10 @@ impl Resolver {
         let Some(pending) = self.pending.get_mut(&id) else {
             return false;
         };
-        if pending.stream {
+        if pending.route != Route::Udp {
             return false;
         }
-        pending.stream = true;
+        pending.route = Route::Stream(None);
         pending.deadline = now.checked_add(self.config.timeout);
         self.emit(id, now);
         true
@@ -794,7 +807,7 @@ impl Resolver {
             return;
         };
         let server = pending.server;
-        if !pending.stream {
+        if pending.route == Route::Udp {
             self.transmits.push_back(Transmit {
                 transport: Transport::Udp(id),
                 destination: server,
@@ -813,7 +826,7 @@ impl Resolver {
             None => self.connect(server, &message, now),
         };
         match (sent, self.pending.get_mut(&id)) {
-            (Ok(connection), Some(pending)) => pending.connection = Some(connection),
+            (Ok(connection), Some(pending)) => pending.route = Route::Stream(Some(connection)),
             (Err(error), _) => self.fail(id, error),
             (Ok(_), None) => {}
         }
