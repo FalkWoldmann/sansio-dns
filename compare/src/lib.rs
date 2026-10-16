@@ -2,7 +2,8 @@
 //! the job a command-line HTTP client gives its resolver: look up one host's
 //! addresses, then connect.
 //!
-//! - `cargo bench -p compare`: lookup and request latency
+//! - `cargo bench -p compare`: lookup and request latency, and how long a
+//!   batch of concurrent lookups takes
 //! - `cargo run -p compare --release --bin allocs`: allocations per lookup
 //! - `get-sansio`, `get-hickory`, `get-system`: the same HTTP client with
 //!   each resolver, to compare binary sizes
