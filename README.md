@@ -101,7 +101,7 @@ them all as one crate.
 | 1034 | §3.6.2 | `addresses` follows the CNAME chain and ignores records owned by other names |
 | 6761 | §6.3 | `localhost` names → loopback for A/AAAA, empty answer otherwise; nothing sent |
 | 6761 | §6.4 | `invalid.` → NXDOMAIN; nothing sent |
-| 6762 | §3 | `local.` → NXDOMAIN; nothing sent (resolve with mDNS instead) |
+| 6762 | §3 | `local.` names are sent to the name servers like any other, as glibc does without nss-mdns; mDNS is up to the caller |
 | 7686 | §2 | `onion.` → NXDOMAIN; nothing sent |
 | 7858 | §3 | With `tls`: every query over TLS on a stream, never UDP; TLS errors fail the attempt |
 | 7858 | §3.4 | The TLS session is reused for later queries; queries wait out a handshake in progress |

@@ -122,9 +122,21 @@ mod search {
 
     #[test]
     fn special_use_search_domain_is_skipped() {
-        let conf = "nameserver 192.0.2.53\nsearch local corp.example\n";
+        let conf = "nameserver 192.0.2.53\nsearch invalid corp.example\n";
         let (asked, _) = tried(conf, "printer", ResponseCode::NXDomain);
         assert_eq!(asked, ["printer.corp.example.", "printer."]);
+    }
+
+    /// A Kubernetes pod's resolv.conf: short service names resolve through
+    /// the `cluster.local` search domains.
+    #[test]
+    fn kubernetes_service_name_is_found() {
+        let conf = "nameserver 10.96.0.10\n\
+                    search ns.svc.cluster.local svc.cluster.local cluster.local\n\
+                    options ndots:5\n";
+        let (asked, event) = tried(conf, "myservice", ResponseCode::NoError);
+        assert_eq!(asked, ["myservice.ns.svc.cluster.local."]);
+        assert_matches!(event, Some(Event::Response { .. }));
     }
 
     #[test]

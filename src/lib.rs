@@ -57,7 +57,7 @@ use std::time::{Duration, Instant};
 pub use hickory_proto;
 use hickory_proto::ProtoError;
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_proto::rr::domain::usage::{INVALID, LOCAL, LOCALHOST, ONION};
+use hickory_proto::rr::domain::usage::{INVALID, LOCALHOST, ONION};
 #[cfg(feature = "tls")]
 use hickory_proto::rr::rdata::opt::EdnsOption;
 use hickory_proto::rr::rdata::{A, AAAA};
@@ -362,7 +362,7 @@ fn pad(request: &mut Message) -> Result<(), ProtoError> {
 
 /// Whether `name` is under a zone that must not reach a unicast server.
 fn is_special_use(name: &Name) -> bool {
-    [&LOCALHOST, &INVALID, &LOCAL, &ONION]
+    [&LOCALHOST, &INVALID, &ONION]
         .iter()
         .any(|z| z.name().zone_of(name))
 }
@@ -435,8 +435,11 @@ impl Resolver {
     ///
     /// Special-use names are answered at once, without a transmit:
     /// `localhost` gets the loopback address (RFC 6761 §6.3), and names
-    /// under `invalid.`, `local.` and `onion.` get NXDOMAIN (RFC 6761 §6.4,
-    /// RFC 6762 §3, RFC 7686 §2). Resolve `.local` names with mDNS instead.
+    /// under `invalid.` and `onion.` get NXDOMAIN (RFC 6761 §6.4, RFC 7686
+    /// §2). Names under `local.` go to the name servers like any other:
+    /// RFC 6762 §3 reserves them for mDNS, but Kubernetes (`cluster.local`)
+    /// and many corporate networks serve them over unicast DNS, which is
+    /// what glibc does without nss-mdns. mDNS is up to the caller.
     ///
     /// Names listed in [`Config::hosts`] are answered from there for A and
     /// AAAA queries, with the addresses of that family (possibly none), as

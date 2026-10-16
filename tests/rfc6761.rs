@@ -1,5 +1,5 @@
-//! RFC 6761, Special-Use Domain Names, plus the special-use registrations in
-//! RFC 6762 §3 (`local.`) and RFC 7686 §2 (`onion.`).
+//! RFC 6761, Special-Use Domain Names, plus RFC 7686 §2 (`onion.`). Names
+//! under `local.` (RFC 6762 §3) are sent like any other.
 //! <https://rfc-annotations.research.icann.org/rfc6761.html>
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -55,15 +55,14 @@ mod section_6_3 {
     }
 }
 
-/// §6.4 `invalid.`, RFC 6762 §3 `local.` and RFC 7686 §2 `onion.` get an
-/// immediate NXDOMAIN and never reach the unicast resolver.
+/// §6.4 `invalid.` and RFC 7686 §2 `onion.` get an immediate NXDOMAIN and
+/// never reach the unicast resolver.
 mod section_6_4 {
     use super::*;
 
     #[rstest]
     #[case::invalid("host.invalid.")]
     #[case::invalid_itself("invalid.")]
-    #[case::mdns_local("printer.local.")]
     #[case::onion("duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion.")]
     fn names_get_nxdomain(mut resolver: Resolver, #[case] name: &str) {
         let response = answered_locally(&mut resolver, name, RecordType::A);
@@ -77,6 +76,18 @@ mod section_6_4 {
     #[case::shared_prefix("invalidated.")]
     fn lookalike_names_are_sent(mut resolver: Resolver, #[case] name: &str) {
         start_name(&mut resolver, name, Instant::now());
+        assert!(resolver.poll_event().is_none());
+    }
+
+    /// RFC 6762 §3 reserves `local.` for mDNS, but Kubernetes and many
+    /// corporate networks serve it over unicast DNS.
+    #[rstest]
+    #[case::mdns_style("printer.local.")]
+    #[case::kubernetes("myservice.ns.svc.cluster.local.")]
+    fn local_names_are_sent(mut resolver: Resolver, #[case] name: &str) {
+        let sent = start_name(&mut resolver, name, Instant::now());
+
+        assert_eq!(sent.destination, S1);
         assert!(resolver.poll_event().is_none());
     }
 }
