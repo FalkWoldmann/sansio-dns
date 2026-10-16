@@ -20,18 +20,18 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/FalkWoldmann/sansio-dns"
 
 [workspace.dependencies]
-sansio-dns = { path = ".", version = "0.1.0" }
-sansio-dns-tokio = { path = "sansio-dns-tokio", version = "0.1.0" }
-reqwest = { version = "0.13.5", default-features = false }
-rstest = "0.27.0"
-thiserror = "2.0.21"
-tokio = "1.53.3"
+sansio-dns = { path = ".", version = "0.1" }
+sansio-dns-tokio = { path = "sansio-dns-tokio", version = "0.1" }
+reqwest = { version = "0.13", default-features = false }
+rstest = "0.27"
+thiserror = "2"
+tokio = "1"
 
 [dependencies]
-hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
-resolv-conf = "0.7.6"
+hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
+resolv-conf = "0.7"
 thiserror.workspace = true
-rustls = { version = "0.23.46", default-features = false, features = ["std"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["std"], optional = true }
 
 [features]
 # DNS over TLS (RFC 7858). Brings rustls without a crypto provider: pass a
@@ -39,14 +39,14 @@ rustls = { version = "0.23.46", default-features = false, features = ["std"], op
 tls = ["dep:rustls"]
 
 [dev-dependencies]
-rcgen = "0.14.10"
-rustls = { version = "0.23.46", default-features = false, features = ["std", "ring"] }
-webpki-roots = "1.0.9"
-compio = { version = "0.19.2", features = ["runtime", "net", "time", "macros", "io"] }
-proptest = "1.12.0"
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+webpki-roots = "1"
+compio = { version = "0.19", features = ["runtime", "net", "time", "macros", "io"] }
+proptest = "1"
 rstest.workspace = true
 tokio = { workspace = true, features = ["net", "time", "rt", "macros", "io-util"] }
-criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 # Adapted from https://github.com/otto-de/rust-ecosystem (lints.toml), trimmed
 # for a sans-IO library: no async or web lints; documentation lints added.

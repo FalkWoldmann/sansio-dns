@@ -10,16 +10,16 @@ publish = false
 
 [dependencies]
 # Default features, so the hickory CLI can read the system configuration too.
-hickory-resolver = "0.26.3"
+hickory-resolver = "0.26"
 reqwest = { workspace = true, features = ["rustls"] }
 sansio-dns.workspace = true
 sansio-dns-tokio = { workspace = true, features = ["reqwest"] }
 # Counts allocations for the allocs binary, without unsafe code of our own.
-stats_alloc = "0.1.10"
+stats_alloc = "0.1"
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "io-util", "macros"] }
 
 [dev-dependencies]
-criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 [lints]
 workspace = true
