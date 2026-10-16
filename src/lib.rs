@@ -63,6 +63,7 @@ use hickory_proto::rr::domain::usage::{INVALID, LOCAL, LOCALHOST, ONION};
 use hickory_proto::rr::rdata::opt::EdnsOption;
 use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
+use hickory_proto::serialize::binary::DecodeError;
 
 mod hosts;
 mod lookup;
@@ -194,13 +195,14 @@ impl Config {
     }
 
     /// The names to try for `name`, in order, as glibc's `res_search` does.
-    /// Candidates under special-use zones are left out.
+    /// Candidates under special-use zones are left out. Empty when the name
+    /// is only tried as given, which needs no list.
     fn candidates(&self, name: &Name) -> VecDeque<Name> {
+        if name.is_fqdn() || self.search.is_empty() {
+            return VecDeque::new();
+        }
         let mut absolute = name.clone();
         absolute.set_fqdn(true);
-        if name.is_fqdn() || self.search.is_empty() {
-            return VecDeque::from([absolute]);
-        }
         let searched = self
             .search
             .iter()
@@ -366,14 +368,6 @@ fn pad(request: &mut Message) -> Result<(), ProtoError> {
             .insert(EdnsOption::Unknown(12, vec![0; fill]));
     }
     Ok(())
-}
-
-/// Remove and return the first complete length-prefixed message in `buf`.
-fn next_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
-    let (len, rest) = buf.split_first_chunk::<2>()?;
-    let message = rest.get(..usize::from(u16::from_be_bytes(*len)))?.to_vec();
-    buf.drain(..2 + message.len());
-    Some(message)
 }
 
 /// Whether `name` is under a zone that must not reach a unicast server.
@@ -546,19 +540,19 @@ impl Resolver {
     /// socket keeps each query's source port its own (§9.2). Once the query
     /// has switched to TCP, UDP replies to it are ignored too.
     pub fn handle_datagram(&mut self, query: QueryId, from: SocketAddr, data: &[u8], now: Instant) {
-        let Ok(response) = Message::from_vec(data) else {
-            return;
-        };
+        // The cheap checks first, so stray datagrams cost no parsing.
         let Some(pending) = self.pending.get(&query) else {
             return;
         };
-        if pending.route != Route::Udp
-            || self.config.server(pending.attempt) != from
-            || !is_reply(&pending.request, &response)
-        {
+        if pending.route != Route::Udp || self.config.server(pending.attempt) != from {
             return;
         }
-        self.handle_response(query, response, now);
+        let Ok(response) = Message::from_vec(data) else {
+            return;
+        };
+        if is_reply(&pending.request, &response) {
+            self.handle_response(query, response, now);
+        }
     }
 
     /// Process bytes read from `connection`.
@@ -598,12 +592,10 @@ impl Resolver {
             },
         };
         conn.received.extend_from_slice(data);
-        let mut messages = Vec::new();
-        while let Some(message) = next_frame(&mut conn.received) {
-            messages.push(message);
-        }
-        for message in messages {
-            let Ok(response) = Message::from_vec(&message) else {
+        // One message at a time: acting on an answer may change this
+        // connection too.
+        while let Some(decoded) = self.next_message(connection) {
+            let Ok(response) = decoded else {
                 continue;
             };
             let id = self
@@ -620,6 +612,17 @@ impl Resolver {
                 self.handle_response(id, response, now);
             }
         }
+    }
+
+    /// Take the first complete length-prefixed message off `connection`'s
+    /// buffer and decode it, or `None` if there is none yet.
+    fn next_message(&mut self, connection: ConnectionId) -> Option<Result<Message, DecodeError>> {
+        let conn = self.connections.get_mut(&connection)?;
+        let (len, rest) = conn.received.split_first_chunk::<2>()?;
+        let len = usize::from(u16::from_be_bytes(*len));
+        let decoded = Message::from_vec(rest.get(..len)?);
+        conn.received.drain(..2 + len);
+        Some(decoded)
     }
 
     /// The server closed `connection`. Its queries move on to their next

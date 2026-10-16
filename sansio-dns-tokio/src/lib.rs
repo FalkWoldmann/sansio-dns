@@ -445,13 +445,15 @@ impl Io {
     }
 }
 
-/// Forward every datagram `socket` receives, until its query is over.
+/// Forward every datagram `socket` receives, until its query is over. Each
+/// is copied out at its size, so a queue of them holds no spare capacity.
 async fn datagrams(query: QueryId, socket: Arc<UdpSocket>, input: mpsc::UnboundedSender<Input>) {
+    let mut buf = [0; 4096];
     loop {
-        let mut data = Vec::with_capacity(4096);
-        let Ok((_, from)) = socket.recv_buf_from(&mut data).await else {
+        let Ok((n, from)) = socket.recv_from(&mut buf).await else {
             return;
         };
+        let data = buf.get(..n).map(<[u8]>::to_vec).unwrap_or_default();
         if input.send(Input::Datagram(query, from, data)).is_err() {
             return;
         }
@@ -482,11 +484,12 @@ async fn carry(
 ) -> io::Result<()> {
     let mut stream = TcpStream::connect(to).await?;
     stream.write_all(&first).await?;
+    let mut buf = [0; 4096];
     loop {
-        let mut data = Vec::with_capacity(4096);
         tokio::select! {
-            read = stream.read_buf(&mut data) => {
-                if read? == 0 || input.send(Input::Stream(connection, data)).is_err() {
+            read = stream.read(&mut buf) => {
+                let data = buf.get(..read?).map(<[u8]>::to_vec).unwrap_or_default();
+                if data.is_empty() || input.send(Input::Stream(connection, data)).is_err() {
                     return Ok(());
                 }
             }
