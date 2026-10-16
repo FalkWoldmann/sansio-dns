@@ -37,8 +37,9 @@ while let Some(event) = resolver.poll_event() {
 ### Tokio and reqwest
 
 [`sansio-dns-tokio`](sansio-dns-tokio) is a ready-made driver: `lookup_ip(host)` runs an
-`IpLookup` with a socket per query and TCP or TLS connections as needed. With its `reqwest`
-feature, it plugs into reqwest as the DNS resolver:
+`IpLookup` on a background task shared by all clones of the resolver. Each UDP query gets its
+own socket, and TCP or TLS connections stay open between lookups until they go idle. With its
+`reqwest` feature, it plugs into reqwest as the DNS resolver:
 
 ```rust
 let client = reqwest::Client::builder()

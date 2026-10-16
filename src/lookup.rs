@@ -77,6 +77,12 @@ impl IpLookup {
         })
     }
 
+    /// The A and the AAAA query, to route events to this lookup or to
+    /// cancel them.
+    pub fn queries(&self) -> [QueryId; 2] {
+        self.queries
+    }
+
     /// Take in `event`; events of other queries leave the lookup as it is.
     pub fn handle_event(mut self, event: &Event) -> Progress {
         let (query, result) = match event {
