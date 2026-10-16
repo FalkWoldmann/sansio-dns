@@ -24,8 +24,12 @@ CNAMEs:
 ```rust
 let mut lookup = IpLookup::start(&mut resolver, Name::from_ascii("example.com")?, now)?;
 // in the event loop:
-while let Some(event) = resolver.poll_event() { lookup.handle_event(&event); }
-if let Some(result) = lookup.result() { /* Ok(addresses) or Err(error) */ }
+while let Some(event) = resolver.poll_event() {
+    lookup = match lookup.handle_event(&event) {
+        Progress::Waiting(lookup) => lookup,
+        Progress::Done(result) => { /* Ok(addresses) or Err(error) */ }
+    };
+}
 ```
 
 `addresses(&message)` does the CNAME-following part for any single response.

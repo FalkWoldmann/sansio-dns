@@ -65,7 +65,7 @@ use hickory_proto::rr::{Name, RData, Record, RecordType};
 mod hosts;
 mod lookup;
 pub use hosts::Hosts;
-pub use lookup::{IpLookup, addresses};
+pub use lookup::{IpLookup, Progress, addresses};
 #[cfg(feature = "tls")]
 mod tls;
 #[cfg(feature = "tls")]

@@ -35,7 +35,7 @@ use std::time::Instant;
 
 use sansio_dns::hickory_proto::ProtoError;
 use sansio_dns::hickory_proto::rr::Name;
-use sansio_dns::{Config, ConnectionId, Hosts, IpLookup, QueryId, Transmit, Transport};
+use sansio_dns::{Config, ConnectionId, Hosts, IpLookup, Progress, QueryId, Transmit, Transport};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
@@ -124,14 +124,16 @@ impl Resolver {
                 }
             }
             while let Some(event) = resolver.poll_event() {
-                lookup.handle_event(&event);
-            }
-            if let Some(result) = lookup.result() {
-                let addresses = result.map_err(Error::Resolve)?;
-                return if addresses.is_empty() {
-                    Err(Error::NotFound)
-                } else {
-                    Ok(addresses)
+                lookup = match lookup.handle_event(&event) {
+                    Progress::Waiting(lookup) => lookup,
+                    Progress::Done(result) => {
+                        let addresses = result.map_err(Error::Resolve)?;
+                        return if addresses.is_empty() {
+                            Err(Error::NotFound)
+                        } else {
+                            Ok(addresses)
+                        };
+                    }
                 };
             }
             let deadline = resolver.poll_timeout();

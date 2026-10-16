@@ -43,14 +43,27 @@ pub fn addresses(response: &Message) -> Vec<IpAddr> {
 
 /// An A and an AAAA query for the same name, with their addresses merged.
 ///
-/// Pass every [`Event`] to [`IpLookup::handle_event`]; once both queries
-/// have finished, [`IpLookup::result`] has the outcome. Ordering the
-/// addresses (RFC 6724) and racing connections (RFC 8305) is up to the
-/// caller.
-#[derive(Debug)]
+/// Pass every [`Event`] to [`IpLookup::handle_event`], which hands the
+/// lookup back until both queries have finished, and then the outcome
+/// instead. Ordering the addresses (RFC 6724) and racing connections
+/// (RFC 8305) is up to the caller.
+#[derive(Debug, PartialEq, Eq)]
 pub struct IpLookup {
     queries: [QueryId; 2],
+    /// Only one can be filled: with both, the lookup is over.
     results: [Option<Result<Vec<IpAddr>, Error>>; 2],
+}
+
+/// Where an [`IpLookup`] stands after an event.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Progress {
+    /// A query is still running: pass the lookup the next event.
+    Waiting(IpLookup),
+    /// Both queries have finished. The IPv4 addresses followed by the IPv6
+    /// ones, each in the server's order. An error only if no address was
+    /// found and a query failed; no address and no failure (NXDOMAIN, or no
+    /// records) is an empty list.
+    Done(Result<Vec<IpAddr>, Error>),
 }
 
 impl IpLookup {
@@ -64,8 +77,8 @@ impl IpLookup {
         })
     }
 
-    /// Record `event` if it belongs to this lookup, and say whether it did.
-    pub fn handle_event(&mut self, event: &Event) -> bool {
+    /// Take in `event`; events of other queries leave the lookup as it is.
+    pub fn handle_event(mut self, event: &Event) -> Progress {
         let (query, result) = match event {
             Event::Response { query, response } => (query, Ok(addresses(response))),
             Event::Failed { query, error } => (query, Err(error.clone())),
@@ -75,24 +88,24 @@ impl IpLookup {
             .iter()
             .zip(&mut self.results)
             .find_map(|(q, slot)| (q == query).then_some(slot));
-        slot.map(|slot| *slot = Some(result)).is_some()
+        if let Some(slot) = slot {
+            *slot = Some(result);
+        }
+        match self.results {
+            [Some(a), Some(aaaa)] => Progress::Done(merge(a, aaaa)),
+            _ => Progress::Waiting(self),
+        }
     }
+}
 
-    /// `None` until both queries have finished. Then the IPv4 addresses
-    /// followed by the IPv6 ones, each in the server's order. An error only
-    /// if no address was found and a query failed; no address and no failure
-    /// (NXDOMAIN, or no records) is an empty list.
-    pub fn result(&self) -> Option<Result<Vec<IpAddr>, Error>> {
-        let [Some(a), Some(aaaa)] = &self.results else {
-            return None;
-        };
-        Some(match (a, aaaa) {
-            (Ok(v4), Ok(v6)) => Ok(v4.iter().chain(v6).copied().collect()),
-            (Ok(found), Err(error)) | (Err(error), Ok(found)) if found.is_empty() => {
-                Err(error.clone())
-            }
-            (Ok(found), Err(_)) | (Err(_), Ok(found)) => Ok(found.clone()),
-            (Err(error), Err(_)) => Err(error.clone()),
-        })
+fn merge(
+    a: Result<Vec<IpAddr>, Error>,
+    aaaa: Result<Vec<IpAddr>, Error>,
+) -> Result<Vec<IpAddr>, Error> {
+    match (a, aaaa) {
+        (Ok(v4), Ok(v6)) => Ok(v4.into_iter().chain(v6).collect()),
+        (Ok(found), Err(error)) | (Err(error), Ok(found)) if found.is_empty() => Err(error),
+        (Ok(found), Err(_)) | (Err(_), Ok(found)) => Ok(found),
+        (Err(error), Err(_)) => Err(error),
     }
 }

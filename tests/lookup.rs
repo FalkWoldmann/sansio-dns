@@ -17,7 +17,7 @@ use hickory_proto::op::{Message, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::{A, CNAME};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use rstest::rstest;
-use sansio_dns::{Error, Event, IpLookup, Resolver, addresses};
+use sansio_dns::{Error, Event, IpLookup, Progress, Resolver, addresses};
 
 fn name(s: &str) -> Name {
     Name::from_ascii(s).unwrap()
@@ -71,7 +71,7 @@ mod rfc1034_section_3_6_2 {
 
 /// Answer the lookup's A and AAAA queries with these response codes. With a
 /// single attempt, SERVFAIL fails the query.
-fn finish(lookup: &mut IpLookup, resolver: &mut Resolver, codes: [ResponseCode; 2]) {
+fn finish(lookup: IpLookup, resolver: &mut Resolver, codes: [ResponseCode; 2]) -> Progress {
     let now = Instant::now();
     let sent: Vec<_> = std::iter::from_fn(|| resolver.poll_transmit()).collect();
     for (t, code) in sent.iter().zip(codes) {
@@ -79,10 +79,18 @@ fn finish(lookup: &mut IpLookup, resolver: &mut Resolver, codes: [ResponseCode; 
     }
     // Feed the events in reverse, to show the result doesn't depend on order.
     let events: Vec<Event> = std::iter::from_fn(|| resolver.poll_event()).collect();
+    feed(lookup, events.into_iter().rev())
+}
+
+/// Pass `events` to `lookup` in order; it must not finish before the last.
+#[expect(clippy::panic, reason = "a test helper fails the test")]
+fn feed(lookup: IpLookup, events: impl IntoIterator<Item = Event>) -> Progress {
     events
-        .iter()
-        .rev()
-        .for_each(|e| assert!(lookup.handle_event(e)));
+        .into_iter()
+        .fold(Progress::Waiting(lookup), |progress, e| match progress {
+            Progress::Waiting(lookup) => lookup.handle_event(&e),
+            Progress::Done(_) => panic!("done before its last event"),
+        })
 }
 
 fn single_attempt_resolver() -> Resolver {
@@ -110,37 +118,37 @@ mod ip_lookup {
         #[case] expected: Result<Vec<IpAddr>, Error>,
     ) {
         let mut resolver = single_attempt_resolver();
-        let mut lookup =
-            IpLookup::start(&mut resolver, name("example.com."), Instant::now()).unwrap();
-        assert_eq!(lookup.result(), None);
+        let lookup = IpLookup::start(&mut resolver, name("example.com."), Instant::now()).unwrap();
 
-        finish(&mut lookup, &mut resolver, codes);
+        let progress = finish(lookup, &mut resolver, codes);
 
-        assert_eq!(lookup.result(), Some(expected));
+        assert_eq!(progress, Progress::Done(expected));
     }
 
     #[rstest]
     fn ignores_events_of_other_queries(mut resolver: Resolver) {
-        let mut lookup =
-            IpLookup::start(&mut resolver, name("example.com."), Instant::now()).unwrap();
+        let lookup = IpLookup::start(&mut resolver, name("example.com."), Instant::now()).unwrap();
+        let a = resolver.poll_transmit().unwrap();
         while resolver.poll_transmit().is_some() {}
         let other = start(&mut resolver, Instant::now());
-        resolver.handle_datagram(udp(&other), S1, &encode(&reply(&other)), Instant::now());
+        for t in [&a, &other] {
+            resolver.handle_datagram(udp(t), S1, &encode(&reply(t)), Instant::now());
+        }
 
-        assert!(!lookup.handle_event(&resolver.poll_event().unwrap()));
-        assert_eq!(lookup.result(), None);
+        let progress = feed(lookup, std::iter::from_fn(|| resolver.poll_event()));
+
+        assert!(matches!(progress, Progress::Waiting(_)), "{progress:?}");
     }
 
     #[rstest]
     fn localhost_resolves_without_network(mut resolver: Resolver) {
-        let mut lookup =
-            IpLookup::start(&mut resolver, name("localhost."), Instant::now()).unwrap();
-        std::iter::from_fn(|| resolver.poll_event()).for_each(|e| assert!(lookup.handle_event(&e)));
+        let lookup = IpLookup::start(&mut resolver, name("localhost."), Instant::now()).unwrap();
+        let progress = feed(lookup, std::iter::from_fn(|| resolver.poll_event()));
 
         assert!(resolver.poll_transmit().is_none());
         assert_eq!(
-            lookup.result(),
-            Some(Ok(vec![
+            progress,
+            Progress::Done(Ok(vec![
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
                 IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
             ]))
