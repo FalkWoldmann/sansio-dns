@@ -1,5 +1,7 @@
 //! Blocking driver: `cargo run --example std -- example.com [1.1.1.1:53]`
 //!
+//! Without a server argument, settings come from `/etc/resolv.conf`.
+//!
 //! Handles one query. While a TCP connection is open it reads only from that,
 //! since the resolver ignores UDP replies once a query has switched to TCP.
 
@@ -21,11 +23,14 @@ use sansio_dns::{Config, Event, QueryId, Resolver, Transmit, Transport};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let name = Name::from_ascii(args.next().unwrap_or_else(|| "example.com.".into()))?;
-    let server = args.next().unwrap_or_else(|| "1.1.1.1:53".into()).parse()?;
 
     let socket = UdpSocket::bind("0.0.0.0:0")?;
     let mut tcp: Option<(QueryId, TcpStream)> = None;
-    let mut resolver = Resolver::new(Config::new(server, []));
+    let config = match args.next() {
+        Some(server) => Config::new(server.parse()?, []),
+        None => Config::from_resolv_conf(&std::fs::read("/etc/resolv.conf")?)?,
+    };
+    let mut resolver = Resolver::new(config);
     resolver.query(name, RecordType::A, Instant::now())?;
 
     let mut buf = [0; 4096];

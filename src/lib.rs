@@ -66,6 +66,12 @@ pub struct Config {
     /// Total number of attempts per query, across all servers. Switching to
     /// TCP or dropping EDNS doesn't count as one.
     pub attempts: NonZeroUsize,
+    /// Domains to try appending to names without a trailing dot, in order.
+    /// Empty means every name is used as given.
+    pub search: Vec<Name>,
+    /// A name with at least this many dots is tried as given before the
+    /// search domains; one with fewer, after them.
+    pub ndots: u8,
 }
 
 impl Config {
@@ -77,12 +83,15 @@ impl Config {
             servers,
             timeout: Duration::from_secs(2),
             attempts,
+            search: Vec::new(),
+            ndots: 1,
         }
     }
 
     /// Settings from the text of a `resolv.conf` file, read the way glibc
-    /// reads it: `nameserver` lines (port 53), `options timeout:` in seconds
-    /// (at most 30) and `options attempts:` per server (at most 5). Without
+    /// reads it: `nameserver` lines (port 53), `search` or `domain`,
+    /// `options ndots:` (at most 15), `options timeout:` in seconds (at most
+    /// 30) and `options attempts:` per server (at most 5). Without
     /// usable `nameserver` lines, the local host is asked (127.0.0.1).
     ///
     /// A link-local server with a named scope (`fe80::1%eth0`) is skipped,
@@ -107,7 +116,37 @@ impl Config {
         let per_server = usize::try_from(parsed.attempts.clamp(1, 5)).unwrap_or(1);
         config.attempts =
             NonZeroUsize::new(per_server * config.servers.len()).unwrap_or(NonZeroUsize::MIN);
+        config.search = parsed
+            .get_last_search_or_domain()
+            .filter_map(|domain| Name::from_ascii(domain).ok())
+            .map(|mut domain| {
+                domain.set_fqdn(true);
+                domain
+            })
+            .collect();
+        config.ndots = u8::try_from(parsed.ndots.min(15)).unwrap_or(15);
         Ok(config)
+    }
+
+    /// The names to try for `name`, in order, as glibc's `res_search` does.
+    /// Candidates under special-use zones are left out.
+    fn candidates(&self, name: &Name) -> VecDeque<Name> {
+        let mut absolute = name.clone();
+        absolute.set_fqdn(true);
+        if name.is_fqdn() || self.search.is_empty() {
+            return VecDeque::from([absolute]);
+        }
+        let searched = self
+            .search
+            .iter()
+            .filter_map(|domain| name.clone().append_domain(domain).ok())
+            .filter(|candidate| !is_special_use(candidate));
+        let dots = usize::from(name.num_labels()).saturating_sub(1);
+        if dots >= usize::from(self.ndots) {
+            std::iter::once(absolute).chain(searched).collect()
+        } else {
+            searched.chain(std::iter::once(absolute)).collect()
+        }
     }
 
     /// The server for the given attempt, rotating through the list.
@@ -197,6 +236,8 @@ struct Pending {
     /// Bytes received so far on the TCP connection, once the query has
     /// switched to TCP; `None` while it still uses UDP.
     tcp: Option<Vec<u8>>,
+    /// Search candidates still to try if this name doesn't exist.
+    rest: VecDeque<Name>,
 }
 
 impl Pending {
@@ -234,16 +275,19 @@ fn next_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
     Some(message)
 }
 
+/// Whether `name` is under a zone that must not reach a unicast server.
+fn is_special_use(name: &Name) -> bool {
+    [&LOCALHOST, &INVALID, &LOCAL, &ONION]
+        .iter()
+        .any(|z| z.name().zone_of(name))
+}
+
 /// The local answer for a special-use name, or `None` for any other name.
 fn special_use(name: &Name, record_type: RecordType) -> Option<Message> {
-    let localhost = LOCALHOST.name().zone_of(name);
-    if !localhost
-        && ![&INVALID, &LOCAL, &ONION]
-            .iter()
-            .any(|z| z.name().zone_of(name))
-    {
+    if !is_special_use(name) {
         return None;
     }
+    let localhost = LOCALHOST.name().zone_of(name);
     let mut response = Message::response(0, OpCode::Query);
     response.add_query(Query::query(name.clone(), record_type));
     response.metadata.response_code = if localhost {
@@ -294,8 +338,11 @@ impl Resolver {
 
     /// Start a recursive lookup of `name`/`record_type`.
     ///
-    /// `name` is treated as absolute: there is no search list, so
-    /// `example.com` and `example.com.` are the same query.
+    /// A name ending in a dot is used as given. Other names are tried with
+    /// the [`Config::search`] domains, ordered by [`Config::ndots`]; the next
+    /// candidate is tried while the answer is NXDOMAIN, and the event carries
+    /// the last answer. Without search domains, `example.com` and
+    /// `example.com.` are the same query.
     ///
     /// Special-use names are answered at once, without a transmit:
     /// `localhost` gets the loopback address (RFC 6761 §6.3), and names
@@ -303,20 +350,37 @@ impl Resolver {
     /// RFC 6762 §3, RFC 7686 §2). Resolve `.local` names with mDNS instead.
     pub fn query(
         &mut self,
-        mut name: Name,
+        name: Name,
         record_type: RecordType,
         now: Instant,
     ) -> Result<QueryId, ProtoError> {
-        name.set_fqdn(true);
-        if let Some(response) = special_use(&name, record_type) {
-            let id = QueryId(self.next_query);
-            self.next_query += 1;
+        let mut candidates = self.config.candidates(&name);
+        let mut absolute = name;
+        absolute.set_fqdn(true);
+        let id = QueryId(self.next_query);
+        self.next_query += 1;
+        if let Some(response) = special_use(&absolute, record_type) {
             self.events.push_back(Event::Response {
                 query: id,
                 response,
             });
             return Ok(id);
         }
+        let first = candidates.pop_front().unwrap_or(absolute);
+        let mut pending = self.new_pending(first, record_type, candidates, now)?;
+        self.transmits.push_back(pending.transmit(id));
+        self.pending.insert(id, pending);
+        Ok(id)
+    }
+
+    /// A fresh first attempt for `name`, with its own message ID.
+    fn new_pending(
+        &self,
+        name: Name,
+        record_type: RecordType,
+        rest: VecDeque<Name>,
+        now: Instant,
+    ) -> Result<Pending, ProtoError> {
         let mut request = self.new_message();
         request.metadata.recursion_desired = true;
         request.add_query(Query::query(name, record_type));
@@ -324,20 +388,33 @@ impl Resolver {
         edns.set_max_payload(EDNS_PAYLOAD);
         request.set_edns(edns);
         let payload = request.to_vec()?;
-
-        let id = QueryId(self.next_query);
-        self.next_query += 1;
-        let mut pending = Pending {
+        Ok(Pending {
             request,
             payload,
             attempt: 0,
             server: self.config.server(0),
             deadline: now.checked_add(self.config.timeout),
             tcp: None,
+            rest,
+        })
+    }
+
+    /// Replace `id`'s attempt with one for its next search candidate.
+    /// Returns `false` if there is none, so the current answer stands.
+    fn next_candidate(&mut self, id: QueryId, now: Instant) -> bool {
+        let Some((name, rest, record_type)) = self.pending.get_mut(&id).and_then(|p| {
+            let record_type = p.request.queries.first()?.query_type();
+            let name = p.rest.pop_front()?;
+            Some((name, std::mem::take(&mut p.rest), record_type))
+        }) else {
+            return false;
         };
-        self.transmits.push_back(pending.transmit(id));
-        self.pending.insert(id, pending);
-        Ok(id)
+        let Ok(mut next) = self.new_pending(name, record_type, rest, now) else {
+            return false;
+        };
+        self.transmits.push_back(next.transmit(id));
+        self.pending.insert(id, next);
+        true
     }
 
     /// Process a datagram received from `from`.
@@ -401,6 +478,7 @@ impl Resolver {
             // RFC 6891 §7: a server without EDNS answers FORMERR and no OPT;
             // §6.2.2 lets us ask the same server again without EDNS.
             ResponseCode::FormErr if response.edns.is_none() => self.drop_edns(id, now),
+            ResponseCode::NXDomain if self.next_candidate(id, now) => {}
             code @ (ResponseCode::ServFail
             | ResponseCode::Refused
             | ResponseCode::NotImp

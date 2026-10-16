@@ -30,6 +30,14 @@ if let Some(result) = lookup.result() { /* Ok(addresses) or Err(error) */ }
 
 `addresses(&message)` does the CNAME-following part for any single response.
 
+### Configuration
+
+`Config::from_resolv_conf(&bytes)` reads the text of a `resolv.conf` (you read the file) with
+the [`resolv-conf`](https://crates.io/crates/resolv-conf) crate and applies glibc's rules:
+nameservers, `search`/`domain`, `ndots`, `timeout` and `attempts`. With search domains, a name
+without a trailing dot is tried with each of them, before the name as given if it has fewer
+than `ndots` dots and after it otherwise; the search moves on only on NXDOMAIN.
+
 ## Spec coverage
 
 Behavior follows the RFCs as listed and annotated at
@@ -71,7 +79,9 @@ length-prefixed. Pass everything read to `handle_stream_data`, and call
 ### Not implemented
 
 - TCP connection reuse and pipelining (RFC 7766 §6.2.1); each TCP attempt is a new connection.
-- DoT/DoH/DoQ, caching, `/etc/resolv.conf`, search domains, DNS cookies (RFC 7873).
+- DoT/DoH/DoQ, caching, DNS cookies (RFC 7873).
+- `resolv.conf` options other than the ones above (`rotate`, `use-vc`, `sortlist`, …).
+- `IpLookup` searches A and AAAA independently, so the two could end on different candidates.
 - Once EDNS is dropped for a query, it stays off for that query's remaining attempts,
   including other servers.
 
