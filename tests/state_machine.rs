@@ -1,8 +1,10 @@
 //! Random sequences of driver calls, checking invariants after every step.
 //!
-//! The resolver only ever sees `query`, `handle_datagram`, `handle_timeout`
-//! and `cancel`, so any sequence of those is a valid input. Datagrams are
-//! replies to recent transmits, often tampered with, plus raw garbage.
+//! The resolver only ever sees `query`, `handle_datagram`,
+//! `handle_stream_data`, `handle_stream_closed`, `handle_timeout` and
+//! `cancel`, so any sequence of those is a valid input. Replies go to recent
+//! transmits over their transport, often tampered with and, over TCP, split
+//! into two chunks; there is raw garbage too.
 
 #![expect(
     clippy::disallowed_methods,
@@ -20,10 +22,11 @@ use std::time::{Duration, Instant};
 use common::*;
 use hickory_proto::op::ResponseCode;
 use proptest::prelude::*;
-use sansio_dns::{Event, QueryId, Resolver, Transmit};
+use sansio_dns::{Event, QueryId, Resolver, Transmit, Transport};
 
-/// Datagrams one query may cause: one per attempt, plus one EDNS downgrade.
-const MAX_TRANSMITS: usize = 2 * 2 + 1;
+/// Transmits one query may cause: one per attempt, plus one EDNS downgrade
+/// and one switch to TCP.
+const MAX_TRANSMITS: usize = 2 * 2 + 2;
 
 #[derive(Clone, Debug)]
 enum Reply {
@@ -39,10 +42,21 @@ enum Reply {
 #[derive(Clone, Debug)]
 enum Op {
     Query,
-    Reply { to: usize, reply: Reply },
-    Elapse { millis: u16 },
+    Reply {
+        to: usize,
+        reply: Reply,
+        split: usize,
+    },
+    Elapse {
+        millis: u16,
+    },
     Timeout,
-    Cancel { which: usize },
+    Cancel {
+        which: usize,
+    },
+    StreamClosed {
+        which: usize,
+    },
     Garbage(Vec<u8>),
 }
 
@@ -68,10 +82,12 @@ fn reply_strategy() -> impl Strategy<Value = Reply> {
 fn op_strategy() -> impl Strategy<Value = Op> {
     prop_oneof![
         2 => Just(Op::Query),
-        4 => (any::<usize>(), reply_strategy()).prop_map(|(to, reply)| Op::Reply { to, reply }),
+        4 => (any::<usize>(), reply_strategy(), any::<usize>())
+            .prop_map(|(to, reply, split)| Op::Reply { to, reply, split }),
         1 => any::<u16>().prop_map(|millis| Op::Elapse { millis }),
         1 => Just(Op::Timeout),
         1 => any::<usize>().prop_map(|which| Op::Cancel { which }),
+        1 => any::<usize>().prop_map(|which| Op::StreamClosed { which }),
         1 => prop::collection::vec(any::<u8>(), 0..64).prop_map(Op::Garbage),
     ]
 }
@@ -146,10 +162,18 @@ impl Harness {
                     .unwrap();
                 self.live.push(id);
             }
-            Op::Reply { to, reply } => {
+            Op::Reply { to, reply, split } => {
                 if let Some(sent) = self.sent.get(to % self.sent.len().max(1)) {
                     let (from, bytes) = datagram(sent, reply);
-                    self.resolver.handle_datagram(from, &bytes, self.now);
+                    match sent.transport {
+                        Transport::Udp => self.resolver.handle_datagram(from, &bytes, self.now),
+                        Transport::Tcp => {
+                            let framed = frame(&bytes);
+                            let (a, b) = framed.split_at(split % (framed.len() + 1));
+                            self.resolver.handle_stream_data(sent.query, a, self.now);
+                            self.resolver.handle_stream_data(sent.query, b, self.now);
+                        }
+                    }
                 }
             }
             Op::Elapse { millis } => {
@@ -169,6 +193,12 @@ impl Harness {
                     self.done.insert(id);
                 }
             }
+            Op::StreamClosed { which } => {
+                if !self.live.is_empty() {
+                    let id = self.live[which % self.live.len()];
+                    self.resolver.handle_stream_closed(id, self.now);
+                }
+            }
             Op::Garbage(bytes) => self.resolver.handle_datagram(S1, bytes, self.now),
         }
     }
@@ -181,6 +211,10 @@ impl Harness {
                 self.live.contains(&t.query),
                 "transmit for a finished query"
             );
+            if t.transport == Transport::Tcp {
+                let len = usize::from(u16::from_be_bytes([t.payload[0], t.payload[1]]));
+                prop_assert_eq!(len + 2, t.payload.len(), "wrong TCP length prefix");
+            }
             let count = self.transmits.entry(t.query).or_default();
             *count += 1;
             prop_assert!(*count <= MAX_TRANSMITS, "too many transmits for one query");

@@ -7,10 +7,10 @@ edition = "2024"
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-compio = { version = "0.19.2", features = ["runtime", "net", "time", "macros"] }
+compio = { version = "0.19.2", features = ["runtime", "net", "time", "macros", "io"] }
 proptest = "1.12.0"
 rstest = "0.27.0"
-tokio = { version = "1.53.3", features = ["net", "time", "rt", "macros"] }
+tokio = { version = "1.53.3", features = ["net", "time", "rt", "macros", "io-util"] }
 
 # Adapted from https://github.com/otto-de/rust-ecosystem (lints.toml), trimmed
 # for a sans-IO library: no async or web lints; documentation lints added.

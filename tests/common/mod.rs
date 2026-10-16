@@ -9,7 +9,7 @@ use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use rstest::fixture;
-use sansio_dns::{Config, Event, Resolver, Transmit};
+use sansio_dns::{Config, Event, Resolver, Transmit, Transport};
 
 pub const S1: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 53);
 pub const S2: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 53);
@@ -31,8 +31,19 @@ pub fn start_name(resolver: &mut Resolver, name: &str, now: Instant) -> Transmit
     resolver.poll_transmit().unwrap()
 }
 
+/// The DNS message in `transmit`, without the TCP length prefix.
 pub fn decode(transmit: &Transmit) -> Message {
-    Message::from_vec(&transmit.payload).unwrap()
+    let message = match transmit.transport {
+        Transport::Udp => &transmit.payload[..],
+        Transport::Tcp => &transmit.payload[2..],
+    };
+    Message::from_vec(message).unwrap()
+}
+
+/// `message` with the two-byte TCP length prefix.
+pub fn frame(message: &[u8]) -> Vec<u8> {
+    let len = u16::try_from(message.len()).unwrap().to_be_bytes();
+    len.iter().chain(message).copied().collect()
 }
 
 /// The answer a well-behaved server would give to `request`. Tests mutate it

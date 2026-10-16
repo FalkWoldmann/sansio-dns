@@ -16,7 +16,7 @@ loop {
 }
 ```
 
-Complete drivers are in `examples/` (`std`, `tokio`, `compio`), each about 50 lines.
+Complete drivers are in `examples/` (`std`, `tokio`, `compio`), about 100 lines each including TCP.
 
 ## Spec coverage
 
@@ -29,7 +29,7 @@ Tests live in `tests/rfc<number>.rs`, with one module per section.
 | 1035 | §2.3.3 | Question names are compared case-insensitively |
 | 1035 | §3.1 | Names are absolute; `example.com` and `example.com.` are the same query |
 | 1035 | §4.1.1 | `RD` set; `NOERROR`/`NXDOMAIN` end the query; `SERVFAIL`/`NOTIMP`/`REFUSED` fail over |
-| 1035 | §4.2.1 | `TC` is reported as `Error::Truncated` |
+| 1035 | §4.2.1 | `TC` set → retry over TCP (RFC 7766) |
 | 1035 | §7.2 | Retransmit on timeout, rotating through servers |
 | 1035 | §7.3 | Non-responses (`QR=0`) and wrong opcodes are discarded |
 | 5452 | §9.1 | Responses must match source address, port, ID, QNAME, QTYPE and QCLASS |
@@ -37,6 +37,8 @@ Tests live in `tests/rfc<number>.rs`, with one module per section.
 | 5452 | §9.2 | IDs from a CSPRNG, unique among outstanding queries; per-query source ports are the driver's job (see below) |
 | 6891 | §6.2.3 | One OPT record, 1232-byte payload (DNS Flag Day 2020) |
 | 6891 | §7, §6.2.2 | `FORMERR` without OPT → same server once more without EDNS; with OPT → fail over |
+| 7766 | §5 | Truncated UDP response → same server over TCP; later attempts stay on TCP; UDP replies then ignored |
+| 7766 | §8 | Two-byte length prefix; replies reassembled from any chunking |
 
 ### Driver obligations
 
@@ -44,10 +46,14 @@ RFC 5452 §9.2 requires an unpredictable source port per outstanding query. A sa
 can't pick ports, so each `Transmit` carries its `QueryId`: bind a fresh ephemeral socket
 per query, and only pass datagrams received on that socket to `handle_datagram`.
 
+A `Transmit` with `Transport::Tcp` means: open a new connection to its destination
+(replacing any earlier one for that query) and write the payload, which is already
+length-prefixed. Pass everything read to `handle_stream_data`, and call
+`handle_stream_closed` on end of stream or error. One connection per query; no pipelining.
+
 ### Not implemented
 
-- TCP fallback for truncated responses. RFC 7766 §5 requires TCP support for
-  general-purpose implementations, so this is the next step.
+- TCP connection reuse and pipelining (RFC 7766 §6.2.1); each TCP attempt is a new connection.
 - DoT/DoH/DoQ, caching, `/etc/resolv.conf`, search domains, DNS cookies (RFC 7873).
 - Once EDNS is dropped for a query, it stays off for that query's remaining attempts,
   including other servers.

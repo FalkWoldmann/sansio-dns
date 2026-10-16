@@ -24,4 +24,6 @@ disallowed-types = [
   { path = "std::net::TcpStream", reason = "sans-IO: emit a Transmit instead" },
   { path = "tokio::net::UdpSocket", reason = "sans-IO: emit a Transmit instead", allow-invalid = true },
   { path = "compio::net::UdpSocket", reason = "sans-IO: emit a Transmit instead", allow-invalid = true },
+  { path = "tokio::net::TcpStream", reason = "sans-IO: emit a Transmit instead", allow-invalid = true },
+  { path = "compio::net::TcpStream", reason = "sans-IO: emit a Transmit instead", allow-invalid = true },
 ]

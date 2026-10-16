@@ -2,22 +2,26 @@
 //!
 //! compio is completion-based, so buffers are moved into each operation and
 //! handed back with the result. The resolver doesn't care: it only sees bytes.
+//!
+//! Handles one query. While a TCP connection is open it reads only from that,
+//! since the resolver ignores UDP replies once a query has switched to TCP.
 
 #![expect(
     clippy::disallowed_methods,
     clippy::disallowed_types,
     clippy::indexing_slicing,
     clippy::print_stdout,
-    reason = "a driver owns the socket, the clock and the output; recv_from never returns more than buf.len()"
+    reason = "a driver owns the sockets, the clock and the output; read and recv_from never return more than buf.len()"
 )]
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use compio::BufResult;
-use compio::net::UdpSocket;
-use compio::time::timeout_at;
+use compio::io::{AsyncRead, AsyncWriteExt};
+use compio::net::{TcpStream, UdpSocket};
+use compio::time::{timeout, timeout_at};
 use sansio_dns::hickory_proto::rr::{Name, RecordType};
-use sansio_dns::{Config, Event, Resolver};
+use sansio_dns::{Config, Event, QueryId, Resolver, Transmit, Transport};
 
 #[compio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,14 +30,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = args.next().unwrap_or_else(|| "1.1.1.1:53".into()).parse()?;
 
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let mut tcp: Option<(QueryId, TcpStream)> = None;
     let mut resolver = Resolver::new(Config::new(server, []));
     resolver.query(name, RecordType::A, Instant::now())?;
 
-    let mut buf = Vec::with_capacity(1232);
+    let mut buf = Vec::with_capacity(4096);
     loop {
         while let Some(t) = resolver.poll_transmit() {
-            let BufResult(sent, _) = socket.send_to(t.payload, t.destination).await;
-            sent?;
+            match t.transport {
+                Transport::Udp => {
+                    let BufResult(sent, _) = socket.send_to(t.payload, t.destination).await;
+                    sent?;
+                }
+                Transport::Tcp => match timeout(Duration::from_secs(2), open(&t)).await {
+                    Ok(Ok(stream)) => tcp = Some((t.query, stream)),
+                    _ => resolver.handle_stream_closed(t.query, Instant::now()),
+                },
+            }
         }
         if let Some(event) = resolver.poll_event() {
             return match event {
@@ -48,6 +61,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("no query in flight".into());
         };
         buf.clear();
+
+        if let Some((query, mut stream)) = tcp.take() {
+            match timeout_at(deadline, stream.read(buf)).await {
+                Ok(BufResult(read, returned)) => {
+                    buf = returned;
+                    match read {
+                        Ok(n) if n > 0 => {
+                            resolver.handle_stream_data(query, &buf[..n], Instant::now());
+                            tcp = Some((query, stream));
+                        }
+                        _ => resolver.handle_stream_closed(query, Instant::now()),
+                    }
+                }
+                Err(_elapsed) => {
+                    buf = Vec::with_capacity(4096);
+                    resolver.handle_timeout(Instant::now());
+                    tcp = Some((query, stream));
+                }
+            }
+            continue;
+        }
+
         match timeout_at(deadline, socket.recv_from(buf)).await {
             Ok(BufResult(received, returned)) => {
                 buf = returned;
@@ -55,9 +90,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 resolver.handle_datagram(from, &buf[..n], Instant::now());
             }
             Err(_elapsed) => {
-                buf = Vec::with_capacity(1232);
+                buf = Vec::with_capacity(4096);
                 resolver.handle_timeout(Instant::now());
             }
         }
     }
+}
+
+/// Connect to the transmit's destination and send its (length-prefixed) payload.
+async fn open(t: &Transmit) -> std::io::Result<TcpStream> {
+    let mut stream = TcpStream::connect(t.destination).await?;
+    let BufResult(written, _) = stream.write_all(t.payload.clone()).await;
+    written?;
+    Ok(stream)
 }

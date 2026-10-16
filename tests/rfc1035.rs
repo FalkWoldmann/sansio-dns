@@ -18,7 +18,7 @@ use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{Name, RData};
 use proptest::prelude::*;
 use rstest::rstest;
-use sansio_dns::{Error, Event, Resolver};
+use sansio_dns::{Error, Event, Resolver, Transport};
 
 /// §2.3.3: name comparisons are case-insensitive, so a server that changes
 /// the case of the question must still be matched.
@@ -137,12 +137,12 @@ mod section_4_1_1 {
 }
 
 /// §4.2.1: a response that didn't fit in the datagram has TC set; the
-/// resolver reports it so the query can be retried over TCP.
+/// query is retried over TCP (details in rfc7766.rs).
 mod section_4_2_1 {
     use super::*;
 
     #[rstest]
-    fn truncated_response_is_reported(mut resolver: Resolver) {
+    fn truncated_response_is_retried_over_tcp(mut resolver: Resolver) {
         let now = Instant::now();
         let sent = start(&mut resolver, now);
         let mut response = reply(&sent);
@@ -150,14 +150,8 @@ mod section_4_2_1 {
 
         resolver.handle_datagram(S1, &encode(&response), now);
 
-        assert!(matches!(
-            resolver.poll_event(),
-            Some(Event::Failed {
-                error: Error::Truncated,
-                ..
-            })
-        ));
-        assert_eq!(resolver.poll_timeout(), None);
+        assert!(resolver.poll_event().is_none());
+        assert_eq!(resolver.poll_transmit().unwrap().transport, Transport::Tcp);
     }
 }
 
