@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 5c57974c782392acb2361db9ea29e26dac10c131fa5b8acdb87c2046d0d7aaf9 # shrinks to ops = [Query, Query, Elapse { millis: 2000 }, Reply { to: 8826140627889576302, reply: FormErrWithoutOpt }, Reply { to: 1030390939273156422, reply: FormErrWithoutOpt }, Elapse { millis: 2000 }, Reply { to: 124577635586779680, reply: Code(ServFail) }]
+cc 6c0f4068cef7aab2d972ca1d0d82f3d598f73ba6674c1010c07a4821a9dc717c # shrinks to ops = [Query, Query, Cancel { which: 0 }, Reply { to: 0, reply: Answer }]

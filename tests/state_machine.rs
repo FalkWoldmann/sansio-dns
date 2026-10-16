@@ -4,6 +4,13 @@
 //! and `cancel`, so any sequence of those is a valid input. Datagrams are
 //! replies to recent transmits, often tampered with, plus raw garbage.
 
+#![expect(
+    clippy::disallowed_methods,
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    reason = "tests stand in for the driver, and helpers outside #[test] may panic"
+)]
+
 mod common;
 
 use std::collections::{HashMap, HashSet};

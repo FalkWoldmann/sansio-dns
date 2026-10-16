@@ -1,0 +1,27 @@
+# Companion to [lints] in Cargo.toml, adapted from
+# https://github.com/otto-de/rust-ecosystem (clippy.toml).
+
+allow-dbg-in-tests = true
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-panic-in-tests = true
+allow-print-in-tests = true
+allow-unwrap-in-tests = true
+allow-useless-vec-in-tests = true
+
+# Lint public items too; nothing is published yet, so signatures may change.
+avoid-breaking-exported-api = false
+
+# The core is sans-IO: time comes in as an argument, bytes go out as Transmits.
+# Drivers (examples) and tests opt out with a crate-level #![expect(...)].
+disallowed-methods = [
+  { path = "std::time::Instant::now", reason = "sans-IO: take `now` as an argument" },
+  { path = "std::time::SystemTime::now", reason = "sans-IO: take `now` as an argument" },
+  { path = "std::thread::sleep", reason = "sans-IO: return a deadline from poll_timeout" },
+]
+disallowed-types = [
+  { path = "std::net::UdpSocket", reason = "sans-IO: emit a Transmit instead" },
+  { path = "std::net::TcpStream", reason = "sans-IO: emit a Transmit instead" },
+  { path = "tokio::net::UdpSocket", reason = "sans-IO: emit a Transmit instead", allow-invalid = true },
+  { path = "compio::net::UdpSocket", reason = "sans-IO: emit a Transmit instead", allow-invalid = true },
+]

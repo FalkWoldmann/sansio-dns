@@ -1,6 +1,6 @@
 //! Shared fixtures: two fake name servers and a reply builder.
 
-#![allow(dead_code)]
+#![allow(dead_code, reason = "each test crate uses a different subset")]
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Instant;
@@ -62,5 +62,5 @@ pub fn encode(message: &Message) -> Vec<u8> {
 }
 
 pub fn is_response(event: Option<Event>) -> bool {
-    matches!(event, Some(Event::Response { .. }))
+    event.is_some_and(|e| matches!(e, Event::Response { .. }))
 }

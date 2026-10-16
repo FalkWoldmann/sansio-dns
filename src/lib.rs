@@ -52,12 +52,18 @@ impl Config {
     /// `first` and then `more`, two attempts per server, two seconds each.
     pub fn new(first: SocketAddr, more: impl IntoIterator<Item = SocketAddr>) -> Self {
         let servers: Vec<SocketAddr> = std::iter::once(first).chain(more).collect();
-        let attempts = NonZeroUsize::new(servers.len() * 2).expect("at least one server");
+        let attempts = NonZeroUsize::new(servers.len() * 2).unwrap_or(NonZeroUsize::MIN);
         Self {
             servers,
             timeout: Duration::from_secs(2),
             attempts,
         }
+    }
+
+    /// The server for the given attempt, rotating through the list.
+    #[expect(clippy::indexing_slicing, reason = "servers is never empty")]
+    fn server(&self, attempt: usize) -> SocketAddr {
+        self.servers[attempt % self.servers.len()]
     }
 }
 
@@ -70,7 +76,9 @@ pub struct QueryId(u64);
 pub struct Transmit {
     /// The query this datagram belongs to; see the crate docs on source ports.
     pub query: QueryId,
+    /// The name server to send it to.
     pub destination: SocketAddr,
+    /// The DNS message, ready to send as one UDP datagram.
     pub payload: Vec<u8>,
 }
 
@@ -79,9 +87,19 @@ pub struct Transmit {
 pub enum Event {
     /// A server answered. `NXDOMAIN` and empty answers arrive here too;
     /// inspect `response.metadata.response_code`.
-    Response { query: QueryId, response: Message },
+    Response {
+        /// The query that completed.
+        query: QueryId,
+        /// The server's answer.
+        response: Message,
+    },
     /// The query gave up.
-    Failed { query: QueryId, error: Error },
+    Failed {
+        /// The query that failed.
+        query: QueryId,
+        /// Why it failed.
+        error: Error,
+    },
 }
 
 /// Why a query failed.
@@ -107,6 +125,7 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+#[derive(Debug)]
 struct Pending {
     request: Message,
     payload: Vec<u8>,
@@ -116,6 +135,7 @@ struct Pending {
 }
 
 /// The resolver state machine. See the crate docs for how to drive it.
+#[derive(Debug)]
 pub struct Resolver {
     config: Config,
     next_query: u64,
@@ -125,6 +145,7 @@ pub struct Resolver {
 }
 
 impl Resolver {
+    /// A resolver with no queries in flight.
     pub fn new(config: Config) -> Self {
         Self {
             config,
@@ -156,7 +177,7 @@ impl Resolver {
 
         let id = QueryId(self.next_query);
         self.next_query += 1;
-        let server = self.config.servers[0];
+        let server = self.config.server(0);
         self.pending.insert(
             id,
             Pending {
@@ -267,7 +288,7 @@ impl Resolver {
             self.fail(id, error);
             return;
         }
-        pending.server = self.config.servers[pending.attempt % self.config.servers.len()];
+        pending.server = self.config.server(pending.attempt);
         pending.deadline = now + self.config.timeout;
         self.transmits.push_back(Transmit {
             query: id,
@@ -309,12 +330,15 @@ impl Resolver {
     /// The ID comes from hickory-proto's `rand::random`, a CSPRNG, covering
     /// the full 16-bit range as RFC 5452 §9.2 requires.
     fn new_message(&self) -> Message {
-        std::iter::repeat_with(Message::query)
-            .find(|m| {
-                self.pending
-                    .values()
-                    .all(|p| p.request.metadata.id != m.metadata.id)
-            })
-            .expect("repeat_with is infinite")
+        loop {
+            let message = Message::query();
+            if self
+                .pending
+                .values()
+                .all(|p| p.request.metadata.id != message.metadata.id)
+            {
+                return message;
+            }
+        }
     }
 }
