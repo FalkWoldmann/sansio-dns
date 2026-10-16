@@ -21,6 +21,37 @@
 //! With the `tls` feature, `Config::with_tls` sends every query over DNS
 //! over TLS (RFC 7858) instead.
 //!
+//! # How a query moves on
+//!
+//! Each query has [`Config::attempts`] attempts, and attempt `n` goes to
+//! server `n` modulo the number of servers, so with one server every attempt
+//! goes to it. Answers are matched by message ID and question, which are
+//! the same for every attempt, so an answer to an earlier attempt still
+//! counts if it comes from the server of the current one.
+//!
+//! | What happens | What the query does next | Server | Uses an attempt |
+//! |---|---|---|---|
+//! | No answer by its deadline | sends its next attempt | next | yes |
+//! | `SERVFAIL`, `REFUSED`, `NOTIMP`, or `FORMERR` with OPT | sends its next attempt | next | yes |
+//! | Truncated answer over UDP | switches to TCP, once: later attempts stay on TCP | same | no |
+//! | `FORMERR` without OPT (not over TLS) | drops EDNS, once: later attempts stay without it | same | no |
+//! | A connection that had answered is lost, or another query on its connection times out | is sent again on a new connection, once per query | same | no |
+//! | A connection that never answered is lost, or TLS fails | sends its next attempt | next | yes |
+//! | `NXDOMAIN` with search candidates left | starts over with the next candidate | first | fresh attempts |
+//! | Out of attempts | fails with the last error | | |
+//!
+//! Over a lost connection the query gets a fresh deadline; after another
+//! query's timeout it keeps its own. So for one name, a query is sent at
+//! most `attempts + 3` times. Any other answer (`NOERROR`, or `NXDOMAIN`
+//! with no candidate left) ends the query, and so does a server error on
+//! the last attempt: the search moves on only on `NXDOMAIN`.
+//!
+//! A query for the same name and type as one in flight joins it instead of
+//! being sent, and gets its outcome. One that joined after the first one
+//! started starts over with attempts of its own if the first runs out.
+//! [`Resolver::cancel`] hands a query that others joined to the next of
+//! them.
+//!
 //! # Driver obligations
 //!
 //! Stream connections (TCP, and TLS on top of it) are named by a

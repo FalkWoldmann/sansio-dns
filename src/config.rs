@@ -22,8 +22,10 @@ pub struct Config {
     /// How long to wait for a response before retrying. A value too large
     /// to add to an `Instant`, such as `Duration::MAX`, means wait forever.
     pub timeout: Duration,
-    /// Total number of attempts per query, across all servers. Switching to
-    /// TCP or dropping EDNS doesn't count as one.
+    /// Total number of attempts per query, across all servers: attempt `n`
+    /// goes to server `n` modulo their number. Switching to TCP, dropping
+    /// EDNS and resending after a lost connection don't count as one; see
+    /// the crate docs on how a query moves on.
     pub attempts: NonZeroUsize,
     /// Domains to try appending to names without a trailing dot, in order.
     /// Empty means every name is used as given.
@@ -91,9 +93,10 @@ impl Config {
 
     /// Settings from the text of a `resolv.conf` file, read the way glibc
     /// reads it: `nameserver` lines (port 53), `search` or `domain`,
-    /// `options ndots:` (at most 15), `options timeout:` in seconds (at most
-    /// 30) and `options attempts:` per server (at most 5). Without
-    /// usable `nameserver` lines, the local host is asked (127.0.0.1).
+    /// `options ndots:` (default 1, at most 15), `options timeout:` in
+    /// seconds (default 5, at most 30) and `options attempts:` per server
+    /// (default 2, at most 5). Without usable `nameserver` lines, the local
+    /// host is asked (127.0.0.1).
     ///
     /// A link-local server with a named scope (`fe80::1%eth0`) is skipped,
     /// since mapping an interface name to its index needs a system call;

@@ -98,7 +98,8 @@ impl Resolver {
     /// A name ending in a dot is used as given. Other names are tried with
     /// the [`Config::search`] domains, ordered by [`Config::ndots`]; the next
     /// candidate is tried while the answer is NXDOMAIN, and the event carries
-    /// the last answer. Without search domains, `example.com` and
+    /// the last answer. Any other answer, or a server error on the last
+    /// attempt, ends the search. Without search domains, `example.com` and
     /// `example.com.` are the same query.
     ///
     /// Special-use names are answered at once, without a transmit:
@@ -228,11 +229,14 @@ impl Resolver {
     /// Process a datagram received from `from` on the socket of `query`,
     /// the one its [`Transport::Udp`] transmits were sent from.
     ///
-    /// Datagrams that aren't a response to that query (wrong source address,
-    /// message ID, opcode or question, RFC 5452 §9.1 and RFC 1035 §7.3) are
-    /// ignored, so spoofed or late responses can't complete it. Naming the
-    /// socket keeps each query's source port its own (§9.2). Once the query
-    /// has switched to TCP, UDP replies to it are ignored too.
+    /// Datagrams that aren't a response to that query are ignored (RFC 5452
+    /// §9.1, RFC 1035 §7.3): the source must be the server of the current
+    /// attempt, and message ID, opcode and question must match, the name
+    /// compared case-insensitively. Spoofed answers and answers from servers
+    /// tried before can't complete it, but a late answer from the current
+    /// server to an earlier attempt can, since attempts keep their message
+    /// ID. Naming the socket keeps each query's source port its own (§9.2).
+    /// Once the query has switched to TCP, UDP replies to it are ignored.
     pub fn handle_datagram(&mut self, query: QueryId, from: SocketAddr, data: &[u8], now: Instant) {
         // The cheap checks first, so stray datagrams cost no parsing.
         let Some(pending) = self.pending.get(&query) else {
@@ -319,21 +323,23 @@ impl Resolver {
         Some(decoded)
     }
 
-    /// The server closed `connection`. Its queries move on to their next
-    /// attempt, still over a stream; see [`Resolver::handle_stream_error`]
-    /// for when they don't use one up.
+    /// The server closed `connection`, or reading from it ended.
+    ///
+    /// If the connection had answered before, the server most likely closed
+    /// it for being idle while a query was on its way (RFC 7766 §6.2.3):
+    /// each query on it is sent once more to the same server, on a new
+    /// connection, with a fresh deadline and without using up an attempt.
+    /// Otherwise, and for a query already resent this way, the query moves on
+    /// to its next attempt, still over a stream, and a query out of attempts
+    /// fails with [`Error::ConnectionClosed`].
     pub fn handle_stream_closed(&mut self, connection: ConnectionId, now: Instant) {
         self.lost(connection, now, &Error::ConnectionClosed);
     }
 
     /// Connecting, reading or writing failed on `connection` with `error`.
-    /// Its queries move on as with [`Resolver::handle_stream_closed`], and
-    /// one out of attempts fails with [`Error::Connection`].
-    ///
-    /// A connection that has answered before was most likely closed by the
-    /// server for being idle while a query was on its way (RFC 7766
-    /// §6.2.3). Each query on it is then sent once more to the same server,
-    /// on a new connection, without using up an attempt.
+    /// Its queries move on exactly as with [`Resolver::handle_stream_closed`];
+    /// the difference is that a query out of attempts fails with
+    /// [`Error::Connection`] carrying `error`.
     pub fn handle_stream_error(
         &mut self,
         connection: ConnectionId,
@@ -506,7 +512,9 @@ impl Resolver {
         self.transmits.extend(resend);
     }
 
-    /// Send `id` to the next server, or fail it with `error` if it is out of attempts.
+    /// Send `id` to the next server, or fail it with `error` if it is out of
+    /// attempts. The route stays: after a truncated answer, later attempts
+    /// also go over TCP.
     fn retry(&mut self, id: QueryId, now: Instant, error: Error) {
         let Some(pending) = self.pending.get_mut(&id) else {
             return;

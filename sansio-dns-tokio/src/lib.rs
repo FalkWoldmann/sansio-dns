@@ -22,7 +22,9 @@
 //! it while some thread is blocked on it: while that runtime sits idle,
 //! lookups from the others hang. When the task's runtime shuts down, the
 //! next lookup, or one that was waiting on it, starts a new task on its own
-//! runtime. The task ends when the last clone is dropped.
+//! runtime; only a stopped task is ever replaced. The task ends when the
+//! last clone is dropped: a lookup borrows its resolver (and reqwest's
+//! holds a clone), so no lookup can outlive every clone and keep it going.
 //!
 //! With the `reqwest` feature, [`Resolver`] also implements
 //! `reqwest::dns::Resolve`:
@@ -83,7 +85,8 @@ pub enum Error {
     #[error("no addresses found")]
     NotFound,
     /// The background task stopped without answering, even after the lookup
-    /// restarted it on its own runtime: it panicked.
+    /// restarted it on its own runtime: it panicked, or that runtime shut
+    /// down while another one polled the lookup.
     #[error("resolver task stopped before answering")]
     Stopped,
 }
@@ -147,6 +150,8 @@ impl Resolver {
                 cancel.requests = None;
                 return result;
             }
+            // The task is gone, so there's nothing to cancel; its channel
+            // tells the retry which task to replace.
             stopped = cancel.requests.take();
         }
         Err(Error::Stopped)
