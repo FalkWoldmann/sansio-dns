@@ -34,6 +34,11 @@ while let Some(event) = resolver.poll_event() {
 
 `addresses(&message)` does the CNAME-following part for any single response.
 
+A query for the same name and type as one already in flight joins it instead of being sent,
+and gets the same outcome as its own event, so parallel lookups of one host share their
+queries. One that joins late doesn't inherit the first one's spent attempts: if that one runs
+out, the later query starts over with its own. Cancelling the first hands the query to the next.
+
 ### Tokio and reqwest
 
 [`sansio-dns-tokio`](sansio-dns-tokio) is a ready-made driver: `lookup_ip(host)` runs an

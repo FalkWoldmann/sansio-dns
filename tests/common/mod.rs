@@ -1,6 +1,7 @@
 //! Shared fixtures: two fake name servers and a reply builder.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use hickory_proto::op::{Message, ResponseCode};
@@ -22,6 +23,14 @@ pub fn resolver() -> Resolver {
 /// Start an `example.com. A` lookup and return the first datagram.
 pub fn start(resolver: &mut Resolver, now: Instant) -> Transmit {
     start_name(resolver, "example.com.", now)
+}
+
+/// Start an A lookup for a name no earlier call has used, so it doesn't join
+/// another query in flight.
+pub fn start_distinct(resolver: &mut Resolver, now: Instant) -> Transmit {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    start_name(resolver, &format!("q{n}.example.com."), now)
 }
 
 pub fn start_name(resolver: &mut Resolver, name: &str, now: Instant) -> Transmit {

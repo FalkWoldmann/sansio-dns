@@ -57,11 +57,12 @@ fn framed(message: &[u8]) -> Vec<u8> {
     .concat()
 }
 
-/// `resolver` with `in_flight` more unanswered queries for other names.
+/// `resolver` with `in_flight` more unanswered queries, each for a name of
+/// its own so none joins another.
 fn busy_resolver(mut resolver: Resolver, in_flight: usize, now: Instant) -> Resolver {
-    for _ in 0..in_flight {
+    for i in 0..in_flight {
         resolver
-            .query(name("busy.example."), RecordType::A, now)
+            .query(name(&format!("busy{i}.example.")), RecordType::A, now)
             .unwrap();
     }
     while resolver.poll_transmit().is_some() {}
@@ -103,11 +104,10 @@ fn connected_resolver(now: Instant) -> (Resolver, ConnectionId) {
 /// on its connection, moved there by truncated answers.
 fn busy_stream_resolver(in_flight: usize, now: Instant) -> (Resolver, ConnectionId) {
     let (mut resolver, connection) = connected_resolver(now);
-    let truncated = answer("busy.example.", true);
-    for _ in 0..in_flight {
-        let query = resolver
-            .query(name("busy.example."), RecordType::A, now)
-            .unwrap();
+    for i in 0..in_flight {
+        let busy = format!("busy{i}.example.");
+        let truncated = answer(&busy, true);
+        let query = resolver.query(name(&busy), RecordType::A, now).unwrap();
         let udp = resolver.poll_transmit().unwrap();
         resolver.handle_datagram(query, SERVER, &answering(&truncated, &udp.payload), now);
         let tcp = resolver.poll_transmit().unwrap();

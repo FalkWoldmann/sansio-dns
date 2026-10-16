@@ -8,6 +8,7 @@
     reason = "helpers may panic; allow, since newer clippy skips tests/ (rust-clippy#16786)"
 )]
 
+mod coalescing;
 mod common;
 mod hosts;
 mod lookup;

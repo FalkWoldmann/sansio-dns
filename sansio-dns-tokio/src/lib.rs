@@ -284,7 +284,7 @@ async fn run(config: Config, mut requests: mpsc::UnboundedReceiver<Request>) {
                 Some(Request::Cancel(id)) => {
                     if let Some(Running { lookup, .. }) = lookups.remove(&id) {
                         for query in lookup.queries() {
-                            resolver.cancel(query);
+                            resolver.cancel(query, Instant::now());
                             owners.remove(&query);
                             io.forget(query);
                         }

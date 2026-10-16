@@ -51,8 +51,18 @@ pub struct Harness {
     finished: BTreeSet<QueryId>,
     open: BTreeSet<ConnectionId>,
     opened: BTreeSet<ConnectionId>,
-    sends: BTreeMap<QueryId, usize>,
-    by_message_id: BTreeMap<u16, QueryId>,
+    /// Live queries for the same name and type, which the resolver
+    /// coalesces: the first one sends, the others join it.
+    groups: BTreeMap<Group, Vec<QueryId>>,
+    group_of: BTreeMap<QueryId, Group>,
+    /// The member a group's datagrams last came from. Another member may
+    /// only send after that one was cancelled in the same step (it takes
+    /// the query over) or failed in it (it starts over on its own).
+    sender: BTreeMap<Group, QueryId>,
+    /// Groups whose sender was cancelled in the current step.
+    handed_over: BTreeSet<Group>,
+    sends: BTreeMap<Group, usize>,
+    by_message_id: BTreeMap<u16, Group>,
     pub recent: VecDeque<Sent>,
     events: Vec<Event>,
 }
@@ -73,6 +83,10 @@ impl Harness {
             open: BTreeSet::new(),
             opened: BTreeSet::new(),
             sends: BTreeMap::new(),
+            groups: BTreeMap::new(),
+            group_of: BTreeMap::new(),
+            sender: BTreeMap::new(),
+            handed_over: BTreeSet::new(),
             by_message_id: BTreeMap::new(),
             recent: VecDeque::new(),
             events: Vec::new(),
@@ -86,9 +100,30 @@ impl Harness {
     }
 
     pub fn query(&mut self, name: Name, record_type: RecordType) -> Option<QueryId> {
+        let group = (name.to_ascii().to_ascii_lowercase(), u16::from(record_type));
         let id = self.resolver.query(name, record_type, self.now).ok()?;
         self.live.insert(id);
+        self.groups.entry(group.clone()).or_default().push(id);
+        self.group_of.insert(id, group);
         Some(id)
+    }
+
+    /// `id` is over: it leaves its group, and an empty group is forgotten.
+    fn leave(&mut self, id: QueryId) {
+        let Some(group) = self.group_of.remove(&id) else {
+            return;
+        };
+        let Some(members) = self.groups.get_mut(&group) else {
+            return;
+        };
+        members.retain(|&member| member != id);
+        if members.is_empty() {
+            self.groups.remove(&group);
+            self.sender.remove(&group);
+            self.handed_over.remove(&group);
+            self.sends.remove(&group);
+            self.by_message_id.retain(|_, g| *g != group);
+        }
     }
 
     pub fn live(&self) -> &BTreeSet<QueryId> {
@@ -102,9 +137,17 @@ impl Harness {
 
     pub fn cancel(&mut self, which: u8) {
         if let Some(id) = pick(&self.live, which) {
-            self.resolver.cancel(id);
+            self.resolver.cancel(id, self.now);
             self.live.remove(&id);
             self.finished.insert(id);
+            let group = self.group_of.get(&id).cloned();
+            let was_sender = group
+                .as_ref()
+                .is_some_and(|g| self.sender.get(g) == Some(&id));
+            self.leave(id);
+            if let Some(group) = group.filter(|g| was_sender && self.groups.contains_key(g)) {
+                self.handed_over.insert(group);
+            }
         }
     }
 
@@ -160,6 +203,7 @@ impl Harness {
     /// transmits.
     pub fn check(&mut self) -> Vec<Transmit> {
         let mut out = Vec::new();
+        let mut started_over = Vec::new();
         while let Some(t) = self.resolver.poll_transmit() {
             assert!(
                 self.servers.is_empty() || self.servers.contains(&t.destination),
@@ -171,9 +215,21 @@ impl Harness {
                         self.live.contains(&q),
                         "datagram for {q:?}, which isn't live"
                     );
-                    self.count(q);
+                    let group = self.group_of[&q].clone();
+                    match self.sender.insert(group.clone(), q) {
+                        Some(previous) if previous != q => {
+                            if !self.handed_over.remove(&group) {
+                                // A late joiner starting over with a budget
+                                // of its own: `previous` must fail now.
+                                started_over.push(previous);
+                                self.sends.remove(&group);
+                                self.count(&group);
+                            }
+                        }
+                        _ => self.count(&group),
+                    }
                     let request = Message::from_vec(&t.payload).expect("the resolver sent garbage");
-                    self.by_message_id.insert(request.metadata.id, q);
+                    self.by_message_id.insert(request.metadata.id, group);
                     self.remember(&t, request);
                 }
                 Transport::TcpConnect(c) | Transport::TcpWrite(c) => {
@@ -204,8 +260,16 @@ impl Harness {
                 "second event for {id:?}, or one after cancel"
             );
             assert!(self.live.remove(&id), "event for unknown {id:?}");
+            self.leave(id);
             self.events.push(event);
         }
+        for previous in started_over {
+            assert!(
+                !self.live.contains(&previous),
+                "another query of {previous:?}'s group sent while it is live"
+            );
+        }
+        self.handed_over.clear();
 
         assert_eq!(
             self.resolver.poll_timeout().is_some(),
@@ -228,23 +292,24 @@ impl Harness {
             "wrong length prefix"
         );
         let request = Message::from_vec(message).expect("the resolver sent garbage");
-        let q = *self
+        let group = self
             .by_message_id
             .get(&request.metadata.id)
-            .expect("stream query with an ID never sent over UDP");
+            .expect("stream query with an ID never sent over UDP")
+            .clone();
         assert!(
-            self.live.contains(&q),
-            "stream query for {q:?}, which isn't live"
+            self.groups.contains_key(&group),
+            "stream query for {group:?}, which has no live query"
         );
-        self.count(q);
+        self.count(&group);
         self.remember(t, request);
     }
 
-    fn count(&mut self, q: QueryId) {
-        let sends = self.sends.entry(q).or_default();
+    fn count(&mut self, group: &Group) {
+        let sends = self.sends.entry(group.clone()).or_default();
         *sends += 1;
         if let Some(max) = self.max_sends {
-            assert!(*sends <= max, "{q:?} sent more than {max} times");
+            assert!(*sends <= max, "{group:?} sent more than {max} times");
         }
     }
 
@@ -259,6 +324,9 @@ impl Harness {
         });
     }
 }
+
+/// The name, as given and lowercased, and record type of a query.
+type Group = (String, u16);
 
 fn pick<T: Copy>(set: &BTreeSet<T>, which: u8) -> Option<T> {
     set.iter()

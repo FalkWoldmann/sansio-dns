@@ -312,6 +312,13 @@ struct Pending {
     /// working connection or being moved off a timed-out one. That happens
     /// once per query; see `Resolver::forgive`.
     forgiven: bool,
+    /// The name and type as asked, before search domains. A later query
+    /// for the same pair joins this one instead of being sent.
+    asked: (Name, RecordType),
+    /// When this query, or its current search candidate, started.
+    started: Instant,
+    /// Queries that joined this one, and when; each gets its outcome too.
+    followers: Vec<(QueryId, Instant)>,
 }
 
 /// How a query's current attempt travels.
@@ -445,13 +452,19 @@ impl Resolver {
     /// AAAA queries, with the addresses of that family (possibly none), as
     /// glibc's `hosts: files dns` does. The name is matched as given, before
     /// any search domain.
+    ///
+    /// A query for the same name and type as one still in flight (compared
+    /// as given, before search domains) joins it: nothing is sent for it,
+    /// and it gets the same response or error as its own event. If the
+    /// first one runs out of attempts, a query that joined it later starts
+    /// over with attempts of its own instead of sharing the failure.
     pub fn query(
         &mut self,
         name: Name,
         record_type: RecordType,
         now: Instant,
     ) -> Result<QueryId, ProtoError> {
-        let mut candidates = self.config.candidates(&name);
+        let asked = (name.clone(), record_type);
         let mut absolute = name;
         absolute.set_fqdn(true);
         let id = QueryId(self.next_query);
@@ -465,11 +478,26 @@ impl Resolver {
             });
             return Ok(id);
         }
-        let first = candidates.pop_front().unwrap_or(absolute);
-        let pending = self.new_pending(first, record_type, candidates, now)?;
+        if let Some(leader) = self.pending.values_mut().find(|p| p.asked == asked) {
+            leader.followers.push((id, now));
+            return Ok(id);
+        }
+        let pending = self.begin(asked, now)?;
         self.pending.insert(id, pending);
         self.emit(id, now);
         Ok(id)
+    }
+
+    /// A new query for `asked`, at its first search candidate.
+    fn begin(&self, asked: (Name, RecordType), now: Instant) -> Result<Pending, ProtoError> {
+        let (name, record_type) = &asked;
+        let mut candidates = self.config.candidates(name);
+        let first = candidates.pop_front().unwrap_or_else(|| {
+            let mut absolute = name.clone();
+            absolute.set_fqdn(true);
+            absolute
+        });
+        self.new_pending(first, *record_type, candidates, asked, now)
     }
 
     /// A fresh first attempt for `name`, with its own message ID.
@@ -478,6 +506,7 @@ impl Resolver {
         name: Name,
         record_type: RecordType,
         rest: VecDeque<Name>,
+        asked: (Name, RecordType),
         now: Instant,
     ) -> Result<Pending, ProtoError> {
         let mut request = self.new_message();
@@ -503,22 +532,33 @@ impl Resolver {
             },
             rest,
             forgiven: false,
+            asked,
+            started: now,
+            followers: Vec::new(),
         })
     }
 
     /// Replace `id`'s attempt with one for its next search candidate.
     /// Returns `false` if there is none, so the current answer stands.
     fn next_candidate(&mut self, id: QueryId, now: Instant) -> bool {
-        let Some((name, rest, record_type)) = self.pending.get_mut(&id).and_then(|p| {
+        let Some((name, rest, record_type, asked)) = self.pending.get_mut(&id).and_then(|p| {
             let record_type = p.request.queries.first()?.query_type();
             let name = p.rest.pop_front()?;
-            Some((name, std::mem::take(&mut p.rest), record_type))
+            Some((
+                name,
+                std::mem::take(&mut p.rest),
+                record_type,
+                p.asked.clone(),
+            ))
         }) else {
             return false;
         };
-        let Ok(next) = self.new_pending(name, record_type, rest, now) else {
+        let Ok(mut next) = self.new_pending(name, record_type, rest, asked, now) else {
             return false;
         };
+        if let Some(previous) = self.pending.get_mut(&id) {
+            next.followers = std::mem::take(&mut previous.followers);
+        }
         self.pending.insert(id, next);
         self.emit(id, now);
         true
@@ -678,11 +718,20 @@ impl Resolver {
             | ResponseCode::NotImp
             | ResponseCode::FormErr) => self.retry(id, now, Error::Server(code)),
             _ => {
-                self.pending.remove(&id);
+                let followers = self.pending.remove(&id).map(|p| p.followers);
+                let copies: Vec<Event> = followers
+                    .into_iter()
+                    .flatten()
+                    .map(|(query, _)| Event::Response {
+                        query,
+                        response: response.clone(),
+                    })
+                    .collect();
                 self.events.push_back(Event::Response {
                     query: id,
                     response,
                 });
+                self.events.extend(copies);
             }
         }
     }
@@ -768,8 +817,32 @@ impl Resolver {
     }
 
     /// Stop tracking a query. No event is emitted for it.
-    pub fn cancel(&mut self, id: QueryId) {
-        self.pending.remove(&id);
+    ///
+    /// Queries that joined it go on: the first of them takes it over. If it
+    /// waits for a datagram, its current attempt is sent again from that
+    /// query's own socket ([`Transport::Udp`]), to the same server, with a
+    /// fresh deadline.
+    pub fn cancel(&mut self, id: QueryId, now: Instant) {
+        let Some(mut pending) = self.pending.remove(&id) else {
+            for p in self.pending.values_mut() {
+                p.followers.retain(|&(follower, _)| follower != id);
+            }
+            return;
+        };
+        if pending.followers.is_empty() {
+            return;
+        }
+        let (heir, _) = pending.followers.remove(0);
+        let resend = (pending.route == Route::Udp).then(|| Transmit {
+            transport: Transport::Udp(heir),
+            destination: self.config.server(pending.attempt),
+            payload: pending.payload.clone(),
+        });
+        if resend.is_some() {
+            pending.deadline = now.checked_add(self.config.timeout);
+        }
+        self.pending.insert(heir, pending);
+        self.transmits.extend(resend);
     }
 
     /// Send `id` to the next server, or fail it with `error` if it is out of attempts.
@@ -779,7 +852,7 @@ impl Resolver {
         };
         pending.attempt += 1;
         if pending.attempt >= self.config.attempts.get() {
-            self.fail(id, error);
+            self.give_up(id, error, now);
             return;
         }
         pending.deadline = now.checked_add(self.config.timeout);
@@ -1004,9 +1077,50 @@ impl Resolver {
         Ok(())
     }
 
+    /// `id` is out of attempts. Queries that joined it after it started
+    /// haven't had attempts of their own yet: instead of sharing the failure
+    /// they start over, the first as a new query that the others join.
+    fn give_up(&mut self, id: QueryId, error: Error, now: Instant) {
+        let Some(pending) = self.pending.get_mut(&id) else {
+            return;
+        };
+        let started = pending.started;
+        let (late, early): (Vec<_>, Vec<_>) = std::mem::take(&mut pending.followers)
+            .into_iter()
+            .partition(|&(_, joined)| joined > started);
+        pending.followers = early;
+        let asked = pending.asked.clone();
+        let Some((&(heir, _), others)) = late.split_first() else {
+            self.fail(id, error);
+            return;
+        };
+        // Can't fail for a name that was already encoded once; if it did,
+        // the late queries would share the failure.
+        let Ok(mut fresh) = self.begin(asked, now) else {
+            if let Some(pending) = self.pending.get_mut(&id) {
+                pending.followers.extend(late);
+            }
+            self.fail(id, error);
+            return;
+        };
+        self.fail(id, error);
+        fresh.followers = others.to_vec();
+        self.pending.insert(heir, fresh);
+        self.emit(heir, now);
+    }
+
     fn fail(&mut self, id: QueryId, error: Error) {
-        self.pending.remove(&id);
+        let followers = self.pending.remove(&id).map(|p| p.followers);
+        let copies: Vec<Event> = followers
+            .into_iter()
+            .flatten()
+            .map(|(query, _)| Event::Failed {
+                query,
+                error: error.clone(),
+            })
+            .collect();
         self.events.push_back(Event::Failed { query: id, error });
+        self.events.extend(copies);
     }
 
     /// A query message, with an ID no in-flight query is using if one of a

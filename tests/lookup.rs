@@ -120,7 +120,7 @@ mod ip_lookup {
         let lookup = IpLookup::start(&mut resolver, name("example.com."), Instant::now()).unwrap();
         let a = resolver.poll_transmit().unwrap();
         while resolver.poll_transmit().is_some() {}
-        let other = start(&mut resolver, Instant::now());
+        let other = start_distinct(&mut resolver, Instant::now());
         for t in [&a, &other] {
             resolver.handle_datagram(udp(t), S1, &encode(&reply(t)), Instant::now());
         }

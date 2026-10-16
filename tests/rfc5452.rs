@@ -42,7 +42,7 @@ mod section_9_1 {
     #[case::missing_question(no_question)]
     fn mismatched_response_is_invalid(mut resolver: Resolver, #[case] tamper: fn(&mut Message)) {
         let now = Instant::now();
-        let sent = start(&mut resolver, now);
+        let sent = start_distinct(&mut resolver, now);
         let mut forged = reply(&sent);
         tamper(&mut forged);
 
@@ -61,7 +61,7 @@ mod section_9_1 {
     #[case::other_port(SocketAddr::new(S1.ip(), 5353))]
     fn response_from_wrong_address_is_invalid(mut resolver: Resolver, #[case] from: SocketAddr) {
         let now = Instant::now();
-        let sent = start(&mut resolver, now);
+        let sent = start_distinct(&mut resolver, now);
 
         resolver.handle_datagram(udp(&sent), from, &encode(&reply(&sent)), now);
 
@@ -72,7 +72,7 @@ mod section_9_1 {
     #[rstest]
     fn late_answer_from_previous_server_is_invalid(mut resolver: Resolver) {
         let now = Instant::now();
-        let first = start(&mut resolver, now);
+        let first = start_distinct(&mut resolver, now);
         resolver.handle_timeout(resolver.poll_timeout().unwrap());
         assert_eq!(resolver.poll_transmit().unwrap().destination, S2);
 
@@ -84,8 +84,8 @@ mod section_9_1 {
     #[rstest]
     fn concurrent_queries_match_independently(mut resolver: Resolver) {
         let now = Instant::now();
-        let a = start(&mut resolver, now);
-        let b = start(&mut resolver, now);
+        let a = start_distinct(&mut resolver, now);
+        let b = start_distinct(&mut resolver, now);
 
         resolver.handle_datagram(udp(&b), S1, &encode(&reply(&b)), now);
         assert!(is_response(resolver.poll_event()));
@@ -100,7 +100,7 @@ mod section_9_1 {
         fn any_id_bit_flip_is_rejected(bit in 0u32..16) {
             let mut r = resolver();
             let now = Instant::now();
-            let sent = start(&mut r, now);
+            let sent = start_distinct(&mut r, now);
             let mut forged = reply(&sent);
             forged.metadata.id ^= 1 << bit;
 
@@ -118,7 +118,7 @@ mod section_4_6 {
     #[rstest]
     fn first_matching_response_wins(mut resolver: Resolver) {
         let now = Instant::now();
-        let sent = start(&mut resolver, now);
+        let sent = start_distinct(&mut resolver, now);
         let answer = encode(&reply(&sent));
 
         resolver.handle_datagram(udp(&sent), S1, &answer, now);
@@ -138,7 +138,9 @@ mod section_9_2 {
     #[rstest]
     fn outstanding_queries_have_distinct_ids_and_handles(mut resolver: Resolver) {
         let now = Instant::now();
-        let sent: Vec<_> = (0..512).map(|_| start(&mut resolver, now)).collect();
+        let sent: Vec<_> = (0..512)
+            .map(|_| start_distinct(&mut resolver, now))
+            .collect();
 
         let ids: HashSet<u16> = sent.iter().map(|t| decode(t).metadata.id).collect();
         let handles: HashSet<_> = sent.iter().map(|t| t.transport).collect();
@@ -151,7 +153,7 @@ mod section_9_2 {
     fn ids_are_not_sequential(mut resolver: Resolver) {
         let now = Instant::now();
         let ids: Vec<u16> = (0..64)
-            .map(|_| decode(&start(&mut resolver, now)).metadata.id)
+            .map(|_| decode(&start_distinct(&mut resolver, now)).metadata.id)
             .collect();
         assert!(ids.windows(2).any(|w| w[1] != w[0].wrapping_add(1)));
     }
@@ -160,8 +162,8 @@ mod section_9_2 {
     #[rstest]
     fn answer_on_another_querys_socket_is_ignored(mut resolver: Resolver) {
         let now = Instant::now();
-        let a = start(&mut resolver, now);
-        let b = start(&mut resolver, now);
+        let a = start_distinct(&mut resolver, now);
+        let b = start_distinct(&mut resolver, now);
 
         resolver.handle_datagram(udp(&a), S1, &encode(&reply(&b)), now);
 

@@ -12,6 +12,8 @@ use crate::common::{V4, V6, counting_name_server, name_server, name_server_on};
 use rstest::rstest;
 use sansio_dns::Config;
 use sansio_dns::hickory_proto::op::{Message, OpCode};
+use sansio_dns::hickory_proto::rr::rdata::{A, AAAA};
+use sansio_dns::hickory_proto::rr::{RData, Record, RecordType};
 use sansio_dns_tokio::{Error, Resolver};
 use tokio::net::UdpSocket;
 
@@ -124,6 +126,48 @@ fn resolver_outlives_the_runtime_of_its_first_lookup() {
             .build()
             .unwrap();
         let addresses = runtime.block_on(resolver.lookup_ip("app.example")).unwrap();
+        assert_eq!(addresses, [IpAddr::V4(V4), IpAddr::V6(V6)]);
+    }
+}
+
+/// Lookups of one name in flight together share one A and one AAAA query.
+#[tokio::test]
+async fn concurrent_lookups_of_one_name_share_their_queries() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let resolver = Resolver::new(Config::new(server.local_addr().unwrap(), []));
+    let lookups: Vec<_> = (0..5)
+        .map(|_| {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.lookup_ip("app.example").await })
+        })
+        .collect();
+    let mut buf = [0; 512];
+    let mut queries = Vec::new();
+    for _ in 0..2 {
+        let (n, from) = server.recv_from(&mut buf).await.unwrap();
+        queries.push((Message::from_vec(&buf[..n]).unwrap(), from));
+    }
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let nothing = server.try_recv_from(&mut buf).unwrap_err();
+    assert_eq!(nothing.kind(), ErrorKind::WouldBlock);
+    for (query, from) in queries {
+        let question = query.queries[0].clone();
+        let data = match question.query_type() {
+            RecordType::A => RData::A(A(V4)),
+            _ => RData::AAAA(AAAA(V6)),
+        };
+        let mut response = Message::response(query.metadata.id, OpCode::Query);
+        response.add_answer(Record::from_rdata(question.name().clone(), 300, data));
+        response.add_query(question);
+        server
+            .send_to(&response.to_vec().unwrap(), from)
+            .await
+            .unwrap();
+    }
+
+    for lookup in lookups {
+        let addresses = lookup.await.unwrap().unwrap();
         assert_eq!(addresses, [IpAddr::V4(V4), IpAddr::V6(V6)]);
     }
 }

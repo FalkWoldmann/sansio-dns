@@ -14,7 +14,7 @@ use sansio_dns::{ConnectionId, Error, Event, Resolver, Transmit, Transport};
 
 /// Start a query, answer it with TC set over UDP, and return the TCP transmit.
 fn switch_to_tcp(resolver: &mut Resolver, now: Instant) -> Transmit {
-    let sent = start(resolver, now);
+    let sent = start_distinct(resolver, now);
     let mut truncated = reply(&sent);
     truncated.metadata.truncation = true;
     resolver.handle_datagram(udp(&sent), S1, &encode(&truncated), now);

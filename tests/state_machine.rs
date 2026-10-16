@@ -189,7 +189,7 @@ impl Harness {
             Op::Cancel { which } => {
                 if !self.live.is_empty() {
                     let id = self.live.swap_remove(which % self.live.len());
-                    self.resolver.cancel(id);
+                    self.resolver.cancel(id, self.now);
                     self.done.insert(id);
                 }
             }
