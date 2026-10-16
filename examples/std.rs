@@ -44,6 +44,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(stream) => tcp = Some((t.query, stream)),
                     Err(_) => resolver.handle_stream_closed(t.query, Instant::now()),
                 },
+                Transport::TcpContinue => {
+                    if let Some((_, stream)) = tcp.as_mut().filter(|(q, _)| *q == t.query)
+                        && stream.write_all(&t.payload).is_err()
+                    {
+                        resolver.handle_stream_closed(t.query, Instant::now());
+                    }
+                }
             }
         }
         if let Some(event) = resolver.poll_event() {

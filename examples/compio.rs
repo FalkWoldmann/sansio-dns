@@ -46,6 +46,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(Ok(stream)) => tcp = Some((t.query, stream)),
                     _ => resolver.handle_stream_closed(t.query, Instant::now()),
                 },
+                Transport::TcpContinue => {
+                    if let Some((_, stream)) = tcp.as_mut().filter(|(q, _)| *q == t.query) {
+                        let BufResult(written, _) = stream.write_all(t.payload).await;
+                        if written.is_err() {
+                            resolver.handle_stream_closed(t.query, Instant::now());
+                        }
+                    }
+                }
             }
         }
         if let Some(event) = resolver.poll_event() {

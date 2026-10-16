@@ -20,5 +20,7 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo nextest run --profile ci
-      - run: cargo test --doc
+      - run: cargo nextest run --profile ci --all-features
+      - run: cargo test --doc --all-features

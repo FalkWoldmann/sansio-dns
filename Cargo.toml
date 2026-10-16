@@ -6,8 +6,17 @@ edition = "2024"
 [dependencies]
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 resolv-conf = "0.7.6"
+rustls = { version = "0.23.46", default-features = false, features = ["std"], optional = true }
+
+[features]
+# DNS over TLS (RFC 7858). Brings rustls without a crypto provider: pass a
+# ClientConfig built with the provider of your choice to Config::with_tls.
+tls = ["dep:rustls"]
 
 [dev-dependencies]
+rcgen = "0.14.10"
+rustls = { version = "0.23.46", default-features = false, features = ["std", "ring"] }
+webpki-roots = "1.0.9"
 compio = { version = "0.19.2", features = ["runtime", "net", "time", "macros", "io"] }
 proptest = "1.12.0"
 rstest = "0.27.0"
@@ -102,3 +111,7 @@ zero_sized_map_values = "deny"
 assertions_on_result_states = "warn"
 string_slice = "warn"
 unreachable = "warn"
+
+[[example]]
+name = "dot"
+required-features = ["tls"]

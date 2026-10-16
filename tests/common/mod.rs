@@ -36,7 +36,7 @@ pub fn start_name(resolver: &mut Resolver, name: &str, now: Instant) -> Transmit
 pub fn decode(transmit: &Transmit) -> Message {
     let message = match transmit.transport {
         Transport::Udp => &transmit.payload[..],
-        Transport::Tcp => &transmit.payload[2..],
+        Transport::Tcp | Transport::TcpContinue => &transmit.payload[2..],
     };
     Message::from_vec(message).unwrap()
 }

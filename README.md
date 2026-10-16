@@ -30,6 +30,17 @@ if let Some(result) = lookup.result() { /* Ok(addresses) or Err(error) */ }
 
 `addresses(&message)` does the CNAME-following part for any single response.
 
+### DNS over TLS
+
+With the `tls` feature, `Config::with_tls(client, server_name)` sends every query over TLS
+(RFC 7858) and authenticates the servers as `server_name` (RFC 8310 strict profile). The crate
+brings rustls without a crypto provider or root store: build the `ClientConfig` with the ones
+you want. `examples/dot.rs` uses ring and the webpki roots:
+
+```sh
+cargo run --example dot --features tls -- example.com 1.1.1.1:853 cloudflare-dns.com
+```
+
 ### Configuration
 
 `Config::from_resolv_conf(&bytes)` reads the text of a `resolv.conf` (you read the file) with
@@ -64,6 +75,9 @@ Tests live in `tests/rfc<number>.rs`, with one module per section.
 | 6761 | §6.4 | `invalid.` → NXDOMAIN; nothing sent |
 | 6762 | §3 | `local.` → NXDOMAIN; nothing sent (resolve with mDNS instead) |
 | 7686 | §2 | `onion.` → NXDOMAIN; nothing sent |
+| 7858 | §3 | With `tls`: every query over TLS on a stream, never UDP; TLS errors fail the attempt |
+| 8310 | §5 | Strict profile: the certificate must match the configured name |
+| 8467 | §4.1 | Queries padded to a multiple of 128 octets |
 
 ### Driver obligations
 
@@ -75,11 +89,14 @@ A `Transmit` with `Transport::Tcp` means: open a new connection to its destinati
 (replacing any earlier one for that query) and write the payload, which is already
 length-prefixed. Pass everything read to `handle_stream_data`, and call
 `handle_stream_closed` on end of stream or error. One connection per query; no pipelining.
+`Transport::TcpContinue` carries more bytes for that same connection (TLS handshakes need it).
 
 ### Not implemented
 
 - TCP connection reuse and pipelining (RFC 7766 §6.2.1); each TCP attempt is a new connection.
-- DoT/DoH/DoQ, caching, DNS cookies (RFC 7873).
+- Reusing TLS connections across queries (RFC 7858 §3.4 recommends it); each attempt
+  handshakes anew. Opportunistic (unauthenticated) TLS.
+- DoH/DoQ, caching, DNS cookies (RFC 7873).
 - `resolv.conf` options other than the ones above (`rotate`, `use-vc`, `sortlist`, …).
 - `IpLookup` searches A and AAAA independently, so the two could end on different candidates.
 - Once EDNS is dropped for a query, it stays off for that query's remaining attempts,

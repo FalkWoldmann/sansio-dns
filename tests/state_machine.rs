@@ -167,7 +167,7 @@ impl Harness {
                     let (from, bytes) = datagram(sent, reply);
                     match sent.transport {
                         Transport::Udp => self.resolver.handle_datagram(from, &bytes, self.now),
-                        Transport::Tcp => {
+                        Transport::Tcp | Transport::TcpContinue => {
                             let framed = frame(&bytes);
                             let (a, b) = framed.split_at(split % (framed.len() + 1));
                             self.resolver.handle_stream_data(sent.query, a, self.now);

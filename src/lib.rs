@@ -18,6 +18,9 @@
 //! For hostnames, [`IpLookup`] runs the A and AAAA queries and collects the
 //! addresses, following CNAMEs.
 //!
+//! With the `tls` feature, `Config::with_tls` sends every query over DNS
+//! over TLS (RFC 7858) instead.
+//!
 //! # Driver obligations
 //!
 //! For a [`Transport::Tcp`] transmit, open a new TCP connection to its
@@ -25,7 +28,9 @@
 //! write the payload; it is already length-prefixed (RFC 7766 §8). Pass
 //! everything read from that connection to [`Resolver::handle_stream_data`]
 //! and call [`Resolver::handle_stream_closed`] on end of stream or error.
-//! The connection can be dropped once the query's [`Event`] arrives.
+//! The connection can be dropped once the query's [`Event`] arrives. A
+//! [`Transport::TcpContinue`] transmit carries more bytes for that same
+//! connection (during a TLS handshake, for example).
 //!
 //! For UDP, [RFC 5452 §9.2] requires an unpredictable source port, and a different
 //! one for each outstanding query. The resolver can't choose ports, so the
@@ -46,11 +51,19 @@ pub use hickory_proto;
 use hickory_proto::ProtoError;
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::domain::usage::{INVALID, LOCAL, LOCALHOST, ONION};
+#[cfg(feature = "tls")]
+use hickory_proto::rr::rdata::opt::EdnsOption;
 use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 
 mod lookup;
 pub use lookup::{IpLookup, addresses};
+#[cfg(feature = "tls")]
+mod tls;
+#[cfg(feature = "tls")]
+pub use rustls;
+#[cfg(feature = "tls")]
+use std::sync::Arc;
 
 /// EDNS UDP payload size recommended by DNS Flag Day 2020.
 const EDNS_PAYLOAD: u16 = 1232;
@@ -72,6 +85,9 @@ pub struct Config {
     /// A name with at least this many dots is tried as given before the
     /// search domains; one with fewer, after them.
     pub ndots: u8,
+    /// DNS over TLS settings; see `Config::with_tls`.
+    #[cfg(feature = "tls")]
+    tls: Option<tls::Settings>,
 }
 
 impl Config {
@@ -85,7 +101,38 @@ impl Config {
             attempts,
             search: Vec::new(),
             ndots: 1,
+            #[cfg(feature = "tls")]
+            tls: None,
         }
+    }
+
+    /// Send every query over DNS over TLS (RFC 7858), authenticating the
+    /// servers as `server_name` with `client` (RFC 8310 strict profile).
+    /// Give the servers' TLS addresses, usually port 853. Queries are padded
+    /// to a multiple of 128 octets (RFC 8467 §4.1).
+    ///
+    /// `client` brings its own crypto provider and root certificates. Fails
+    /// if rustls can't start a session with it.
+    #[cfg(feature = "tls")]
+    pub fn with_tls(
+        mut self,
+        client: Arc<rustls::ClientConfig>,
+        server_name: rustls::pki_types::ServerName<'static>,
+    ) -> Result<Self, rustls::Error> {
+        rustls::ClientConnection::new(Arc::clone(&client), server_name.clone())?;
+        self.tls = Some(tls::Settings {
+            client,
+            server_name,
+        });
+        Ok(self)
+    }
+
+    /// Whether queries go over TLS, and so over a stream from the start.
+    fn uses_tls(&self) -> bool {
+        #[cfg(feature = "tls")]
+        return self.tls.is_some();
+        #[cfg(not(feature = "tls"))]
+        false
     }
 
     /// Settings from the text of a `resolv.conf` file, read the way glibc
@@ -167,6 +214,9 @@ pub enum Transport {
     Udp,
     /// Over a new TCP connection; see the crate docs.
     Tcp,
+    /// On the connection opened by this query's last [`Transport::Tcp`]
+    /// transmit.
+    TcpContinue,
 }
 
 /// Bytes the caller must send.
@@ -209,6 +259,9 @@ pub enum Error {
     Timeout,
     /// The last TCP connection closed before a complete response arrived.
     ConnectionClosed,
+    /// The last TLS session failed, for example on an invalid certificate.
+    /// Only with the `tls` feature.
+    Tls(String),
     /// The last server answered with this error code (e.g. `SERVFAIL`).
     Server(ResponseCode),
 }
@@ -218,6 +271,7 @@ impl fmt::Display for Error {
         match self {
             Self::Timeout => f.write_str("no response from any name server"),
             Self::ConnectionClosed => f.write_str("connection closed before a response"),
+            Self::Tls(error) => write!(f, "TLS failed: {error}"),
             Self::Server(code) => write!(f, "name server returned {code}"),
         }
     }
@@ -236,27 +290,53 @@ struct Pending {
     /// Bytes received so far on the TCP connection, once the query has
     /// switched to TCP; `None` while it still uses UDP.
     tcp: Option<Vec<u8>>,
+    /// The TLS session on the current connection, when using DNS over TLS.
+    #[cfg(feature = "tls")]
+    tls: Option<Box<rustls::ClientConnection>>,
     /// Search candidates still to try if this name doesn't exist.
     rest: VecDeque<Name>,
 }
 
 impl Pending {
     /// The bytes to send for the current attempt. Starts a fresh TCP buffer,
-    /// since every TCP transmit means a new connection.
-    fn transmit(&mut self, query: QueryId) -> Transmit {
+    /// and TLS session if configured, since every TCP transmit means a new
+    /// connection.
+    fn transmit(&mut self, query: QueryId, config: &Config) -> Result<Transmit, Error> {
         let (transport, payload) = match &mut self.tcp {
             None => (Transport::Udp, self.payload.clone()),
             Some(received) => {
                 received.clear();
-                (Transport::Tcp, frame(&self.payload))
+                (Transport::Tcp, self.connect(config)?)
             }
         };
-        Transmit {
+        Ok(Transmit {
             query,
             transport,
             destination: self.server,
             payload,
+        })
+    }
+
+    /// The first bytes for a new connection: the framed query, or the TLS
+    /// ClientHello with the framed query queued behind the handshake.
+    #[cfg_attr(
+        not(feature = "tls"),
+        expect(
+            unused_variables,
+            clippy::unnecessary_wraps,
+            reason = "only TLS settings can make connecting fail"
+        )
+    )]
+    fn connect(&mut self, config: &Config) -> Result<Vec<u8>, Error> {
+        #[cfg(feature = "tls")]
+        if let Some(settings) = &config.tls {
+            let (session, hello) = settings
+                .connect(&frame(&self.payload))
+                .map_err(Error::Tls)?;
+            self.tls = Some(Box::new(session));
+            return Ok(hello);
         }
+        Ok(frame(&self.payload))
     }
 }
 
@@ -265,6 +345,19 @@ fn frame(message: &[u8]) -> Vec<u8> {
     // A single-question query is far below 64 KiB.
     let len = u16::try_from(message.len()).unwrap_or(u16::MAX);
     len.to_be_bytes().iter().chain(message).copied().collect()
+}
+
+/// Pad `request` with an EDNS padding option so it encodes to a multiple of
+/// 128 octets (RFC 8467 §4.1, RFC 7830). The option adds 4 octets of header.
+#[cfg(feature = "tls")]
+fn pad(request: &mut Message) -> Result<(), ProtoError> {
+    let unpadded = request.to_vec()?.len();
+    let fill = (128 - (unpadded + 4) % 128) % 128;
+    if let Some(edns) = &mut request.edns {
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(12, vec![0; fill]));
+    }
+    Ok(())
 }
 
 /// Remove and return the first complete length-prefixed message in `buf`.
@@ -367,9 +460,9 @@ impl Resolver {
             return Ok(id);
         }
         let first = candidates.pop_front().unwrap_or(absolute);
-        let mut pending = self.new_pending(first, record_type, candidates, now)?;
-        self.transmits.push_back(pending.transmit(id));
+        let pending = self.new_pending(first, record_type, candidates, now)?;
         self.pending.insert(id, pending);
+        self.emit(id);
         Ok(id)
     }
 
@@ -387,6 +480,10 @@ impl Resolver {
         let mut edns = Edns::new();
         edns.set_max_payload(EDNS_PAYLOAD);
         request.set_edns(edns);
+        #[cfg(feature = "tls")]
+        if self.config.uses_tls() {
+            pad(&mut request)?;
+        }
         let payload = request.to_vec()?;
         Ok(Pending {
             request,
@@ -394,7 +491,9 @@ impl Resolver {
             attempt: 0,
             server: self.config.server(0),
             deadline: now.checked_add(self.config.timeout),
-            tcp: None,
+            tcp: self.config.uses_tls().then(Vec::new),
+            #[cfg(feature = "tls")]
+            tls: None,
             rest,
         })
     }
@@ -409,11 +508,11 @@ impl Resolver {
         }) else {
             return false;
         };
-        let Ok(mut next) = self.new_pending(name, record_type, rest, now) else {
+        let Ok(next) = self.new_pending(name, record_type, rest, now) else {
             return false;
         };
-        self.transmits.push_back(next.transmit(id));
         self.pending.insert(id, next);
+        self.emit(id);
         true
     }
 
@@ -442,13 +541,40 @@ impl Resolver {
     /// Process bytes read from the TCP connection opened for `query`.
     ///
     /// Bytes may arrive in any chunking. The first complete message that
-    /// answers the query is used; others are ignored.
+    /// answers the query is used; others are ignored. Over TLS, the bytes go
+    /// through the session first, which may queue a
+    /// [`Transport::TcpContinue`] transmit; a TLS error counts as a failed
+    /// attempt on this server.
     pub fn handle_stream_data(&mut self, query: QueryId, data: &[u8], now: Instant) {
         let Some(pending) = self.pending.get_mut(&query) else {
             return;
         };
         let Some(received) = &mut pending.tcp else {
             return;
+        };
+        #[cfg(feature = "tls")]
+        let decrypted;
+        #[cfg(feature = "tls")]
+        let data = match &mut pending.tls {
+            None => data,
+            Some(session) => match tls::receive(session, data) {
+                Ok((reply, plaintext)) => {
+                    if !reply.is_empty() {
+                        self.transmits.push_back(Transmit {
+                            query,
+                            transport: Transport::TcpContinue,
+                            destination: pending.server,
+                            payload: reply,
+                        });
+                    }
+                    decrypted = plaintext;
+                    &decrypted[..]
+                }
+                Err(error) => {
+                    self.retry(query, now, Error::Tls(error));
+                    return;
+                }
+            },
         };
         received.extend_from_slice(data);
         while let Some(message) = next_frame(received) {
@@ -538,7 +664,7 @@ impl Resolver {
         }
         pending.server = self.config.server(pending.attempt);
         pending.deadline = now.checked_add(self.config.timeout);
-        self.transmits.push_back(pending.transmit(id));
+        self.emit(id);
     }
 
     /// Re-send `id` to the same server over TCP (RFC 7766 §5). Doesn't
@@ -553,7 +679,7 @@ impl Resolver {
         }
         pending.tcp = Some(Vec::new());
         pending.deadline = now.checked_add(self.config.timeout);
-        self.transmits.push_back(pending.transmit(id));
+        self.emit(id);
         true
     }
 
@@ -573,7 +699,19 @@ impl Resolver {
         };
         pending.payload = payload;
         pending.deadline = now.checked_add(self.config.timeout);
-        self.transmits.push_back(pending.transmit(id));
+        self.emit(id);
+    }
+
+    /// Queue the current attempt's bytes for `id`, or fail the query if
+    /// they can't be produced.
+    fn emit(&mut self, id: QueryId) {
+        let Some(pending) = self.pending.get_mut(&id) else {
+            return;
+        };
+        match pending.transmit(id, &self.config) {
+            Ok(transmit) => self.transmits.push_back(transmit),
+            Err(error) => self.fail(id, error),
+        }
     }
 
     fn fail(&mut self, id: QueryId, error: Error) {
