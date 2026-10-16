@@ -305,7 +305,6 @@ struct Pending {
     request: Message,
     payload: Vec<u8>,
     attempt: usize,
-    server: SocketAddr,
     /// `None` if `now + timeout` overflows: the query then waits forever.
     deadline: Option<Instant>,
     route: Route,
@@ -497,7 +496,6 @@ impl Resolver {
             request,
             payload,
             attempt: 0,
-            server: self.config.server(0),
             deadline: now.checked_add(self.config.timeout),
             route: if self.config.uses_tls() {
                 Route::Stream(None)
@@ -542,7 +540,7 @@ impl Resolver {
             return;
         };
         if pending.route != Route::Udp
-            || pending.server != from
+            || self.config.server(pending.attempt) != from
             || !is_reply(&pending.request, &response)
         {
             return;
@@ -733,7 +731,6 @@ impl Resolver {
             self.fail(id, error);
             return;
         }
-        pending.server = self.config.server(pending.attempt);
         pending.deadline = now.checked_add(self.config.timeout);
         self.emit(id, now);
     }
@@ -806,7 +803,7 @@ impl Resolver {
         let Some(pending) = self.pending.get(&id) else {
             return;
         };
-        let server = pending.server;
+        let server = self.config.server(pending.attempt);
         if pending.route == Route::Udp {
             self.transmits.push_back(Transmit {
                 transport: Transport::Udp(id),
