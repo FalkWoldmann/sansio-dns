@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 # let-chains, and the ICU crates under hickory-proto, need 1.88.
 rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/FalkWoldmann/sansio-dns"
 
 [dependencies]
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }

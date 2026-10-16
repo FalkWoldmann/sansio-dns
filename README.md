@@ -132,3 +132,10 @@ cargo bench --bench tls --features tls    # DoT against an in-process rustls ser
 
 The TLS numbers include the server's half of each exchange. On a network, a new
 connection also costs two extra round trips (TCP and TLS) before the query's own.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option. Unless you explicitly state otherwise, any
+contribution you submit for inclusion in this crate, as defined in the Apache-2.0 license,
+is dual licensed as above, without any additional terms or conditions.
