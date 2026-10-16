@@ -30,6 +30,21 @@ if let Some(result) = lookup.result() { /* Ok(addresses) or Err(error) */ }
 
 `addresses(&message)` does the CNAME-following part for any single response.
 
+### Tokio and reqwest
+
+[`sansio-dns-tokio`](sansio-dns-tokio) is a ready-made driver: `lookup_ip(host)` runs an
+`IpLookup` with a socket per query and TCP or TLS connections as needed. With its `reqwest`
+feature, it plugs into reqwest as the DNS resolver:
+
+```rust
+let client = reqwest::Client::builder()
+    .dns_resolver(sansio_dns_tokio::Resolver::from_system_conf()?)
+    .build()?;
+```
+
+`cargo run -p sansio-dns-tokio --features reqwest --example get -- https://example.com` is a
+small HTTP client built this way.
+
 ### DNS over TLS
 
 With the `tls` feature, `Config::with_tls(client, server_name)` sends every query over TLS

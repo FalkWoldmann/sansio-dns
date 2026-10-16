@@ -1,0 +1,12 @@
+# The core's clippy.toml without its sans-IO bans: this crate is the driver
+# that owns the sockets and the clock.
+
+allow-dbg-in-tests = true
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-panic-in-tests = true
+allow-print-in-tests = true
+allow-unwrap-in-tests = true
+allow-useless-vec-in-tests = true
+
+avoid-breaking-exported-api = false

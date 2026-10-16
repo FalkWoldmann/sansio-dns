@@ -19,15 +19,15 @@ jobs:
           components: clippy, rustfmt
       - uses: taiki-e/install-action@nextest
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo nextest run --profile ci
-      - run: cargo nextest run --profile ci --all-features
-      - run: cargo test --doc --all-features
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo nextest run --workspace --profile ci
+      - run: cargo nextest run --workspace --profile ci --all-features
+      - run: cargo test --workspace --doc --all-features
 
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88
-      - run: cargo check --lib --all-features
+      - run: cargo check --workspace --lib --all-features

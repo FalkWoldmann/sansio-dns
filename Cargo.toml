@@ -7,6 +7,9 @@ rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/FalkWoldmann/sansio-dns"
 
+[workspace]
+members = ["sansio-dns-tokio"]
+
 [dependencies]
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 resolv-conf = "0.7.6"
@@ -29,7 +32,10 @@ criterion = { version = "0.8.2", default-features = false, features = ["cargo_be
 
 # Adapted from https://github.com/otto-de/rust-ecosystem (lints.toml), trimmed
 # for a sans-IO library: no async or web lints; documentation lints added.
-[lints.rust]
+[lints]
+workspace = true
+
+[workspace.lints.rust]
 deprecated_safe = { level = "deny", priority = -1 }
 future_incompatible = { level = "deny", priority = -1 }
 keyword_idents = { level = "deny", priority = -1 }
@@ -45,7 +51,7 @@ unsafe_code = "forbid"
 unused_must_use = "deny"
 unused_qualifications = "warn"
 
-[lints.clippy]
+[workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
