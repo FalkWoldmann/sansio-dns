@@ -128,7 +128,7 @@ them all as one crate.
 | 5452 | §4.6 | Only the first matching response is accepted |
 | 5452 | §9.2 | IDs from a CSPRNG, unique among outstanding queries; per-query source ports are the driver's job (see below) |
 | 6891 | §6.2.3 | One OPT record, 1232-byte payload (DNS Flag Day 2020) |
-| 6891 | §7, §6.2.2 | `FORMERR` without OPT → same server once more without EDNS; with OPT → fail over |
+| 6891 | §7, §6.2.2 | `FORMERR` without OPT → same server once more without EDNS (over TLS: fail over, since EDNS carries the padding); with OPT → fail over |
 | 7766 | §5 | Truncated UDP response → same server over TCP; later attempts stay on TCP; UDP replies then ignored |
 | 7766 | §6.2.1 | One connection per server, reused and pipelined; answers matched in any order |
 | 7766 | §6.2.3 | Idle connections closed after `idle_timeout`; a timeout closes the connection |
@@ -186,9 +186,8 @@ records (`tls_stream`), hosts and resolv.conf files (`system_files`) and call se
 event per query, transmits only for live queries and open connections, a bounded number
 of sends per query, and a timer exactly while something is pending. `system_files` also
 checks the local answers for hosts and special-use names and the order of the search
-candidates, and `tls_stream` checks that every query the server decrypts is padded to a
-multiple of 128 octets while it carries EDNS (a query resent without EDNS after `FORMERR`
-can't be). They need nightly:
+candidates, and `tls_stream` checks that every query the server decrypts keeps EDNS and is
+padded to a multiple of 128 octets. They need nightly:
 
 ```sh
 cd fuzz && cargo fuzz run driver_ops -- -max_total_time=60 -timeout=5

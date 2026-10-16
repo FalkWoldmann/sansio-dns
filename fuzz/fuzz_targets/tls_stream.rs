@@ -1,9 +1,9 @@
 //! DNS over TLS connections fed arbitrary bytes, or the records of an
 //! in-process rustls server that the input steers and tampers with: what
 //! it says inside the session, when it sends close_notify, and what
-//! follows. The server checks each query it decrypts: padded to a multiple
-//! of 128 octets while it has an OPT record (RFC 8467 §4.1), and sent at
-//! most `attempts + 3` times. Run with `-timeout` so a receive loop that
+//! follows. The server checks each query it decrypts: it keeps its OPT
+//! record, is padded to a multiple of 128 octets (RFC 8467 §4.1), and is
+//! sent at most `attempts + 3` times. Run with `-timeout` so a receive loop that
 //! stops making progress shows up as a hang.
 
 #![no_main]
@@ -104,9 +104,8 @@ struct Sends {
 impl Sends {
     fn check(&mut self, query: &[u8]) -> Message {
         let request = Message::from_vec(query).expect("the resolver sent garbage");
-        if request.edns.is_some() {
-            assert_eq!(query.len() % 128, 0, "query not padded to 128 octets");
-        }
+        assert!(request.edns.is_some(), "query without EDNS over TLS");
+        assert_eq!(query.len() % 128, 0, "query not padded to 128 octets");
         let name = request.queries.first().map(|q| q.name().clone());
         let key = (request.metadata.id, name.unwrap_or_default());
         let count = self.counts.entry(key).or_default();

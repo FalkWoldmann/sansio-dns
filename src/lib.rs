@@ -667,8 +667,11 @@ impl Resolver {
         }
         match response.metadata.response_code {
             // RFC 6891 §7: a server without EDNS answers FORMERR and no OPT;
-            // §6.2.2 lets us ask the same server again without EDNS.
-            ResponseCode::FormErr if response.edns.is_none() => self.drop_edns(id, now),
+            // §6.2.2 lets us ask the same server again without EDNS. Not over
+            // TLS, where EDNS carries the padding (RFC 8467 §4.1).
+            ResponseCode::FormErr if response.edns.is_none() && !self.config.uses_tls() => {
+                self.drop_edns(id, now);
+            }
             ResponseCode::NXDomain if self.next_candidate(id, now) => {}
             code @ (ResponseCode::ServFail
             | ResponseCode::Refused

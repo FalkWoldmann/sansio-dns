@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::common::*;
-use hickory_proto::op::Message;
+use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::{Name, RecordType};
 use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection};
@@ -56,6 +56,8 @@ struct Server {
     sessions: HashMap<ConnectionId, (ServerConnection, Vec<u8>)>,
     queries: Vec<Vec<u8>>,
     sni: Option<String>,
+    /// Answer every query with FORMERR and no OPT, like a server without EDNS.
+    formerr: bool,
 }
 
 impl Server {
@@ -65,6 +67,7 @@ impl Server {
             sessions: HashMap::new(),
             queries: Vec::new(),
             sni: None,
+            formerr: false,
         }
     }
 
@@ -106,7 +109,11 @@ impl Server {
                 break;
             }
             let query: Vec<u8> = plaintext.drain(..2 + len).skip(2).collect();
-            let answer = reply_to(&Message::from_vec(&query).unwrap());
+            let mut answer = reply_to(&Message::from_vec(&query).unwrap());
+            if self.formerr {
+                answer = with_code(answer, ResponseCode::FormErr);
+                answer.edns = None;
+            }
             session
                 .writer()
                 .write_all(&frame(&encode(&answer)))
@@ -194,6 +201,35 @@ fn wrong_certificate_moves_on_then_fails() {
         resolver.poll_event(),
         Some(Event::Failed {
             error: Error::Tls(_),
+            ..
+        })
+    );
+}
+
+/// A FORMERR without OPT doesn't make the query drop EDNS over TLS, since
+/// EDNS carries the padding: it moves on like any other server error.
+#[test]
+fn formerr_without_opt_moves_on_padded() {
+    let (client, server_config) = configs("dns.example");
+    let now = Instant::now();
+    let mut resolver = tls_resolver(client, now);
+    let mut server = Server::new(server_config);
+    server.formerr = true;
+
+    let sent = run(&mut resolver, &mut server, now);
+
+    let servers: Vec<_> = sent
+        .iter()
+        .filter(|t| is_connect(t))
+        .map(|t| t.destination)
+        .collect();
+    assert_eq!(servers, [S1, S2]);
+    assert_eq!(server.queries.len(), 4, "one query per attempt");
+    assert!(server.queries.iter().all(|q| q.len() % 128 == 0));
+    assert_matches!(
+        resolver.poll_event(),
+        Some(Event::Failed {
+            error: Error::Server(ResponseCode::FormErr),
             ..
         })
     );
