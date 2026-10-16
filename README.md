@@ -144,6 +144,21 @@ Parameterized cases use [rstest](https://crates.io/crates/rstest); properties su
 "arbitrary bytes never complete a query" and "any ID bit flip is rejected" use
 [proptest](https://crates.io/crates/proptest).
 
+The `fuzz/` crate has [cargo-fuzz](https://crates.io/crates/cargo-fuzz) targets that
+drive the resolver with arbitrary datagrams (`datagram`), TCP bytes (`stream`), DoT
+records (`tls_stream`), hosts and resolv.conf files (`system_files`) and call sequences
+(`driver_ops`). After every step they check what the state machine proptest checks: one
+event per query, transmits only for live queries and open connections, a bounded number
+of sends per query, and a timer exactly while something is pending. `system_files` also
+checks the local answers for hosts and special-use names and the order of the search
+candidates, and `tls_stream` checks that every query the server decrypts is padded to a
+multiple of 128 octets while it carries EDNS (a query resent without EDNS after `FORMERR`
+can't be). They need nightly:
+
+```sh
+cd fuzz && cargo fuzz run driver_ops -- -max_total_time=60 -timeout=5
+```
+
 ## Benchmarks
 
 [Criterion](https://crates.io/crates/criterion) benchmarks run without a network:

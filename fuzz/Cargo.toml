@@ -1,0 +1,56 @@
+[package]
+name = "sansio-dns-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+sansio-dns = { path = "..", features = ["tls"] }
+
+# Not part of the main workspace: cargo-fuzz builds it with its own flags.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "datagram"
+path = "fuzz_targets/datagram.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stream"
+path = "fuzz_targets/stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tls_stream"
+path = "fuzz_targets/tls_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "system_files"
+path = "fuzz_targets/system_files.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "driver_ops"
+path = "fuzz_targets/driver_ops.rs"
+test = false
+doc = false
+bench = false
