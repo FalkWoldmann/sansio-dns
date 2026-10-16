@@ -38,7 +38,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
@@ -78,6 +78,36 @@ impl Config {
             timeout: Duration::from_secs(2),
             attempts,
         }
+    }
+
+    /// Settings from the text of a `resolv.conf` file, read the way glibc
+    /// reads it: `nameserver` lines (port 53), `options timeout:` in seconds
+    /// (at most 30) and `options attempts:` per server (at most 5). Without
+    /// usable `nameserver` lines, the local host is asked (127.0.0.1).
+    ///
+    /// A link-local server with a named scope (`fe80::1%eth0`) is skipped,
+    /// since mapping an interface name to its index needs a system call;
+    /// numeric scopes (`fe80::1%2`) work. Other options, such as `rotate`,
+    /// `use-vc` and `edns0` (EDNS is always on), are ignored.
+    pub fn from_resolv_conf(text: &[u8]) -> Result<Self, resolv_conf::ParseError> {
+        let parsed = resolv_conf::Config::parse(text)?;
+        let mut servers = parsed.nameservers.iter().filter_map(|ip| match ip {
+            resolv_conf::ScopedIp::V4(v4) => Some(SocketAddr::from((*v4, 53))),
+            resolv_conf::ScopedIp::V6(v6, None) => Some(SocketAddr::from((*v6, 53))),
+            resolv_conf::ScopedIp::V6(v6, Some(scope)) => scope
+                .parse()
+                .ok()
+                .map(|id| SocketAddr::V6(SocketAddrV6::new(*v6, 53, 0, id))),
+        });
+        let first = servers
+            .next()
+            .unwrap_or_else(|| SocketAddr::from((Ipv4Addr::LOCALHOST, 53)));
+        let mut config = Self::new(first, servers);
+        config.timeout = Duration::from_secs(u64::from(parsed.timeout.clamp(1, 30)));
+        let per_server = usize::try_from(parsed.attempts.clamp(1, 5)).unwrap_or(1);
+        config.attempts =
+            NonZeroUsize::new(per_server * config.servers.len()).unwrap_or(NonZeroUsize::MIN);
+        Ok(config)
     }
 
     /// The server for the given attempt, rotating through the list.

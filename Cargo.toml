@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
+resolv-conf = "0.7.6"
 
 [dev-dependencies]
 compio = { version = "0.19.2", features = ["runtime", "net", "time", "macros", "io"] }
