@@ -1,0 +1,159 @@
+//! Resolver settings, and reading them from a `resolv.conf`.
+
+use std::collections::VecDeque;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV6};
+use std::num::NonZeroUsize;
+#[cfg(feature = "tls")]
+use std::sync::Arc;
+use std::time::Duration;
+
+use hickory_proto::rr::Name;
+
+use crate::Hosts;
+#[cfg(feature = "tls")]
+use crate::tls;
+use crate::wire::is_special_use;
+
+/// Resolver settings.
+#[derive(Clone, Debug)]
+pub struct Config {
+    /// Name servers, tried in order and rotated on each retry. Never empty.
+    servers: Vec<SocketAddr>,
+    /// How long to wait for a response before retrying. A value too large
+    /// to add to an `Instant`, such as `Duration::MAX`, means wait forever.
+    pub timeout: Duration,
+    /// Total number of attempts per query, across all servers. Switching to
+    /// TCP or dropping EDNS doesn't count as one.
+    pub attempts: NonZeroUsize,
+    /// Domains to try appending to names without a trailing dot, in order.
+    /// Empty means every name is used as given.
+    pub search: Vec<Name>,
+    /// A name with at least this many dots is tried as given before the
+    /// search domains; one with fewer, after them.
+    pub ndots: u8,
+    /// How long a stream connection may sit without queries before the
+    /// resolver asks for it to be closed (RFC 7766 §6.2.3).
+    pub idle_timeout: Duration,
+    /// Static entries answered before DNS, like `/etc/hosts`. Empty by
+    /// default; fill it with [`Hosts::parse`].
+    pub hosts: Hosts,
+    /// DNS over TLS settings; see `Config::with_tls`.
+    #[cfg(feature = "tls")]
+    pub(crate) tls: Option<tls::Settings>,
+}
+
+impl Config {
+    /// `first` and then `more`, two attempts per server, two seconds each.
+    pub fn new(first: SocketAddr, more: impl IntoIterator<Item = SocketAddr>) -> Self {
+        let servers: Vec<SocketAddr> = std::iter::once(first).chain(more).collect();
+        let attempts = NonZeroUsize::new(servers.len() * 2).unwrap_or(NonZeroUsize::MIN);
+        Self {
+            servers,
+            timeout: Duration::from_secs(2),
+            attempts,
+            search: Vec::new(),
+            ndots: 1,
+            idle_timeout: Duration::from_secs(10),
+            hosts: Hosts::default(),
+            #[cfg(feature = "tls")]
+            tls: None,
+        }
+    }
+
+    /// Send every query over DNS over TLS (RFC 7858), authenticating the
+    /// servers as `server_name` with `client` (RFC 8310 strict profile).
+    /// Give the servers' TLS addresses, usually port 853. Queries are padded
+    /// to a multiple of 128 octets (RFC 8467 §4.1).
+    ///
+    /// `client` brings its own crypto provider and root certificates. Fails
+    /// if rustls can't start a session with it.
+    #[cfg(feature = "tls")]
+    pub fn with_tls(
+        mut self,
+        client: Arc<rustls::ClientConfig>,
+        server_name: rustls::pki_types::ServerName<'static>,
+    ) -> Result<Self, rustls::Error> {
+        rustls::ClientConnection::new(Arc::clone(&client), server_name.clone())?;
+        self.tls = Some(tls::Settings {
+            client,
+            server_name,
+        });
+        Ok(self)
+    }
+
+    /// Whether queries go over TLS, and so over a stream from the start.
+    pub(crate) fn uses_tls(&self) -> bool {
+        #[cfg(feature = "tls")]
+        return self.tls.is_some();
+        #[cfg(not(feature = "tls"))]
+        false
+    }
+
+    /// Settings from the text of a `resolv.conf` file, read the way glibc
+    /// reads it: `nameserver` lines (port 53), `search` or `domain`,
+    /// `options ndots:` (at most 15), `options timeout:` in seconds (at most
+    /// 30) and `options attempts:` per server (at most 5). Without
+    /// usable `nameserver` lines, the local host is asked (127.0.0.1).
+    ///
+    /// A link-local server with a named scope (`fe80::1%eth0`) is skipped,
+    /// since mapping an interface name to its index needs a system call;
+    /// numeric scopes (`fe80::1%2`) work. Other options, such as `rotate`,
+    /// `use-vc` and `edns0` (EDNS is always on), are ignored.
+    pub fn from_resolv_conf(text: &[u8]) -> Result<Self, resolv_conf::ParseError> {
+        let parsed = resolv_conf::Config::parse(text)?;
+        let mut servers = parsed.nameservers.iter().filter_map(|ip| match ip {
+            resolv_conf::ScopedIp::V4(v4) => Some(SocketAddr::from((*v4, 53))),
+            resolv_conf::ScopedIp::V6(v6, None) => Some(SocketAddr::from((*v6, 53))),
+            resolv_conf::ScopedIp::V6(v6, Some(scope)) => scope
+                .parse()
+                .ok()
+                .map(|id| SocketAddr::V6(SocketAddrV6::new(*v6, 53, 0, id))),
+        });
+        let first = servers
+            .next()
+            .unwrap_or_else(|| SocketAddr::from((Ipv4Addr::LOCALHOST, 53)));
+        let mut config = Self::new(first, servers);
+        config.timeout = Duration::from_secs(u64::from(parsed.timeout.clamp(1, 30)));
+        let per_server = usize::try_from(parsed.attempts.clamp(1, 5)).unwrap_or(1);
+        config.attempts =
+            NonZeroUsize::new(per_server * config.servers.len()).unwrap_or(NonZeroUsize::MIN);
+        config.search = parsed
+            .get_last_search_or_domain()
+            .filter_map(|domain| Name::from_ascii(domain).ok())
+            .map(|mut domain| {
+                domain.set_fqdn(true);
+                domain
+            })
+            .collect();
+        config.ndots = u8::try_from(parsed.ndots.min(15)).unwrap_or(15);
+        Ok(config)
+    }
+
+    /// The names to try for `name`, in order, as glibc's `res_search` does.
+    /// Candidates under special-use zones are left out. Empty when the name
+    /// is only tried as given, which needs no list.
+    pub(crate) fn candidates(&self, name: &Name) -> VecDeque<Name> {
+        if name.is_fqdn() || self.search.is_empty() {
+            return VecDeque::new();
+        }
+        let mut absolute = name.clone();
+        absolute.set_fqdn(true);
+        let searched = self
+            .search
+            .iter()
+            .filter_map(|domain| name.clone().append_domain(domain).ok())
+            .filter(|candidate| !is_special_use(candidate));
+        let dots = usize::from(name.num_labels()).saturating_sub(1);
+        if dots >= usize::from(self.ndots) {
+            std::iter::once(absolute).chain(searched).collect()
+        } else {
+            searched.chain(std::iter::once(absolute)).collect()
+        }
+    }
+
+    /// The server for the given attempt, rotating through the list.
+    #[expect(clippy::indexing_slicing, reason = "servers is never empty")]
+    pub(crate) fn server(&self, attempt: usize) -> SocketAddr {
+        self.servers[attempt % self.servers.len()]
+    }
+}
