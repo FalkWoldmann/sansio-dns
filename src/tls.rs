@@ -19,13 +19,20 @@ impl Settings {
     pub(crate) fn connect(&self, message: &[u8]) -> Result<(ClientConnection, Vec<u8>), String> {
         let mut session = ClientConnection::new(Arc::clone(&self.client), self.server_name.clone())
             .map_err(|e| e.to_string())?;
-        session
-            .writer()
-            .write_all(message)
-            .map_err(|e| e.to_string())?;
-        let out = pending_output(&mut session)?;
+        let out = send(&mut session, message)?;
         Ok((session, out))
     }
+}
+
+/// Queue `message` on the session and return the bytes to send now. Before
+/// the handshake is done, the message waits inside the session and goes out
+/// with a later [`receive`].
+pub(crate) fn send(session: &mut ClientConnection, message: &[u8]) -> Result<Vec<u8>, String> {
+    session
+        .writer()
+        .write_all(message)
+        .map_err(|e| e.to_string())?;
+    pending_output(session)
 }
 
 /// Feed bytes read from the connection. Returns the bytes to send back and

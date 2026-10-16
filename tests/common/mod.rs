@@ -9,7 +9,7 @@ use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use rstest::fixture;
-use sansio_dns::{Config, Event, Resolver, Transmit, Transport};
+use sansio_dns::{Config, ConnectionId, Event, Resolver, Transmit, Transport};
 
 pub const S1: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 53);
 pub const S2: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 53);
@@ -35,10 +35,26 @@ pub fn start_name(resolver: &mut Resolver, name: &str, now: Instant) -> Transmit
 /// The DNS message in `transmit`, without the TCP length prefix.
 pub fn decode(transmit: &Transmit) -> Message {
     let message = match transmit.transport {
-        Transport::Udp => &transmit.payload[..],
-        Transport::Tcp | Transport::TcpContinue => &transmit.payload[2..],
+        Transport::Udp(_) => &transmit.payload[..],
+        _ => &transmit.payload[2..],
     };
     Message::from_vec(message).unwrap()
+}
+
+/// The connection a stream transmit belongs to.
+#[expect(
+    clippy::panic,
+    reason = "calling it on a datagram is a bug in the test"
+)]
+pub fn conn(transmit: &Transmit) -> ConnectionId {
+    match transmit.transport {
+        Transport::TcpConnect(c) | Transport::TcpWrite(c) | Transport::TcpClose(c) => c,
+        Transport::Udp(_) => panic!("not a stream transmit: {transmit:?}"),
+    }
+}
+
+pub fn is_connect(transmit: &Transmit) -> bool {
+    matches!(transmit.transport, Transport::TcpConnect(_))
 }
 
 /// `message` with the two-byte TCP length prefix.
@@ -50,7 +66,12 @@ pub fn frame(message: &[u8]) -> Vec<u8> {
 /// The answer a well-behaved server would give to `request`. Tests mutate it
 /// to model misbehaving or spoofing servers before encoding it.
 pub fn reply(request: &Transmit) -> Message {
-    let request = decode(request);
+    reply_to(&decode(request))
+}
+
+/// The answer a well-behaved server would give to the query `request`.
+pub fn reply_to(request: &Message) -> Message {
+    let request = request.clone();
     let mut response = Message::response(request.metadata.id, request.metadata.op_code);
     response.add_queries(request.queries.clone());
     let question = &request.queries[0];

@@ -39,6 +39,7 @@ you want. `examples/dot.rs` uses ring and the webpki roots:
 
 ```sh
 cargo run --example dot --features tls -- example.com 1.1.1.1:853 cloudflare-dns.com
+cargo bench --bench dot --features tls   # connections, handshakes and time per query
 ```
 
 ### Configuration
@@ -69,6 +70,8 @@ Tests live in `tests/rfc<number>.rs`, with one module per section.
 | 6891 | §6.2.3 | One OPT record, 1232-byte payload (DNS Flag Day 2020) |
 | 6891 | §7, §6.2.2 | `FORMERR` without OPT → same server once more without EDNS; with OPT → fail over |
 | 7766 | §5 | Truncated UDP response → same server over TCP; later attempts stay on TCP; UDP replies then ignored |
+| 7766 | §6.2.1 | One connection per server, reused and pipelined; answers matched in any order |
+| 7766 | §6.2.3 | Idle connections closed after `idle_timeout`; a timeout closes the connection |
 | 7766 | §8 | Two-byte length prefix; replies reassembled from any chunking |
 | 1034 | §3.6.2 | `addresses` follows the CNAME chain and ignores records owned by other names |
 | 6761 | §6.3 | `localhost` names → loopback for A/AAAA, empty answer otherwise; nothing sent |
@@ -76,26 +79,28 @@ Tests live in `tests/rfc<number>.rs`, with one module per section.
 | 6762 | §3 | `local.` → NXDOMAIN; nothing sent (resolve with mDNS instead) |
 | 7686 | §2 | `onion.` → NXDOMAIN; nothing sent |
 | 7858 | §3 | With `tls`: every query over TLS on a stream, never UDP; TLS errors fail the attempt |
+| 7858 | §3.4 | The TLS session is reused for later queries; queries wait out a handshake in progress |
 | 8310 | §5 | Strict profile: the certificate must match the configured name |
 | 8467 | §4.1 | Queries padded to a multiple of 128 octets |
 
 ### Driver obligations
 
 RFC 5452 §9.2 requires an unpredictable source port per outstanding query. A sans-IO core
-can't pick ports, so each `Transmit` carries its `QueryId`: bind a fresh ephemeral socket
+can't pick ports, so `Transport::Udp(query)` names the query: bind a fresh ephemeral socket
 per query, and only pass datagrams received on that socket to `handle_datagram`.
 
-A `Transmit` with `Transport::Tcp` means: open a new connection to its destination
-(replacing any earlier one for that query) and write the payload, which is already
-length-prefixed. Pass everything read to `handle_stream_data`, and call
-`handle_stream_closed` on end of stream or error. One connection per query; no pipelining.
-`Transport::TcpContinue` carries more bytes for that same connection (TLS handshakes need it).
+Stream connections are named by a `ConnectionId`: `TcpConnect(id)` means open a connection
+to the destination and write the payload, `TcpWrite(id)` write to it, `TcpClose(id)` close
+it. Payloads are already length-prefixed or TLS-encrypted. Pass everything read to
+`handle_stream_data(id, …)`, and call `handle_stream_closed(id, …)` if the connection ends
+on its own. The resolver keeps one connection per server and pipelines queries over it;
+it closes the connection after `Config::idle_timeout` (10 s) without queries, or when a
+query on it times out.
 
 ### Not implemented
 
-- TCP connection reuse and pipelining (RFC 7766 §6.2.1); each TCP attempt is a new connection.
-- Reusing TLS connections across queries (RFC 7858 §3.4 recommends it); each attempt
-  handshakes anew. Opportunistic (unauthenticated) TLS.
+- Opportunistic (unauthenticated) TLS.
+- EDNS TCP keepalive (RFC 7828) to negotiate the idle timeout with the server.
 - DoH/DoQ, caching, DNS cookies (RFC 7873).
 - `resolv.conf` options other than the ones above (`rotate`, `use-vc`, `sortlist`, …).
 - `IpLookup` searches A and AAAA independently, so the two could end on different candidates.

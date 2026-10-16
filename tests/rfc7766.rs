@@ -10,14 +10,15 @@
 
 mod common;
 
-use std::time::Instant;
+use std::assert_matches;
+use std::time::{Duration, Instant};
 
 use common::*;
 use hickory_proto::rr::RData;
 use hickory_proto::rr::rdata::A;
 use proptest::prelude::*;
 use rstest::rstest;
-use sansio_dns::{Event, Resolver, Transmit, Transport};
+use sansio_dns::{ConnectionId, Event, Resolver, Transmit, Transport};
 
 /// Start a query, answer it with TC set over UDP, and return the TCP transmit.
 fn switch_to_tcp(resolver: &mut Resolver, now: Instant) -> Transmit {
@@ -42,7 +43,7 @@ mod section_5 {
         resolver.handle_datagram(S1, &encode(&truncated), now);
 
         let tcp = resolver.poll_transmit().unwrap();
-        assert_eq!(tcp.transport, Transport::Tcp);
+        assert!(is_connect(&tcp));
         assert_eq!(tcp.destination, S1);
         assert_eq!(tcp.payload, frame(&udp.payload));
     }
@@ -65,13 +66,13 @@ mod section_5 {
         let mut answer = reply(&tcp);
         answer.metadata.truncation = true;
 
-        resolver.handle_stream_data(tcp.query, &frame(&encode(&answer)), now);
+        resolver.handle_stream_data(conn(&tcp), &frame(&encode(&answer)), now);
 
         assert!(is_response(resolver.poll_event()));
     }
 
     fn close(resolver: &mut Resolver, tcp: &Transmit, now: Instant) {
-        resolver.handle_stream_closed(tcp.query, now);
+        resolver.handle_stream_closed(conn(tcp), now);
     }
     fn time_out(resolver: &mut Resolver, _: &Transmit, _: Instant) {
         resolver.handle_timeout(resolver.poll_timeout().unwrap());
@@ -91,8 +92,9 @@ mod section_5 {
 
         fail(&mut resolver, &tcp, now);
 
-        let retry = resolver.poll_transmit().unwrap();
-        assert_eq!(retry.transport, Transport::Tcp);
+        let retry = std::iter::from_fn(|| resolver.poll_transmit())
+            .find(is_connect)
+            .unwrap();
         assert_eq!(retry.destination, S2);
     }
 }
@@ -114,7 +116,7 @@ mod section_8 {
             cuts.sort_unstable();
 
             cuts.windows(2)
-                .for_each(|w| r.handle_stream_data(tcp.query, &bytes[w[0]..w[1]], now));
+                .for_each(|w| r.handle_stream_data(conn(&tcp), &bytes[w[0]..w[1]], now));
 
             let Some(Event::Response { response, .. }) = r.poll_event() else {
                 panic!("expected a response");
@@ -129,11 +131,11 @@ mod section_8 {
     fn partial_message_from_replaced_connection_is_discarded(mut resolver: Resolver) {
         let now = Instant::now();
         let first = switch_to_tcp(&mut resolver, now);
-        resolver.handle_stream_data(first.query, &[0, 40, 1, 2], now);
-        resolver.handle_stream_closed(first.query, now);
+        resolver.handle_stream_data(conn(&first), &[0, 40, 1, 2], now);
+        resolver.handle_stream_closed(conn(&first), now);
         let second = resolver.poll_transmit().unwrap();
 
-        resolver.handle_stream_data(second.query, &frame(&encode(&reply(&second))), now);
+        resolver.handle_stream_data(conn(&second), &frame(&encode(&reply(&second))), now);
 
         assert!(is_response(resolver.poll_event()));
     }
@@ -148,8 +150,132 @@ mod section_8 {
         wrong.metadata.id = wrong.metadata.id.wrapping_add(1);
         let bytes = [frame(&encode(&wrong)), frame(&encode(&reply(&tcp)))].concat();
 
-        resolver.handle_stream_data(tcp.query, &bytes, now);
+        resolver.handle_stream_data(conn(&tcp), &bytes, now);
 
         assert!(is_response(resolver.poll_event()));
+    }
+}
+
+/// §6.2.1: further queries to a server reuse its open connection, several
+/// at a time.
+mod section_6_2_1 {
+    use super::*;
+
+    #[rstest]
+    fn second_query_shares_the_connection(mut resolver: Resolver) {
+        let now = Instant::now();
+        let first = switch_to_tcp(&mut resolver, now);
+        let second = switch_to_tcp(&mut resolver, now);
+
+        assert!(is_connect(&first));
+        assert_matches!(second.transport, Transport::TcpWrite(c) if c == conn(&first));
+    }
+
+    /// §6.2.1.1: answers on a shared connection may come in any order.
+    #[rstest]
+    fn answers_in_any_order_complete_their_queries(mut resolver: Resolver) {
+        let now = Instant::now();
+        let first = switch_to_tcp(&mut resolver, now);
+        let second = switch_to_tcp(&mut resolver, now);
+        let bytes = [
+            frame(&encode(&reply(&second))),
+            frame(&encode(&reply(&first))),
+        ]
+        .concat();
+
+        resolver.handle_stream_data(conn(&first), &bytes, now);
+
+        assert!(is_response(resolver.poll_event()));
+        assert!(is_response(resolver.poll_event()));
+    }
+
+    fn close(resolver: &mut Resolver, connection: ConnectionId, now: Instant) {
+        resolver.handle_stream_closed(connection, now);
+    }
+    fn time_out(resolver: &mut Resolver, _: ConnectionId, _: Instant) {
+        resolver.handle_timeout(resolver.poll_timeout().unwrap());
+    }
+
+    /// When a shared connection fails, all its queries move on, and share
+    /// a new connection to the next server.
+    #[rstest]
+    #[case::closed(close)]
+    #[case::timed_out(time_out)]
+    fn failure_moves_all_queries_to_one_new_connection(
+        mut resolver: Resolver,
+        #[case] fail: fn(&mut Resolver, ConnectionId, Instant),
+    ) {
+        let now = Instant::now();
+        let first = switch_to_tcp(&mut resolver, now);
+        switch_to_tcp(&mut resolver, now);
+
+        fail(&mut resolver, conn(&first), now);
+
+        let next: Vec<Transmit> = std::iter::from_fn(|| resolver.poll_transmit())
+            .filter(|t| !matches!(t.transport, Transport::TcpClose(_)))
+            .collect();
+        assert_eq!(next.len(), 2);
+        assert!(next.iter().all(|t| t.destination == S2));
+        assert!(is_connect(&next[0]));
+        assert_matches!(next[1].transport, Transport::TcpWrite(c) if c == conn(&next[0]));
+    }
+}
+
+/// A query that times out on a stream suggests a dead connection: it is
+/// closed, and queries still waiting on it move on too.
+mod stream_timeout {
+    use super::*;
+
+    #[rstest]
+    fn closes_the_connection_and_moves_its_other_queries(mut resolver: Resolver) {
+        let now = Instant::now();
+        let first = switch_to_tcp(&mut resolver, now);
+        let later = now + Duration::from_secs(1);
+        switch_to_tcp(&mut resolver, later);
+
+        resolver.handle_timeout(now + Duration::from_secs(2));
+
+        let sent: Vec<Transmit> = std::iter::from_fn(|| resolver.poll_transmit()).collect();
+        assert_matches!(sent[0].transport, Transport::TcpClose(c) if c == conn(&first));
+        assert_eq!(sent.len(), 3, "both queries resent: {sent:?}");
+        assert!(sent[1..].iter().all(|t| t.destination == S2));
+    }
+
+    /// A query still waiting keeps its connection open past the idle timeout.
+    #[test]
+    fn busy_connection_is_not_idle() {
+        let mut config = sansio_dns::Config::new(S1, [S2]);
+        config.timeout = Duration::from_secs(30);
+        let mut resolver = Resolver::new(config);
+        let now = Instant::now();
+        switch_to_tcp(&mut resolver, now);
+
+        resolver.handle_timeout(now + Duration::from_secs(10));
+
+        assert!(resolver.poll_transmit().is_none());
+    }
+}
+
+/// §6.2.3: an idle connection is closed after the idle timeout, and not
+/// while queries are still waiting on it.
+mod section_6_2_3 {
+    use super::*;
+
+    #[rstest]
+    fn idle_connection_is_closed(mut resolver: Resolver) {
+        let now = Instant::now();
+        let tcp = switch_to_tcp(&mut resolver, now);
+        resolver.handle_stream_data(conn(&tcp), &frame(&encode(&reply(&tcp))), now);
+        assert!(is_response(resolver.poll_event()));
+
+        let deadline = resolver.poll_timeout().unwrap();
+        assert_eq!(deadline - now, Duration::from_secs(10));
+        resolver.handle_timeout(deadline);
+
+        assert_matches!(
+            resolver.poll_transmit().map(|t| t.transport),
+            Some(Transport::TcpClose(c)) if c == conn(&tcp)
+        );
+        assert_eq!(resolver.poll_timeout(), None);
     }
 }

@@ -21,7 +21,7 @@ use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::net::{TcpStream, UdpSocket};
 use compio::time::{timeout, timeout_at};
 use sansio_dns::hickory_proto::rr::{Name, RecordType};
-use sansio_dns::{Config, Event, QueryId, Resolver, Transmit, Transport};
+use sansio_dns::{Config, ConnectionId, Event, Resolver, Transmit, Transport};
 
 #[compio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = args.next().unwrap_or_else(|| "1.1.1.1:53".into()).parse()?;
 
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    let mut tcp: Option<(QueryId, TcpStream)> = None;
+    let mut tcp: Option<(ConnectionId, TcpStream)> = None;
     let mut resolver = Resolver::new(Config::new(server, []));
     resolver.query(name, RecordType::A, Instant::now())?;
 
@@ -38,21 +38,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         while let Some(t) = resolver.poll_transmit() {
             match t.transport {
-                Transport::Udp => {
+                Transport::Udp(_) => {
                     let BufResult(sent, _) = socket.send_to(t.payload, t.destination).await;
                     sent?;
                 }
-                Transport::Tcp => match timeout(Duration::from_secs(2), open(&t)).await {
-                    Ok(Ok(stream)) => tcp = Some((t.query, stream)),
-                    _ => resolver.handle_stream_closed(t.query, Instant::now()),
+                Transport::TcpConnect(c) => match timeout(Duration::from_secs(2), open(&t)).await {
+                    Ok(Ok(stream)) => tcp = Some((c, stream)),
+                    _ => resolver.handle_stream_closed(c, Instant::now()),
                 },
-                Transport::TcpContinue => {
-                    if let Some((_, stream)) = tcp.as_mut().filter(|(q, _)| *q == t.query) {
+                Transport::TcpWrite(c) => {
+                    if let Some((_, stream)) = tcp.as_mut().filter(|(open, _)| *open == c) {
                         let BufResult(written, _) = stream.write_all(t.payload).await;
                         if written.is_err() {
-                            resolver.handle_stream_closed(t.query, Instant::now());
+                            resolver.handle_stream_closed(c, Instant::now());
                         }
                     }
+                }
+                Transport::TcpClose(c) => {
+                    tcp.take_if(|(open, _)| *open == c);
                 }
             }
         }
@@ -70,22 +73,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         buf.clear();
 
-        if let Some((query, mut stream)) = tcp.take() {
+        if let Some((connection, mut stream)) = tcp.take() {
             match timeout_at(deadline, stream.read(buf)).await {
                 Ok(BufResult(read, returned)) => {
                     buf = returned;
                     match read {
                         Ok(n) if n > 0 => {
-                            resolver.handle_stream_data(query, &buf[..n], Instant::now());
-                            tcp = Some((query, stream));
+                            resolver.handle_stream_data(connection, &buf[..n], Instant::now());
+                            tcp = Some((connection, stream));
                         }
-                        _ => resolver.handle_stream_closed(query, Instant::now()),
+                        _ => resolver.handle_stream_closed(connection, Instant::now()),
                     }
                 }
                 Err(_elapsed) => {
                     buf = Vec::with_capacity(4096);
                     resolver.handle_timeout(Instant::now());
-                    tcp = Some((query, stream));
+                    tcp = Some((connection, stream));
                 }
             }
             continue;

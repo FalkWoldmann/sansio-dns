@@ -18,14 +18,14 @@ use std::net::{TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
 use sansio_dns::hickory_proto::rr::{Name, RecordType};
-use sansio_dns::{Config, Event, QueryId, Resolver, Transmit, Transport};
+use sansio_dns::{Config, ConnectionId, Event, Resolver, Transmit, Transport};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let name = Name::from_ascii(args.next().unwrap_or_else(|| "example.com.".into()))?;
 
     let socket = UdpSocket::bind("0.0.0.0:0")?;
-    let mut tcp: Option<(QueryId, TcpStream)> = None;
+    let mut tcp: Option<(ConnectionId, TcpStream)> = None;
     let config = match args.next() {
         Some(server) => Config::new(server.parse()?, []),
         None => Config::from_resolv_conf(&std::fs::read("/etc/resolv.conf")?)?,
@@ -37,19 +37,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         while let Some(t) = resolver.poll_transmit() {
             match t.transport {
-                Transport::Udp => {
+                Transport::Udp(_) => {
                     socket.send_to(&t.payload, t.destination)?;
                 }
-                Transport::Tcp => match open(&t) {
-                    Ok(stream) => tcp = Some((t.query, stream)),
-                    Err(_) => resolver.handle_stream_closed(t.query, Instant::now()),
+                Transport::TcpConnect(c) => match open(&t) {
+                    Ok(stream) => tcp = Some((c, stream)),
+                    Err(_) => resolver.handle_stream_closed(c, Instant::now()),
                 },
-                Transport::TcpContinue => {
-                    if let Some((_, stream)) = tcp.as_mut().filter(|(q, _)| *q == t.query)
+                Transport::TcpWrite(c) => {
+                    if let Some((_, stream)) = tcp.as_mut().filter(|(open, _)| *open == c)
                         && stream.write_all(&t.payload).is_err()
                     {
-                        resolver.handle_stream_closed(t.query, Instant::now());
+                        resolver.handle_stream_closed(c, Instant::now());
                     }
+                }
+                Transport::TcpClose(c) => {
+                    tcp.take_if(|(open, _)| *open == c);
                 }
             }
         }
@@ -63,19 +66,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .saturating_duration_since(Instant::now())
             .max(Duration::from_millis(1));
 
-        if let Some((query, mut stream)) = tcp.take() {
+        if let Some((connection, mut stream)) = tcp.take() {
             stream.set_read_timeout(Some(wait))?;
             match stream.read(&mut buf) {
-                Ok(0) => resolver.handle_stream_closed(query, Instant::now()),
+                Ok(0) => resolver.handle_stream_closed(connection, Instant::now()),
                 Ok(n) => {
-                    resolver.handle_stream_data(query, &buf[..n], Instant::now());
-                    tcp = Some((query, stream));
+                    resolver.handle_stream_data(connection, &buf[..n], Instant::now());
+                    tcp = Some((connection, stream));
                 }
                 Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                     resolver.handle_timeout(Instant::now());
-                    tcp = Some((query, stream));
+                    tcp = Some((connection, stream));
                 }
-                Err(_) => resolver.handle_stream_closed(query, Instant::now()),
+                Err(_) => resolver.handle_stream_closed(connection, Instant::now()),
             }
             continue;
         }

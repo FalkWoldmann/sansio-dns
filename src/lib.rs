@@ -23,21 +23,27 @@
 //!
 //! # Driver obligations
 //!
-//! For a [`Transport::Tcp`] transmit, open a new TCP connection to its
-//! destination, replacing any earlier connection for the same query, and
-//! write the payload; it is already length-prefixed (RFC 7766 §8). Pass
-//! everything read from that connection to [`Resolver::handle_stream_data`]
-//! and call [`Resolver::handle_stream_closed`] on end of stream or error.
-//! The connection can be dropped once the query's [`Event`] arrives. A
-//! [`Transport::TcpContinue`] transmit carries more bytes for that same
-//! connection (during a TLS handshake, for example).
+//! Stream connections (TCP, and TLS on top of it) are named by a
+//! [`ConnectionId`]. For [`Transport::TcpConnect`], open a TCP connection to
+//! the destination under that id and write the payload; for
+//! [`Transport::TcpWrite`], write the payload to that connection; for
+//! [`Transport::TcpClose`], close it. Pass everything read from a connection
+//! to [`Resolver::handle_stream_data`], and call
+//! [`Resolver::handle_stream_closed`] when it ends or fails on its own.
+//! Payloads are already length-prefixed (RFC 7766 §8) or TLS-encrypted.
 //!
-//! For UDP, [RFC 5452 §9.2] requires an unpredictable source port, and a different
-//! one for each outstanding query. The resolver can't choose ports, so the
-//! driver must: bind a fresh ephemeral socket per [`Transmit::query`], and
-//! only feed a datagram to [`Resolver::handle_datagram`] if it arrived on
-//! the socket that query was sent from. The resolver checks everything else
-//! §9.1 asks for: source address and port, message ID and question.
+//! The resolver keeps one connection per server open and sends further
+//! queries over it, several at a time (RFC 7766 §6.2.1, RFC 7858 §3.4). It
+//! asks for the connection to be closed once it has been idle for
+//! [`Config::idle_timeout`], or when a query on it times out.
+//!
+//! For UDP, [RFC 5452 §9.2] requires an unpredictable source port, and a
+//! different one for each outstanding query. The resolver can't choose
+//! ports, so the driver must: bind a fresh ephemeral socket per query
+//! ([`Transport::Udp`] names it), and only feed a datagram to
+//! [`Resolver::handle_datagram`] if it arrived on the socket that query was
+//! sent from. The resolver checks everything else §9.1 asks for: source
+//! address and port, message ID and question.
 //!
 //! [RFC 5452 §9.2]: https://rfc-annotations.research.icann.org/rfc5452.html
 
@@ -85,6 +91,9 @@ pub struct Config {
     /// A name with at least this many dots is tried as given before the
     /// search domains; one with fewer, after them.
     pub ndots: u8,
+    /// How long a stream connection may sit without queries before the
+    /// resolver asks for it to be closed (RFC 7766 §6.2.3).
+    pub idle_timeout: Duration,
     /// DNS over TLS settings; see `Config::with_tls`.
     #[cfg(feature = "tls")]
     tls: Option<tls::Settings>,
@@ -101,6 +110,7 @@ impl Config {
             attempts,
             search: Vec::new(),
             ndots: 1,
+            idle_timeout: Duration::from_secs(10),
             #[cfg(feature = "tls")]
             tls: None,
         }
@@ -207,28 +217,33 @@ impl Config {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct QueryId(u64);
 
+/// Handle for a stream connection; see the crate docs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConnectionId(u64);
+
 /// How a [`Transmit`] must be sent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Transport {
-    /// As one UDP datagram.
-    Udp,
-    /// Over a new TCP connection; see the crate docs.
-    Tcp,
-    /// On the connection opened by this query's last [`Transport::Tcp`]
-    /// transmit.
-    TcpContinue,
+    /// As one UDP datagram, from the socket bound for this query.
+    Udp(QueryId),
+    /// Open a new TCP connection to the destination, named by this id, and
+    /// write the payload.
+    TcpConnect(ConnectionId),
+    /// Write the payload to this open connection.
+    TcpWrite(ConnectionId),
+    /// Close this connection. The payload is empty.
+    TcpClose(ConnectionId),
 }
 
-/// Bytes the caller must send.
+/// Something the caller must do on the network.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Transmit {
-    /// The query these bytes belong to; see the crate docs on source ports.
-    pub query: QueryId,
-    /// Whether to send them as a UDP datagram or over a new TCP connection.
+    /// How to send it, and which socket or connection it belongs to.
     pub transport: Transport,
-    /// The name server to send them to.
+    /// The name server to send it to.
     pub destination: SocketAddr,
-    /// The DNS message, length-prefixed for TCP.
+    /// The bytes to send: a DNS message, length-prefixed or TLS-encrypted
+    /// on streams.
     pub payload: Vec<u8>,
 }
 
@@ -287,57 +302,27 @@ struct Pending {
     server: SocketAddr,
     /// `None` if `now + timeout` overflows: the query then waits forever.
     deadline: Option<Instant>,
-    /// Bytes received so far on the TCP connection, once the query has
-    /// switched to TCP; `None` while it still uses UDP.
-    tcp: Option<Vec<u8>>,
-    /// The TLS session on the current connection, when using DNS over TLS.
-    #[cfg(feature = "tls")]
-    tls: Option<Box<rustls::ClientConnection>>,
+    /// Whether the query goes over a stream: after a truncated UDP answer,
+    /// or always with DNS over TLS.
+    stream: bool,
+    /// The connection the current stream attempt was written to.
+    connection: Option<ConnectionId>,
     /// Search candidates still to try if this name doesn't exist.
     rest: VecDeque<Name>,
 }
 
-impl Pending {
-    /// The bytes to send for the current attempt. Starts a fresh TCP buffer,
-    /// and TLS session if configured, since every TCP transmit means a new
-    /// connection.
-    fn transmit(&mut self, query: QueryId, config: &Config) -> Result<Transmit, Error> {
-        let (transport, payload) = match &mut self.tcp {
-            None => (Transport::Udp, self.payload.clone()),
-            Some(received) => {
-                received.clear();
-                (Transport::Tcp, self.connect(config)?)
-            }
-        };
-        Ok(Transmit {
-            query,
-            transport,
-            destination: self.server,
-            payload,
-        })
-    }
-
-    /// The first bytes for a new connection: the framed query, or the TLS
-    /// ClientHello with the framed query queued behind the handshake.
-    #[cfg_attr(
-        not(feature = "tls"),
-        expect(
-            unused_variables,
-            clippy::unnecessary_wraps,
-            reason = "only TLS settings can make connecting fail"
-        )
-    )]
-    fn connect(&mut self, config: &Config) -> Result<Vec<u8>, Error> {
-        #[cfg(feature = "tls")]
-        if let Some(settings) = &config.tls {
-            let (session, hello) = settings
-                .connect(&frame(&self.payload))
-                .map_err(Error::Tls)?;
-            self.tls = Some(Box::new(session));
-            return Ok(hello);
-        }
-        Ok(frame(&self.payload))
-    }
+/// A stream connection to one server, shared by its queries.
+#[derive(Debug)]
+struct Connection {
+    server: SocketAddr,
+    /// Decrypted bytes not yet split into messages.
+    received: Vec<u8>,
+    /// When it last carried data; the idle timeout counts from here once
+    /// no query uses it.
+    last_active: Instant,
+    /// The TLS session, when using DNS over TLS.
+    #[cfg(feature = "tls")]
+    tls: Option<Box<rustls::ClientConnection>>,
 }
 
 /// Prefix `message` with its two-byte length (RFC 7766 §8).
@@ -413,6 +398,8 @@ pub struct Resolver {
     config: Config,
     next_query: u64,
     pending: BTreeMap<QueryId, Pending>,
+    next_connection: u64,
+    connections: BTreeMap<ConnectionId, Connection>,
     transmits: VecDeque<Transmit>,
     events: VecDeque<Event>,
 }
@@ -424,6 +411,8 @@ impl Resolver {
             config,
             next_query: 0,
             pending: BTreeMap::new(),
+            next_connection: 0,
+            connections: BTreeMap::new(),
             transmits: VecDeque::new(),
             events: VecDeque::new(),
         }
@@ -462,7 +451,7 @@ impl Resolver {
         let first = candidates.pop_front().unwrap_or(absolute);
         let pending = self.new_pending(first, record_type, candidates, now)?;
         self.pending.insert(id, pending);
-        self.emit(id);
+        self.emit(id, now);
         Ok(id)
     }
 
@@ -491,9 +480,8 @@ impl Resolver {
             attempt: 0,
             server: self.config.server(0),
             deadline: now.checked_add(self.config.timeout),
-            tcp: self.config.uses_tls().then(Vec::new),
-            #[cfg(feature = "tls")]
-            tls: None,
+            stream: self.config.uses_tls(),
+            connection: None,
             rest,
         })
     }
@@ -512,7 +500,7 @@ impl Resolver {
             return false;
         };
         self.pending.insert(id, next);
-        self.emit(id);
+        self.emit(id, now);
         true
     }
 
@@ -530,7 +518,7 @@ impl Resolver {
         let Some(id) = self
             .pending
             .iter()
-            .find(|(_, p)| p.tcp.is_none() && p.server == from && is_reply(&p.request, &response))
+            .find(|(_, p)| !p.stream && p.server == from && is_reply(&p.request, &response))
             .map(|(id, _)| *id)
         else {
             return;
@@ -538,32 +526,30 @@ impl Resolver {
         self.handle_response(id, response, now);
     }
 
-    /// Process bytes read from the TCP connection opened for `query`.
+    /// Process bytes read from `connection`.
     ///
-    /// Bytes may arrive in any chunking. The first complete message that
-    /// answers the query is used; others are ignored. Over TLS, the bytes go
-    /// through the session first, which may queue a
-    /// [`Transport::TcpContinue`] transmit; a TLS error counts as a failed
-    /// attempt on this server.
-    pub fn handle_stream_data(&mut self, query: QueryId, data: &[u8], now: Instant) {
-        let Some(pending) = self.pending.get_mut(&query) else {
+    /// Bytes may arrive in any chunking, and answers in any order: each
+    /// complete message goes to the query on this connection it answers,
+    /// and is ignored if there is none (RFC 7766 §6.2.1.1). Over TLS, the
+    /// bytes go through the session first, which may queue a
+    /// [`Transport::TcpWrite`]; a TLS error closes the connection and moves
+    /// its queries on to their next attempt.
+    pub fn handle_stream_data(&mut self, connection: ConnectionId, data: &[u8], now: Instant) {
+        let Some(conn) = self.connections.get_mut(&connection) else {
             return;
         };
-        let Some(received) = &mut pending.tcp else {
-            return;
-        };
+        conn.last_active = now;
         #[cfg(feature = "tls")]
         let decrypted;
         #[cfg(feature = "tls")]
-        let data = match &mut pending.tls {
+        let data = match &mut conn.tls {
             None => data,
             Some(session) => match tls::receive(session, data) {
                 Ok((reply, plaintext)) => {
                     if !reply.is_empty() {
                         self.transmits.push_back(Transmit {
-                            query,
-                            transport: Transport::TcpContinue,
-                            destination: pending.server,
+                            transport: Transport::TcpWrite(connection),
+                            destination: conn.server,
                             payload: reply,
                         });
                     }
@@ -571,27 +557,36 @@ impl Resolver {
                     &decrypted[..]
                 }
                 Err(error) => {
-                    self.retry(query, now, Error::Tls(error));
+                    self.close(connection, now, &Error::Tls(error));
                     return;
                 }
             },
         };
-        received.extend_from_slice(data);
-        while let Some(message) = next_frame(received) {
-            if let Ok(response) = Message::from_vec(&message)
-                && is_reply(&pending.request, &response)
-            {
-                self.handle_response(query, response, now);
-                return;
+        conn.received.extend_from_slice(data);
+        let mut messages = Vec::new();
+        while let Some(message) = next_frame(&mut conn.received) {
+            messages.push(message);
+        }
+        for message in messages {
+            let Ok(response) = Message::from_vec(&message) else {
+                continue;
+            };
+            let id = self
+                .pending
+                .iter()
+                .find(|(_, p)| p.connection == Some(connection) && is_reply(&p.request, &response))
+                .map(|(id, _)| *id);
+            if let Some(id) = id {
+                self.handle_response(id, response, now);
             }
         }
     }
 
-    /// The TCP connection for `query` ended or failed. Retries the query on
-    /// the next server, still over TCP.
-    pub fn handle_stream_closed(&mut self, query: QueryId, now: Instant) {
-        if self.pending.get(&query).is_some_and(|p| p.tcp.is_some()) {
-            self.retry(query, now, Error::ConnectionClosed);
+    /// `connection` ended or failed on its own. Its queries move on to their
+    /// next attempt, still over a stream.
+    pub fn handle_stream_closed(&mut self, connection: ConnectionId, now: Instant) {
+        if self.connections.remove(&connection).is_some() {
+            self.retry_all_on(connection, now, &Error::ConnectionClosed);
         }
     }
 
@@ -619,7 +614,11 @@ impl Resolver {
         }
     }
 
-    /// Retry or fail every query whose deadline is at or before `now`.
+    /// Retry or fail every query whose deadline is at or before `now`, and
+    /// close connections that have been idle for too long.
+    ///
+    /// A query that times out on a stream suggests the connection is dead,
+    /// so the connection is closed and all its queries move on.
     pub fn handle_timeout(&mut self, now: Instant) {
         let expired: Vec<QueryId> = self
             .pending
@@ -628,7 +627,35 @@ impl Resolver {
             .map(|(id, _)| *id)
             .collect();
         for id in expired {
-            self.retry(id, now, Error::Timeout);
+            // An earlier close may already have moved this query on.
+            let Some(pending) = self.pending.get(&id) else {
+                continue;
+            };
+            if !pending.deadline.is_some_and(|d| d <= now) {
+                continue;
+            }
+            match pending
+                .connection
+                .filter(|c| self.connections.contains_key(c))
+            {
+                Some(connection) => self.close(connection, now, &Error::Timeout),
+                None => self.retry(id, now, Error::Timeout),
+            }
+        }
+        let idle: Vec<ConnectionId> = self
+            .connections
+            .keys()
+            .filter(|c| self.idle_deadline(**c).is_some_and(|d| d <= now))
+            .copied()
+            .collect();
+        for connection in idle {
+            if let Some(conn) = self.connections.remove(&connection) {
+                self.transmits.push_back(Transmit {
+                    transport: Transport::TcpClose(connection),
+                    destination: conn.server,
+                    payload: Vec::new(),
+                });
+            }
         }
     }
 
@@ -639,7 +666,26 @@ impl Resolver {
 
     /// Earliest instant at which [`Resolver::handle_timeout`] must be called.
     pub fn poll_timeout(&self) -> Option<Instant> {
-        self.pending.values().filter_map(|p| p.deadline).min()
+        let queries = self.pending.values().filter_map(|p| p.deadline);
+        let idle = self
+            .connections
+            .keys()
+            .filter_map(|c| self.idle_deadline(*c));
+        queries.chain(idle).min()
+    }
+
+    /// When `connection` should close for being idle: `None` while a query
+    /// uses it.
+    fn idle_deadline(&self, connection: ConnectionId) -> Option<Instant> {
+        let conn = self.connections.get(&connection)?;
+        if self
+            .pending
+            .values()
+            .any(|p| p.connection == Some(connection))
+        {
+            return None;
+        }
+        conn.last_active.checked_add(self.config.idle_timeout)
     }
 
     /// Next completed query, if any.
@@ -664,7 +710,33 @@ impl Resolver {
         }
         pending.server = self.config.server(pending.attempt);
         pending.deadline = now.checked_add(self.config.timeout);
-        self.emit(id);
+        self.emit(id, now);
+    }
+
+    /// Move every query on `connection` on to its next attempt.
+    fn retry_all_on(&mut self, connection: ConnectionId, now: Instant, error: &Error) {
+        let affected: Vec<QueryId> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| p.connection == Some(connection))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in affected {
+            self.retry(id, now, error.clone());
+        }
+    }
+
+    /// Ask the driver to close `connection`, and move its queries on.
+    fn close(&mut self, connection: ConnectionId, now: Instant, error: &Error) {
+        let Some(conn) = self.connections.remove(&connection) else {
+            return;
+        };
+        self.transmits.push_back(Transmit {
+            transport: Transport::TcpClose(connection),
+            destination: conn.server,
+            payload: Vec::new(),
+        });
+        self.retry_all_on(connection, now, error);
     }
 
     /// Re-send `id` to the same server over TCP (RFC 7766 §5). Doesn't
@@ -674,12 +746,12 @@ impl Resolver {
         let Some(pending) = self.pending.get_mut(&id) else {
             return false;
         };
-        if pending.tcp.is_some() {
+        if pending.stream {
             return false;
         }
-        pending.tcp = Some(Vec::new());
+        pending.stream = true;
         pending.deadline = now.checked_add(self.config.timeout);
-        self.emit(id);
+        self.emit(id, now);
         true
     }
 
@@ -699,19 +771,118 @@ impl Resolver {
         };
         pending.payload = payload;
         pending.deadline = now.checked_add(self.config.timeout);
-        self.emit(id);
+        self.emit(id, now);
     }
 
-    /// Queue the current attempt's bytes for `id`, or fail the query if
-    /// they can't be produced.
-    fn emit(&mut self, id: QueryId) {
-        let Some(pending) = self.pending.get_mut(&id) else {
+    /// Send `id`'s current attempt: as a datagram, or on the open
+    /// connection to its server, opening one if there is none. Fails the
+    /// query if the bytes can't be produced.
+    fn emit(&mut self, id: QueryId, now: Instant) {
+        let Some(pending) = self.pending.get(&id) else {
             return;
         };
-        match pending.transmit(id, &self.config) {
-            Ok(transmit) => self.transmits.push_back(transmit),
-            Err(error) => self.fail(id, error),
+        let server = pending.server;
+        if !pending.stream {
+            self.transmits.push_back(Transmit {
+                transport: Transport::Udp(id),
+                destination: server,
+                payload: pending.payload.clone(),
+            });
+            return;
         }
+        let message = frame(&pending.payload);
+        let open = self
+            .connections
+            .iter()
+            .find(|(_, c)| c.server == server)
+            .map(|(c, _)| *c);
+        let sent = match open {
+            Some(connection) => self.write(connection, &message, now).map(|()| connection),
+            None => self.connect(server, &message, now),
+        };
+        match (sent, self.pending.get_mut(&id)) {
+            (Ok(connection), Some(pending)) => pending.connection = Some(connection),
+            (Err(error), _) => self.fail(id, error),
+            (Ok(_), None) => {}
+        }
+    }
+
+    /// Open a connection to `server` with `message` as its first query.
+    #[cfg_attr(
+        not(feature = "tls"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "only TLS settings can make connecting fail"
+        )
+    )]
+    fn connect(
+        &mut self,
+        server: SocketAddr,
+        message: &[u8],
+        now: Instant,
+    ) -> Result<ConnectionId, Error> {
+        let connection = ConnectionId(self.next_connection);
+        self.next_connection += 1;
+        #[cfg(feature = "tls")]
+        let (tls, payload) = match &self.config.tls {
+            Some(settings) => {
+                let (session, hello) = settings.connect(message).map_err(Error::Tls)?;
+                (Some(Box::new(session)), hello)
+            }
+            None => (None, message.to_vec()),
+        };
+        #[cfg(not(feature = "tls"))]
+        let payload = message.to_vec();
+        let conn = Connection {
+            server,
+            received: Vec::new(),
+            last_active: now,
+            #[cfg(feature = "tls")]
+            tls,
+        };
+        self.connections.insert(connection, conn);
+        self.transmits.push_back(Transmit {
+            transport: Transport::TcpConnect(connection),
+            destination: server,
+            payload,
+        });
+        Ok(connection)
+    }
+
+    /// Write `message` to an open connection. Over TLS it may wait inside
+    /// the session until the handshake is done.
+    #[cfg_attr(
+        not(feature = "tls"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "only a TLS session can refuse a write"
+        )
+    )]
+    fn write(
+        &mut self,
+        connection: ConnectionId,
+        message: &[u8],
+        now: Instant,
+    ) -> Result<(), Error> {
+        let Some(conn) = self.connections.get_mut(&connection) else {
+            return Ok(());
+        };
+        conn.last_active = now;
+        #[cfg(feature = "tls")]
+        let payload = match &mut conn.tls {
+            Some(session) => tls::send(session, message).map_err(Error::Tls)?,
+            None => message.to_vec(),
+        };
+        #[cfg(not(feature = "tls"))]
+        let payload = message.to_vec();
+        if !payload.is_empty() {
+            self.transmits.push_back(Transmit {
+                transport: Transport::TcpWrite(connection),
+                destination: conn.server,
+                payload,
+            });
+        }
+        Ok(())
     }
 
     fn fail(&mut self, id: QueryId, error: Error) {

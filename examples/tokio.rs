@@ -14,7 +14,7 @@
 use std::time::{Duration, Instant};
 
 use sansio_dns::hickory_proto::rr::{Name, RecordType};
-use sansio_dns::{Config, Event, QueryId, Resolver, Transmit, Transport};
+use sansio_dns::{Config, ConnectionId, Event, Resolver, Transmit, Transport};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::{sleep_until, timeout, timeout_at};
@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = args.next().unwrap_or_else(|| "1.1.1.1:53".into()).parse()?;
 
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    let mut tcp: Option<(QueryId, TcpStream)> = None;
+    let mut tcp: Option<(ConnectionId, TcpStream)> = None;
     let mut resolver = Resolver::new(Config::new(server, []));
     resolver.query(name, RecordType::A, Instant::now())?;
 
@@ -34,19 +34,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         while let Some(t) = resolver.poll_transmit() {
             match t.transport {
-                Transport::Udp => {
+                Transport::Udp(_) => {
                     socket.send_to(&t.payload, t.destination).await?;
                 }
-                Transport::Tcp => match timeout(Duration::from_secs(2), open(&t)).await {
-                    Ok(Ok(stream)) => tcp = Some((t.query, stream)),
-                    _ => resolver.handle_stream_closed(t.query, Instant::now()),
+                Transport::TcpConnect(c) => match timeout(Duration::from_secs(2), open(&t)).await {
+                    Ok(Ok(stream)) => tcp = Some((c, stream)),
+                    _ => resolver.handle_stream_closed(c, Instant::now()),
                 },
-                Transport::TcpContinue => {
-                    if let Some((_, stream)) = tcp.as_mut().filter(|(q, _)| *q == t.query)
+                Transport::TcpWrite(c) => {
+                    if let Some((_, stream)) = tcp.as_mut().filter(|(open, _)| *open == c)
                         && stream.write_all(&t.payload).await.is_err()
                     {
-                        resolver.handle_stream_closed(t.query, Instant::now());
+                        resolver.handle_stream_closed(c, Instant::now());
                     }
+                }
+                Transport::TcpClose(c) => {
+                    tcp.take_if(|(open, _)| *open == c);
                 }
             }
         }
@@ -63,16 +66,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("no query in flight".into());
         };
 
-        if let Some((query, mut stream)) = tcp.take() {
+        if let Some((connection, mut stream)) = tcp.take() {
             match timeout_at(deadline.into(), stream.read(&mut buf)).await {
                 Ok(Ok(n)) if n > 0 => {
-                    resolver.handle_stream_data(query, &buf[..n], Instant::now());
-                    tcp = Some((query, stream));
+                    resolver.handle_stream_data(connection, &buf[..n], Instant::now());
+                    tcp = Some((connection, stream));
                 }
-                Ok(_) => resolver.handle_stream_closed(query, Instant::now()),
+                Ok(_) => resolver.handle_stream_closed(connection, Instant::now()),
                 Err(_elapsed) => {
                     resolver.handle_timeout(Instant::now());
-                    tcp = Some((query, stream));
+                    tcp = Some((connection, stream));
                 }
             }
             continue;

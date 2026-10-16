@@ -12,6 +12,7 @@
 
 mod common;
 
+use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::sync::Arc;
 use std::time::Instant;
@@ -21,7 +22,7 @@ use hickory_proto::op::Message;
 use hickory_proto::rr::{Name, RecordType};
 use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection};
-use sansio_dns::{Config, Error, Event, Resolver, Transmit, Transport};
+use sansio_dns::{Config, ConnectionId, Error, Event, Resolver, Transmit, Transport};
 use std::assert_matches;
 
 /// A client that trusts a self-signed `dns.example` certificate, and a
@@ -59,11 +60,10 @@ fn tls_resolver(client: Arc<ClientConfig>, now: Instant) -> Resolver {
 }
 
 /// A name server behind TLS. Records the queries it decrypts and answers
-/// each one like `reply` does.
+/// each one like `reply` does, on every connection the resolver opens.
 struct Server {
     config: Arc<ServerConfig>,
-    session: Option<ServerConnection>,
-    plaintext: Vec<u8>,
+    sessions: HashMap<ConnectionId, (ServerConnection, Vec<u8>)>,
     queries: Vec<Vec<u8>>,
     sni: Option<String>,
 }
@@ -72,8 +72,7 @@ impl Server {
     fn new(config: Arc<ServerConfig>) -> Self {
         Self {
             config,
-            session: None,
-            plaintext: Vec::new(),
+            sessions: HashMap::new(),
             queries: Vec::new(),
             sni: None,
         }
@@ -81,11 +80,19 @@ impl Server {
 
     /// Take bytes the resolver sent; return the bytes to send back.
     fn receive(&mut self, transmit: &Transmit) -> Vec<u8> {
-        if transmit.transport == Transport::Tcp {
-            self.session = Some(ServerConnection::new(Arc::clone(&self.config)).unwrap());
-            self.plaintext.clear();
+        let connection = conn(transmit);
+        match transmit.transport {
+            Transport::TcpConnect(_) => {
+                let session = ServerConnection::new(Arc::clone(&self.config)).unwrap();
+                self.sessions.insert(connection, (session, Vec::new()));
+            }
+            Transport::TcpClose(_) => {
+                self.sessions.remove(&connection);
+                return Vec::new();
+            }
+            _ => {}
         }
-        let session = self.session.as_mut().unwrap();
+        let (session, plaintext) = self.sessions.get_mut(&connection).unwrap();
         let mut data = &transmit.payload[..];
         while !data.is_empty() {
             session.read_tls(&mut data).unwrap();
@@ -99,26 +106,22 @@ impl Server {
             }
         }
         self.sni = session.server_name().map(str::to_owned);
-        match session.reader().read_to_end(&mut self.plaintext) {
+        match session.reader().read_to_end(plaintext) {
             Ok(_) => {}
             Err(e) => assert_eq!(e.kind(), ErrorKind::WouldBlock),
         }
-        if self.plaintext.len() >= 2 {
-            let len = usize::from(u16::from_be_bytes([self.plaintext[0], self.plaintext[1]]));
-            if self.plaintext.len() >= 2 + len {
-                let query: Vec<u8> = self.plaintext.drain(..2 + len).skip(2).collect();
-                let fake = Transmit {
-                    query: transmit.query,
-                    transport: Transport::Udp,
-                    destination: transmit.destination,
-                    payload: query.clone(),
-                };
-                session
-                    .writer()
-                    .write_all(&frame(&encode(&reply(&fake))))
-                    .unwrap();
-                self.queries.push(query);
+        while plaintext.len() >= 2 {
+            let len = usize::from(u16::from_be_bytes([plaintext[0], plaintext[1]]));
+            if plaintext.len() < 2 + len {
+                break;
             }
+            let query: Vec<u8> = plaintext.drain(..2 + len).skip(2).collect();
+            let answer = reply_to(&Message::from_vec(&query).unwrap());
+            session
+                .writer()
+                .write_all(&frame(&encode(&answer)))
+                .unwrap();
+            self.queries.push(query);
         }
         let mut out = Vec::new();
         while session.wants_write() {
@@ -134,7 +137,7 @@ fn run(resolver: &mut Resolver, server: &mut Server, now: Instant) -> Vec<Transm
     while let Some(t) = resolver.poll_transmit() {
         let back = server.receive(&t);
         if !back.is_empty() {
-            resolver.handle_stream_data(t.query, &back, now);
+            resolver.handle_stream_data(conn(&t), &back, now);
         }
         sent.push(t);
     }
@@ -153,10 +156,13 @@ fn query_is_answered_over_tls() {
     let sent = run(&mut resolver, &mut server, now);
 
     let (first, rest) = sent.split_first().unwrap();
-    assert_eq!(first.transport, Transport::Tcp);
+    assert!(is_connect(first));
     assert_eq!(first.destination, S1);
     assert_eq!(first.payload[0], 0x16, "TLS handshake record");
-    assert!(rest.iter().all(|t| t.transport == Transport::TcpContinue));
+    assert!(
+        rest.iter()
+            .all(|t| matches!(t.transport, Transport::TcpWrite(_)))
+    );
     assert_eq!(server.sni.as_deref(), Some("dns.example"));
     assert!(is_response(resolver.poll_event()));
 }
@@ -189,7 +195,7 @@ fn wrong_certificate_moves_on_then_fails() {
 
     let new_connections: Vec<_> = sent
         .iter()
-        .filter(|t| t.transport == Transport::Tcp)
+        .filter(|t| is_connect(t))
         .map(|t| t.destination)
         .collect();
     assert_eq!(new_connections, [S1, S2, S1, S2]);
@@ -201,4 +207,46 @@ fn wrong_certificate_moves_on_then_fails() {
             ..
         })
     );
+}
+
+/// §3.4: later queries reuse the established session, without a new
+/// connection or handshake.
+#[test]
+fn later_query_reuses_the_session() {
+    let (client, server_config) = configs("dns.example");
+    let now = Instant::now();
+    let mut resolver = tls_resolver(client, now);
+    let mut server = Server::new(server_config);
+    run(&mut resolver, &mut server, now);
+    assert!(is_response(resolver.poll_event()));
+
+    let name = Name::from_ascii("example.org.").unwrap();
+    resolver.query(name, RecordType::A, now).unwrap();
+    let sent = run(&mut resolver, &mut server, now);
+
+    assert!(
+        sent.iter()
+            .all(|t| matches!(t.transport, Transport::TcpWrite(_)))
+    );
+    assert_eq!(server.queries.len(), 2);
+    assert!(is_response(resolver.poll_event()));
+}
+
+/// A query started during the handshake waits for it on the same
+/// connection, as with the A and AAAA queries of an `IpLookup`.
+#[test]
+fn query_during_handshake_waits_for_it() {
+    let (client, server_config) = configs("dns.example");
+    let now = Instant::now();
+    let mut resolver = tls_resolver(client, now);
+    let mut server = Server::new(server_config);
+    let name = Name::from_ascii("example.org.").unwrap();
+    resolver.query(name, RecordType::AAAA, now).unwrap();
+
+    let sent = run(&mut resolver, &mut server, now);
+
+    assert_eq!(sent.iter().filter(|t| is_connect(t)).count(), 1);
+    assert_eq!(server.queries.len(), 2);
+    assert!(is_response(resolver.poll_event()));
+    assert!(is_response(resolver.poll_event()));
 }

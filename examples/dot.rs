@@ -21,7 +21,7 @@ use sansio_dns::hickory_proto::rr::{Name, RecordType};
 use sansio_dns::rustls::crypto::ring;
 use sansio_dns::rustls::pki_types::ServerName;
 use sansio_dns::rustls::{ClientConfig, RootCertStore};
-use sansio_dns::{Config, Event, QueryId, Resolver, Transport};
+use sansio_dns::{Config, ConnectionId, Event, Resolver, Transport};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -44,28 +44,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut resolver = Resolver::new(Config::new(server, []).with_tls(Arc::new(client), tls_name)?);
     resolver.query(name, RecordType::A, Instant::now())?;
 
-    let mut tcp: Option<(QueryId, TcpStream)> = None;
+    let mut tcp: Option<(ConnectionId, TcpStream)> = None;
     let mut buf = [0; 4096];
     loop {
         while let Some(t) = resolver.poll_transmit() {
-            let written = match t.transport {
-                Transport::Tcp => {
+            let (connection, written) = match t.transport {
+                Transport::TcpConnect(c) => (
+                    c,
                     TcpStream::connect_timeout(&t.destination, Duration::from_secs(2)).and_then(
                         |mut stream| {
                             stream.write_all(&t.payload)?;
-                            tcp = Some((t.query, stream));
+                            tcp = Some((c, stream));
                             Ok(())
                         },
-                    )
-                }
-                Transport::TcpContinue => match tcp.as_mut().filter(|(q, _)| *q == t.query) {
-                    Some((_, stream)) => stream.write_all(&t.payload),
-                    None => Ok(()),
+                    ),
+                ),
+                Transport::TcpWrite(c) => match tcp.as_mut().filter(|(open, _)| *open == c) {
+                    Some((_, stream)) => (c, stream.write_all(&t.payload)),
+                    None => (c, Ok(())),
                 },
-                Transport::Udp => return Err("DNS over TLS never uses UDP".into()),
+                Transport::TcpClose(c) => {
+                    tcp.take_if(|(open, _)| *open == c);
+                    continue;
+                }
+                Transport::Udp(_) => return Err("DNS over TLS never uses UDP".into()),
             };
             if written.is_err() {
-                resolver.handle_stream_closed(t.query, Instant::now());
+                resolver.handle_stream_closed(connection, Instant::now());
             }
         }
         if let Some(event) = resolver.poll_event() {
@@ -80,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let Some(deadline) = resolver.poll_timeout() else {
             return Err("no query in flight".into());
         };
-        let Some((query, mut stream)) = tcp.take() else {
+        let Some((connection, mut stream)) = tcp.take() else {
             resolver.handle_timeout(deadline);
             continue;
         };
@@ -89,16 +94,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .max(Duration::from_millis(1));
         stream.set_read_timeout(Some(wait))?;
         match stream.read(&mut buf) {
-            Ok(0) => resolver.handle_stream_closed(query, Instant::now()),
+            Ok(0) => resolver.handle_stream_closed(connection, Instant::now()),
             Ok(n) => {
-                resolver.handle_stream_data(query, &buf[..n], Instant::now());
-                tcp = Some((query, stream));
+                resolver.handle_stream_data(connection, &buf[..n], Instant::now());
+                tcp = Some((connection, stream));
             }
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                 resolver.handle_timeout(Instant::now());
-                tcp = Some((query, stream));
+                tcp = Some((connection, stream));
             }
-            Err(_) => resolver.handle_stream_closed(query, Instant::now()),
+            Err(_) => resolver.handle_stream_closed(connection, Instant::now()),
         }
     }
 }

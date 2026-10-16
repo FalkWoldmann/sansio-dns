@@ -22,11 +22,10 @@ use std::time::{Duration, Instant};
 use common::*;
 use hickory_proto::op::ResponseCode;
 use proptest::prelude::*;
-use sansio_dns::{Event, QueryId, Resolver, Transmit, Transport};
+use sansio_dns::{ConnectionId, Event, QueryId, Resolver, Transmit, Transport};
 
-/// Transmits one query may cause: one per attempt, plus one EDNS downgrade
-/// and one switch to TCP.
-const MAX_TRANSMITS: usize = 2 * 2 + 2;
+/// Datagrams one query may cause: one per attempt, plus one EDNS downgrade.
+const MAX_DATAGRAMS: usize = 2 * 2 + 1;
 
 #[derive(Clone, Debug)]
 enum Reply {
@@ -137,7 +136,9 @@ struct Harness {
     sent: Vec<Transmit>,
     live: Vec<QueryId>,
     done: HashSet<QueryId>,
-    transmits: HashMap<QueryId, usize>,
+    datagrams: HashMap<QueryId, usize>,
+    open: HashSet<ConnectionId>,
+    ever_opened: HashSet<ConnectionId>,
 }
 
 impl Harness {
@@ -148,7 +149,9 @@ impl Harness {
             sent: Vec::new(),
             live: Vec::new(),
             done: HashSet::new(),
-            transmits: HashMap::new(),
+            datagrams: HashMap::new(),
+            open: HashSet::new(),
+            ever_opened: HashSet::new(),
         }
     }
 
@@ -166,13 +169,14 @@ impl Harness {
                 if let Some(sent) = self.sent.get(to % self.sent.len().max(1)) {
                     let (from, bytes) = datagram(sent, reply);
                     match sent.transport {
-                        Transport::Udp => self.resolver.handle_datagram(from, &bytes, self.now),
-                        Transport::Tcp | Transport::TcpContinue => {
+                        Transport::Udp(_) => self.resolver.handle_datagram(from, &bytes, self.now),
+                        Transport::TcpConnect(c) | Transport::TcpWrite(c) => {
                             let framed = frame(&bytes);
                             let (a, b) = framed.split_at(split % (framed.len() + 1));
-                            self.resolver.handle_stream_data(sent.query, a, self.now);
-                            self.resolver.handle_stream_data(sent.query, b, self.now);
+                            self.resolver.handle_stream_data(c, a, self.now);
+                            self.resolver.handle_stream_data(c, b, self.now);
                         }
+                        Transport::TcpClose(_) => {}
                     }
                 }
             }
@@ -194,9 +198,12 @@ impl Harness {
                 }
             }
             Op::StreamClosed { which } => {
-                if !self.live.is_empty() {
-                    let id = self.live[which % self.live.len()];
-                    self.resolver.handle_stream_closed(id, self.now);
+                let mut open: Vec<_> = self.open.iter().copied().collect();
+                open.sort_unstable();
+                if !open.is_empty() {
+                    let c = open[which % open.len()];
+                    self.open.remove(&c);
+                    self.resolver.handle_stream_closed(c, self.now);
                 }
             }
             Op::Garbage(bytes) => self.resolver.handle_datagram(S1, bytes, self.now),
@@ -207,17 +214,29 @@ impl Harness {
     fn check(&mut self) -> Result<(), TestCaseError> {
         while let Some(t) = self.resolver.poll_transmit() {
             prop_assert!(t.destination == S1 || t.destination == S2, "unknown server");
-            prop_assert!(
-                self.live.contains(&t.query),
-                "transmit for a finished query"
-            );
-            if t.transport == Transport::Tcp {
-                let len = usize::from(u16::from_be_bytes([t.payload[0], t.payload[1]]));
-                prop_assert_eq!(len + 2, t.payload.len(), "wrong TCP length prefix");
+            match t.transport {
+                Transport::Udp(q) => {
+                    prop_assert!(self.live.contains(&q), "datagram for a finished query");
+                    let count = self.datagrams.entry(q).or_default();
+                    *count += 1;
+                    prop_assert!(*count <= MAX_DATAGRAMS, "too many datagrams for one query");
+                }
+                Transport::TcpConnect(c) | Transport::TcpWrite(c) => {
+                    if matches!(t.transport, Transport::TcpConnect(_)) {
+                        prop_assert!(self.ever_opened.insert(c), "connection id reused");
+                        self.open.insert(c);
+                    }
+                    prop_assert!(self.open.contains(&c), "write on a closed connection");
+                    prop_assert!(!self.live.is_empty(), "query written with none pending");
+                    let len = usize::from(u16::from_be_bytes([t.payload[0], t.payload[1]]));
+                    prop_assert_eq!(len + 2, t.payload.len(), "wrong TCP length prefix");
+                }
+                Transport::TcpClose(c) => {
+                    prop_assert!(self.open.remove(&c), "closing a connection that isn't open");
+                    prop_assert!(t.payload.is_empty());
+                    continue;
+                }
             }
-            let count = self.transmits.entry(t.query).or_default();
-            *count += 1;
-            prop_assert!(*count <= MAX_TRANSMITS, "too many transmits for one query");
             self.sent.push(t);
         }
         // Keep recent transmits only, so late replies to old ones still happen.
@@ -239,8 +258,8 @@ impl Harness {
         let timeout = self.resolver.poll_timeout();
         prop_assert_eq!(
             timeout.is_some(),
-            !self.live.is_empty(),
-            "timer iff pending"
+            !self.live.is_empty() || !self.open.is_empty(),
+            "timer iff queries pending or connections open"
         );
         prop_assert!(
             timeout.is_none_or(|t| t > self.now),

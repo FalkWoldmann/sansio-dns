@@ -18,7 +18,7 @@ use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{Name, RData};
 use proptest::prelude::*;
 use rstest::rstest;
-use sansio_dns::{Error, Event, Resolver, Transport};
+use sansio_dns::{Error, Event, Resolver};
 use std::assert_matches;
 
 /// §2.3.3: name comparisons are case-insensitive, so a server that changes
@@ -152,7 +152,7 @@ mod section_4_2_1 {
         resolver.handle_datagram(S1, &encode(&response), now);
 
         assert!(resolver.poll_event().is_none());
-        assert_eq!(resolver.poll_transmit().unwrap().transport, Transport::Tcp);
+        assert!(is_connect(&resolver.poll_transmit().unwrap()));
     }
 }
 

@@ -117,3 +117,8 @@ unreachable = "warn"
 [[example]]
 name = "dot"
 required-features = ["tls"]
+
+[[bench]]
+name = "dot"
+harness = false
+required-features = ["tls"]

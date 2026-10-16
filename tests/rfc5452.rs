@@ -150,7 +150,7 @@ mod section_9_2 {
         let sent: Vec<_> = (0..512).map(|_| start(&mut resolver, now)).collect();
 
         let ids: HashSet<u16> = sent.iter().map(|t| decode(t).metadata.id).collect();
-        let handles: HashSet<_> = sent.iter().map(|t| t.query).collect();
+        let handles: HashSet<_> = sent.iter().map(|t| t.transport).collect();
         assert_eq!(ids.len(), sent.len());
         assert_eq!(handles.len(), sent.len());
     }
