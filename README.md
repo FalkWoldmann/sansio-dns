@@ -74,6 +74,41 @@ nameservers, `search`/`domain`, `ndots`, `timeout` and `attempts`. With search d
 without a trailing dot is tried with each of them, before the name as given if it has fewer
 than `ndots` dots and after it otherwise; the search moves on only on NXDOMAIN.
 
+## Compared with hickory-resolver
+
+[hickory-resolver](https://crates.io/crates/hickory-resolver) is the established async
+resolver for Rust, and the one behind reqwest's `hickory-dns` feature. The `compare/` crate
+measures both on the job a reqwest client gives them, against a name server on localhost
+(`cargo bench -p compare`, `cargo run -p compare --release --bin allocs`). On an M3 Pro, with
+hickory-resolver 0.26.3 and its cache off:
+
+| | sansio-dns-tokio | hickory-resolver |
+|---|---|---|
+| `lookup_ip` over UDP | 226 µs | 311 µs |
+| `lookup_ip` after a truncated answer, over TCP | 305 µs | 396 µs |
+| reqwest GET on a new connection | 396 µs | 425 µs |
+| Heap allocations per UDP lookup, incl. 18 by the test server | 57 | 145 |
+| Stripped binary size over reqwest's default resolver | +0.58 MB | +1.44 MB |
+
+On localhost the times are mostly task wakeups; on a real network the round trip to the
+server dominates. With its cache on, hickory answers a repeated lookup in about 1 µs, and
+sansio-dns has no cache yet.
+
+Where the two behave differently:
+
+| | sansio-dns | hickory-resolver |
+|---|---|---|
+| Runtime | Sans-IO core for any runtime, plus a Tokio driver | Tokio; its `RuntimeProvider` needs `Send + Sync` |
+| EDNS | Always on at 1232 bytes, dropped once on `FORMERR` | From the system config only with `options edns0` |
+| Truncated answer over TCP | Used as it is | The lookup fails |
+| Hosts entry with only an IPv4 address | Empty AAAA answer, as glibc does | AAAA asked from DNS |
+| Names with `_` | Resolved | Rejected |
+| Cache | None | Positive and negative, 8192 entries |
+| Server order | As configured, for every query | By measured latency, two servers raced |
+| Transports | UDP, TCP, DoT | Also DoH, DoH3, DoQ and DNSSEC validation |
+| System configuration | `resolv.conf` and hosts | Also Windows, and macOS through SystemConfiguration |
+| Tokio lookups | `lookup_ip` | Any record type, reverse lookups, typed helpers |
+
 ## Spec coverage
 
 Behavior follows the RFCs as listed and annotated at
