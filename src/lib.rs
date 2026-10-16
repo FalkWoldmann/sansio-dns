@@ -1006,20 +1006,24 @@ impl Resolver {
         self.events.push_back(Event::Failed { query: id, error });
     }
 
-    /// A query message whose ID no in-flight query is using.
+    /// A query message, with an ID no in-flight query is using if one of a
+    /// few random picks finds one.
     ///
     /// The ID comes from hickory-proto's `rand::random`, a CSPRNG, covering
-    /// the full 16-bit range as RFC 5452 §9.2 requires.
+    /// the full 16-bit range as RFC 5452 §9.2 requires. With nearly all
+    /// 65536 IDs in use, the last pick is kept rather than looping forever:
+    /// a datagram is matched by its query's own socket and a stream answer
+    /// by ID and question, so a duplicate ID only pairs queries whose
+    /// answers are interchangeable.
     fn new_message(&self) -> Message {
-        loop {
-            let message = Message::query();
-            if self
-                .pending
+        let free = |message: &Message| {
+            self.pending
                 .values()
                 .all(|p| p.request.metadata.id != message.metadata.id)
-            {
-                return message;
-            }
-        }
+        };
+        std::iter::repeat_with(Message::query)
+            .take(16)
+            .find(free)
+            .unwrap_or_else(Message::query)
     }
 }
