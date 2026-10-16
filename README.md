@@ -18,6 +18,18 @@ loop {
 
 Complete drivers are in `examples/` (`std`, `tokio`, `compio`), about 100 lines each including TCP.
 
+For hostnames, `IpLookup` runs the A and AAAA queries and merges the addresses, following
+CNAMEs:
+
+```rust
+let mut lookup = IpLookup::start(&mut resolver, Name::from_ascii("example.com")?, now)?;
+// in the event loop:
+while let Some(event) = resolver.poll_event() { lookup.handle_event(&event); }
+if let Some(result) = lookup.result() { /* Ok(addresses) or Err(error) */ }
+```
+
+`addresses(&message)` does the CNAME-following part for any single response.
+
 ## Spec coverage
 
 Behavior follows the RFCs as listed and annotated at
@@ -39,6 +51,11 @@ Tests live in `tests/rfc<number>.rs`, with one module per section.
 | 6891 | §7, §6.2.2 | `FORMERR` without OPT → same server once more without EDNS; with OPT → fail over |
 | 7766 | §5 | Truncated UDP response → same server over TCP; later attempts stay on TCP; UDP replies then ignored |
 | 7766 | §8 | Two-byte length prefix; replies reassembled from any chunking |
+| 1034 | §3.6.2 | `addresses` follows the CNAME chain and ignores records owned by other names |
+| 6761 | §6.3 | `localhost` names → loopback for A/AAAA, empty answer otherwise; nothing sent |
+| 6761 | §6.4 | `invalid.` → NXDOMAIN; nothing sent |
+| 6762 | §3 | `local.` → NXDOMAIN; nothing sent (resolve with mDNS instead) |
+| 7686 | §2 | `onion.` → NXDOMAIN; nothing sent |
 
 ### Driver obligations
 

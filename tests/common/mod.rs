@@ -2,11 +2,11 @@
 
 #![allow(dead_code, reason = "each test crate uses a different subset")]
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Instant;
 
 use hickory_proto::op::{Message, ResponseCode};
-use hickory_proto::rr::rdata::A;
+use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use rstest::fixture;
 use sansio_dns::{Config, Event, Resolver, Transmit, Transport};
@@ -14,6 +14,7 @@ use sansio_dns::{Config, Event, Resolver, Transmit, Transport};
 pub const S1: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 53);
 pub const S2: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 53);
 pub const ADDR: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 7);
+pub const ADDR6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 7);
 
 #[fixture]
 pub fn resolver() -> Resolver {
@@ -52,8 +53,12 @@ pub fn reply(request: &Transmit) -> Message {
     let request = decode(request);
     let mut response = Message::response(request.metadata.id, request.metadata.op_code);
     response.add_queries(request.queries.clone());
-    let name = request.queries[0].name().clone();
-    response.add_answer(Record::from_rdata(name, 300, RData::A(A(ADDR))));
+    let question = &request.queries[0];
+    let data = match question.query_type() {
+        RecordType::AAAA => RData::AAAA(AAAA(ADDR6)),
+        _ => RData::A(A(ADDR)),
+    };
+    response.add_answer(Record::from_rdata(question.name().clone(), 300, data));
     if let Some(edns) = request.edns {
         response.set_edns(edns);
     }

@@ -12,7 +12,11 @@
 //! 5. Collect results from [`Resolver::poll_event`].
 //!
 //! Queries go over UDP. A truncated response switches that query to TCP,
-//! as RFC 7766 §5 requires.
+//! as RFC 7766 §5 requires. Special-use names never reach the network; see
+//! [`Resolver::query`].
+//!
+//! For hostnames, [`IpLookup`] runs the A and AAAA queries and collects the
+//! addresses, following CNAMEs.
 //!
 //! # Driver obligations
 //!
@@ -34,14 +38,19 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 pub use hickory_proto;
 use hickory_proto::ProtoError;
-use hickory_proto::op::{Edns, Message, MessageType, Query, ResponseCode};
-use hickory_proto::rr::{Name, RecordType};
+use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_proto::rr::domain::usage::{INVALID, LOCAL, LOCALHOST, ONION};
+use hickory_proto::rr::rdata::{A, AAAA};
+use hickory_proto::rr::{Name, RData, Record, RecordType};
+
+mod lookup;
+pub use lookup::{IpLookup, addresses};
 
 /// EDNS UDP payload size recommended by DNS Flag Day 2020.
 const EDNS_PAYLOAD: u16 = 1232;
@@ -195,6 +204,34 @@ fn next_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
     Some(message)
 }
 
+/// The local answer for a special-use name, or `None` for any other name.
+fn special_use(name: &Name, record_type: RecordType) -> Option<Message> {
+    let localhost = LOCALHOST.name().zone_of(name);
+    if !localhost
+        && ![&INVALID, &LOCAL, &ONION]
+            .iter()
+            .any(|z| z.name().zone_of(name))
+    {
+        return None;
+    }
+    let mut response = Message::response(0, OpCode::Query);
+    response.add_query(Query::query(name.clone(), record_type));
+    response.metadata.response_code = if localhost {
+        ResponseCode::NoError
+    } else {
+        ResponseCode::NXDomain
+    };
+    let loopback = match record_type {
+        RecordType::A if localhost => Some(RData::A(A(Ipv4Addr::LOCALHOST))),
+        RecordType::AAAA if localhost => Some(RData::AAAA(AAAA(Ipv6Addr::LOCALHOST))),
+        _ => None,
+    };
+    response
+        .answers
+        .extend(loopback.map(|data| Record::from_rdata(name.clone(), 0, data)));
+    Some(response)
+}
+
 /// Whether `response` answers `request` (RFC 5452 §9.1, RFC 1035 §7.3).
 fn is_reply(request: &Message, response: &Message) -> bool {
     response.metadata.message_type == MessageType::Response
@@ -229,6 +266,11 @@ impl Resolver {
     ///
     /// `name` is treated as absolute: there is no search list, so
     /// `example.com` and `example.com.` are the same query.
+    ///
+    /// Special-use names are answered at once, without a transmit:
+    /// `localhost` gets the loopback address (RFC 6761 §6.3), and names
+    /// under `invalid.`, `local.` and `onion.` get NXDOMAIN (RFC 6761 §6.4,
+    /// RFC 6762 §3, RFC 7686 §2). Resolve `.local` names with mDNS instead.
     pub fn query(
         &mut self,
         mut name: Name,
@@ -236,6 +278,15 @@ impl Resolver {
         now: Instant,
     ) -> Result<QueryId, ProtoError> {
         name.set_fqdn(true);
+        if let Some(response) = special_use(&name, record_type) {
+            let id = QueryId(self.next_query);
+            self.next_query += 1;
+            self.events.push_back(Event::Response {
+                query: id,
+                response,
+            });
+            return Ok(id);
+        }
         let mut request = self.new_message();
         request.metadata.recursion_desired = true;
         request.add_query(Query::query(name, record_type));
