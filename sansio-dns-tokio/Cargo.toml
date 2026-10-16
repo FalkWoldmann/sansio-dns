@@ -1,25 +1,25 @@
 [package]
 name = "sansio-dns-tokio"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.88"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/FalkWoldmann/sansio-dns"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Tokio driver for sansio-dns: resolve host names to addresses"
 
 [dependencies]
-sansio-dns = { path = ".." }
-tokio = { version = "1.53.3", features = ["net", "time", "rt", "macros", "io-util", "sync"] }
-reqwest = { version = "0.13.5", default-features = false, optional = true }
+sansio-dns.workspace = true
+tokio = { workspace = true, features = ["net", "time", "rt", "macros", "io-util", "sync"] }
+reqwest = { workspace = true, optional = true }
 
 [features]
 # Implements reqwest::dns::Resolve for Resolver.
 reqwest = ["dep:reqwest"]
 
 [dev-dependencies]
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
-rstest = "0.27.0"
-tokio = { version = "1.53.3", features = ["rt-multi-thread"] }
+reqwest = { workspace = true, features = ["rustls"] }
+rstest.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [lints]
 workspace = true

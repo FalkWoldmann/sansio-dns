@@ -1,5 +1,15 @@
 [package]
 name = "sansio-dns"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[workspace]
+members = ["sansio-dns-tokio"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 # let-chains, and the ICU crates under hickory-proto, need 1.88.
@@ -7,8 +17,11 @@ rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/FalkWoldmann/sansio-dns"
 
-[workspace]
-members = ["sansio-dns-tokio"]
+[workspace.dependencies]
+sansio-dns = { path = ".", version = "0.1.0" }
+reqwest = { version = "0.13.5", default-features = false }
+rstest = "0.27.0"
+tokio = "1.53.3"
 
 [dependencies]
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
@@ -26,8 +39,8 @@ rustls = { version = "0.23.46", default-features = false, features = ["std", "ri
 webpki-roots = "1.0.9"
 compio = { version = "0.19.2", features = ["runtime", "net", "time", "macros", "io"] }
 proptest = "1.12.0"
-rstest = "0.27.0"
-tokio = { version = "1.53.3", features = ["net", "time", "rt", "macros", "io-util"] }
+rstest.workspace = true
+tokio = { workspace = true, features = ["net", "time", "rt", "macros", "io-util"] }
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
 # Adapted from https://github.com/otto-de/rust-ecosystem (lints.toml), trimmed
