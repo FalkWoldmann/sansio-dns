@@ -39,7 +39,6 @@ you want. `examples/dot.rs` uses ring and the webpki roots:
 
 ```sh
 cargo run --example dot --features tls -- example.com 1.1.1.1:853 cloudflare-dns.com
-cargo bench --bench dot --features tls   # connections, handshakes and time per query
 ```
 
 ### Configuration
@@ -117,3 +116,19 @@ PROPTEST_CASES=10000 cargo nextest run
 Parameterized cases use [rstest](https://crates.io/crates/rstest); properties such as
 "arbitrary bytes never complete a query" and "any ID bit flip is rejected" use
 [proptest](https://crates.io/crates/proptest).
+
+## Benchmarks
+
+[Criterion](https://crates.io/crates/criterion) benchmarks run without a network:
+
+```sh
+cargo bench --bench resolver              # UDP round trip and spoof rejection with 0/16/256
+                                          # queries in flight, TCP reassembly, CNAME chains,
+                                          # resolv.conf parsing
+cargo bench --bench tls --features tls    # DoT against an in-process rustls server: a query
+                                          # on an open connection vs. new connections with a
+                                          # resumed or a full handshake
+```
+
+The TLS numbers include the server's half of each exchange. On a network, a new
+connection also costs two extra round trips (TCP and TLS) before the query's own.

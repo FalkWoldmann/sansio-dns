@@ -23,6 +23,7 @@ compio = { version = "0.19.2", features = ["runtime", "net", "time", "macros", "
 proptest = "1.12.0"
 rstest = "0.27.0"
 tokio = { version = "1.53.3", features = ["net", "time", "rt", "macros", "io-util"] }
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
 # Adapted from https://github.com/otto-de/rust-ecosystem (lints.toml), trimmed
 # for a sans-IO library: no async or web lints; documentation lints added.
@@ -119,6 +120,10 @@ name = "dot"
 required-features = ["tls"]
 
 [[bench]]
-name = "dot"
+name = "resolver"
+harness = false
+
+[[bench]]
+name = "tls"
 harness = false
 required-features = ["tls"]
