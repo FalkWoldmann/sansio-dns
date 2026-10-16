@@ -410,11 +410,20 @@ impl Io {
         }
     }
 
-    /// The socket for `query`, bound on first use, with a task forwarding
-    /// what it receives.
+    /// The socket for `query`, bound on first use and again when the query
+    /// moves to a server of the other address family, with a task
+    /// forwarding what it receives.
     async fn socket(&mut self, query: QueryId, to: SocketAddr) -> io::Result<Arc<UdpSocket>> {
         if let Entry::Occupied(entry) = self.sockets.entry(query) {
-            return Ok(Arc::clone(&entry.get().0));
+            let (socket, _) = entry.get();
+            if socket
+                .local_addr()
+                .is_ok_and(|local| local.is_ipv4() == to.is_ipv4())
+            {
+                return Ok(Arc::clone(socket));
+            }
+            // A retry rotated to a server of the other address family.
+            entry.remove().1.abort();
         }
         let any = match to {
             SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),

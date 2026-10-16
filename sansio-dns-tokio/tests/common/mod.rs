@@ -1,6 +1,6 @@
 //! A name server on localhost, answering over UDP and TCP from a fixed list.
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -33,12 +33,21 @@ pub async fn counting_name_server(
     host: &str,
     truncate_udp: bool,
 ) -> (SocketAddr, Arc<Connections>) {
+    name_server_on(IpAddr::V4(Ipv4Addr::LOCALHOST), host, truncate_udp).await
+}
+
+/// [`counting_name_server`] on `ip`.
+pub async fn name_server_on(
+    ip: IpAddr,
+    host: &str,
+    truncate_udp: bool,
+) -> (SocketAddr, Arc<Connections>) {
     let connections = Arc::new(Connections::default());
     let counts = Arc::clone(&connections);
     let host = Name::from_ascii(host).unwrap();
     // The UDP port may be taken on TCP; try another until both are free.
     let (udp, tcp) = loop {
-        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp = UdpSocket::bind((ip, 0)).await.unwrap();
         if let Ok(tcp) = TcpListener::bind(udp.local_addr().unwrap()).await {
             break (udp, tcp);
         }

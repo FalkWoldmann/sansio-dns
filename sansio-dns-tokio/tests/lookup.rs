@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 use std::task::Poll;
 use std::time::Duration;
 
-use crate::common::{V4, V6, counting_name_server, name_server};
+use crate::common::{V4, V6, counting_name_server, name_server, name_server_on};
 use rstest::rstest;
 use sansio_dns::Config;
 use sansio_dns::hickory_proto::op::{Message, OpCode};
@@ -165,6 +165,21 @@ fn retry_runs_on_the_lookups_own_runtime() {
     .unwrap()
     .unwrap();
     assert_eq!(connections.opened.load(Ordering::Relaxed), opened);
+}
+
+/// A retry that rotates from an IPv4 server to an IPv6 one gets a socket
+/// that can reach it.
+#[tokio::test]
+async fn retry_reaches_a_server_of_the_other_family() {
+    let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let (server, _) = name_server_on(IpAddr::V6(Ipv6Addr::LOCALHOST), "app.example.", false).await;
+    let mut config = Config::new(silent.local_addr().unwrap(), [server]);
+    config.timeout = Duration::from_millis(200);
+    let resolver = Resolver::new(config);
+
+    let addresses = resolver.lookup_ip("app.example").await.unwrap();
+
+    assert_eq!(addresses, [IpAddr::V4(V4), IpAddr::V6(V6)]);
 }
 
 /// An address needs no lookup; the server here doesn't exist.
