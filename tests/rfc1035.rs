@@ -19,6 +19,7 @@ use hickory_proto::rr::{Name, RData};
 use proptest::prelude::*;
 use rstest::rstest;
 use sansio_dns::{Error, Event, Resolver, Transport};
+use std::assert_matches;
 
 /// §2.3.3: name comparisons are case-insensitive, so a server that changes
 /// the case of the question must still be matched.
@@ -129,10 +130,10 @@ mod section_4_1_1 {
 
         r.handle_datagram(S1, &encode(&with_code(reply(&sent), code)), now);
 
-        assert!(matches!(
+        assert_matches!(
             r.poll_event(),
             Some(Event::Failed { error: Error::Server(c), .. }) if c == code
-        ));
+        );
     }
 }
 
@@ -172,13 +173,13 @@ mod section_7_2 {
         .collect();
 
         assert_eq!(destinations, [S2, S1, S2]);
-        assert!(matches!(
+        assert_matches!(
             resolver.poll_event(),
             Some(Event::Failed {
                 error: Error::Timeout,
                 ..
             })
-        ));
+        );
     }
 
     #[rstest]

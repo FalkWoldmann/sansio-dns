@@ -22,6 +22,7 @@ use hickory_proto::rr::{Name, RecordType};
 use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection};
 use sansio_dns::{Config, Error, Event, Resolver, Transmit, Transport};
+use std::assert_matches;
 
 /// A client that trusts a self-signed `dns.example` certificate, and a
 /// server presenting a certificate for `presented`.
@@ -193,11 +194,11 @@ fn wrong_certificate_moves_on_then_fails() {
         .collect();
     assert_eq!(new_connections, [S1, S2, S1, S2]);
     assert!(server.queries.is_empty(), "no query sent to the impostor");
-    assert!(matches!(
+    assert_matches!(
         resolver.poll_event(),
         Some(Event::Failed {
             error: Error::Tls(_),
             ..
         })
-    ));
+    );
 }

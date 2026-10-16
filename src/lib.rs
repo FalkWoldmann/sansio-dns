@@ -342,9 +342,9 @@ impl Pending {
 
 /// Prefix `message` with its two-byte length (RFC 7766 §8).
 fn frame(message: &[u8]) -> Vec<u8> {
-    // A single-question query is far below 64 KiB.
+    // A single-question query stays below 500 octets, far from the limit.
     let len = u16::try_from(message.len()).unwrap_or(u16::MAX);
-    len.to_be_bytes().iter().chain(message).copied().collect()
+    [&len.to_be_bytes()[..], message].concat()
 }
 
 /// Pad `request` with an EDNS padding option so it encodes to a multiple of

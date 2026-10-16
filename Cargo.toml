@@ -2,6 +2,8 @@
 name = "sansio-dns"
 version = "0.1.0"
 edition = "2024"
+# let-chains, and the ICU crates under hickory-proto, need 1.88.
+rust-version = "1.88"
 
 [dependencies]
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }

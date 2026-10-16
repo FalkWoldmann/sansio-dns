@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use common::*;
 use rstest::rstest;
 use sansio_dns::{Config, Resolver};
+use std::assert_matches;
 
 /// Let one query time out on every attempt; return where each attempt went
 /// and how long the first one waited.
@@ -120,7 +121,7 @@ mod search {
     fn existing_name_ends_the_search() {
         let (asked, event) = tried(CONF, "db", ResponseCode::NoError);
         assert_eq!(asked, ["db.corp.example."]);
-        assert!(matches!(event, Some(Event::Response { .. })));
+        assert_matches!(event, Some(Event::Response { .. }));
     }
 
     #[test]
@@ -134,6 +135,6 @@ mod search {
     fn localhost_is_not_searched() {
         let (asked, event) = tried(CONF, "localhost", ResponseCode::NXDomain);
         assert!(asked.is_empty());
-        assert!(matches!(event, Some(Event::Response { .. })));
+        assert_matches!(event, Some(Event::Response { .. }));
     }
 }
