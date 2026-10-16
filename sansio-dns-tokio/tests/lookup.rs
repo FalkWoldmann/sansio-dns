@@ -1,17 +1,9 @@
 //! `Resolver::lookup_ip` against a name server on localhost.
 
-#![expect(
-    clippy::indexing_slicing,
-    clippy::unwrap_used,
-    reason = "helpers outside #[test] may panic"
-)]
-
-mod common;
-
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use common::{V4, V6, name_server};
+use crate::common::{V4, V6, name_server};
 use rstest::rstest;
 use sansio_dns::Config;
 use sansio_dns::hickory_proto::op::{Message, OpCode};

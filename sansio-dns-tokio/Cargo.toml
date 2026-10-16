@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Tokio driver for sansio-dns: resolve host names to addresses"
+# The files in tests/ are modules of tests/main.rs, one crate that builds once.
+autotests = false
 
 [dependencies]
 sansio-dns.workspace = true
@@ -25,8 +27,8 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 workspace = true
 
 [[test]]
-name = "reqwest"
-required-features = ["reqwest"]
+name = "integration"
+path = "tests/main.rs"
 
 [[example]]
 name = "get"

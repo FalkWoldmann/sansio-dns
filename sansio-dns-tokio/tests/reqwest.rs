@@ -1,13 +1,6 @@
 //! reqwest resolving through `Resolver`, against local DNS and HTTP servers.
 
-#![expect(
-    clippy::indexing_slicing,
-    clippy::unwrap_used,
-    reason = "helpers outside #[test] may panic"
-)]
-
-mod common;
-
+use crate::common;
 use sansio_dns::Config;
 use sansio_dns_tokio::Resolver;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

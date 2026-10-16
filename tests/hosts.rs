@@ -1,18 +1,9 @@
 //! `Hosts`: static entries answered before DNS, as hosts(5) describes.
 
-#![expect(
-    clippy::disallowed_methods,
-    clippy::indexing_slicing,
-    clippy::unwrap_used,
-    reason = "tests stand in for the driver, and helpers outside #[test] may panic"
-)]
-
-mod common;
-
 use std::net::IpAddr;
 use std::time::Instant;
 
-use common::*;
+use crate::common::*;
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::{Name, RecordType};
 use rstest::rstest;

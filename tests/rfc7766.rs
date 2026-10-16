@@ -1,20 +1,11 @@
 //! RFC 7766, DNS Transport over TCP - Implementation Requirements.
 //! <https://rfc-annotations.research.icann.org/rfc7766.html>
 
-#![expect(
-    clippy::disallowed_methods,
-    clippy::indexing_slicing,
-    clippy::unwrap_used,
-    reason = "tests stand in for the driver, and helpers outside #[test] may panic"
-)]
-
-mod common;
-
 use std::assert_matches;
 use std::io::ErrorKind;
 use std::time::{Duration, Instant};
 
-use common::*;
+use crate::common::*;
 use hickory_proto::rr::RData;
 use hickory_proto::rr::rdata::A;
 use proptest::prelude::*;

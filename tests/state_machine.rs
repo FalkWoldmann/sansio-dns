@@ -6,21 +6,12 @@
 //! Replies go to recent transmits over their transport, often tampered with
 //! and, over TCP, split into two chunks; there is raw garbage too.
 
-#![expect(
-    clippy::disallowed_methods,
-    clippy::indexing_slicing,
-    clippy::unwrap_used,
-    reason = "tests stand in for the driver, and helpers outside #[test] may panic"
-)]
-
-mod common;
-
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use common::*;
+use crate::common::*;
 use hickory_proto::op::ResponseCode;
 use proptest::prelude::*;
 use sansio_dns::{ConnectionId, Event, QueryId, Resolver, Transmit, Transport};

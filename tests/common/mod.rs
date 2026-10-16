@@ -1,7 +1,5 @@
 //! Shared fixtures: two fake name servers and a reply builder.
 
-#![allow(dead_code, reason = "each test crate uses a different subset")]
-
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Instant;
 
@@ -42,10 +40,6 @@ pub fn decode(transmit: &Transmit) -> Message {
 }
 
 /// The connection a stream transmit belongs to.
-#[expect(
-    clippy::panic,
-    reason = "calling it on a datagram is a bug in the test"
-)]
 pub fn conn(transmit: &Transmit) -> ConnectionId {
     match transmit.transport {
         Transport::TcpConnect(c) | Transport::TcpWrite(c) | Transport::TcpClose(c) => c,
@@ -54,10 +48,6 @@ pub fn conn(transmit: &Transmit) -> ConnectionId {
 }
 
 /// The query a datagram transmit belongs to, i.e. the socket it uses.
-#[expect(
-    clippy::panic,
-    reason = "calling it on a stream transmit is a bug in the test"
-)]
 pub fn udp(transmit: &Transmit) -> QueryId {
     match transmit.transport {
         Transport::Udp(query) => query,

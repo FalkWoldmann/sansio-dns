@@ -1,20 +1,11 @@
 //! RFC 5452, Measures for Making DNS More Resilient against Forged Answers.
 //! <https://rfc-annotations.research.icann.org/rfc5452.html>
 
-#![expect(
-    clippy::disallowed_methods,
-    clippy::indexing_slicing,
-    clippy::unwrap_used,
-    reason = "tests stand in for the driver, and helpers outside #[test] may panic"
-)]
-
-mod common;
-
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use common::*;
+use crate::common::*;
 use hickory_proto::op::{Message, Query};
 use hickory_proto::rr::{DNSClass, Name, RecordType};
 use proptest::prelude::*;

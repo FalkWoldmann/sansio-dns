@@ -77,7 +77,8 @@ than `ndots` dots and after it otherwise; the search moves on only on NXDOMAIN.
 
 Behavior follows the RFCs as listed and annotated at
 [rfc-annotations.research.icann.org](https://rfc-annotations.research.icann.org/).
-Tests live in `tests/rfc<number>.rs`, with one module per section.
+Tests live in `tests/rfc<number>.rs`, with one module per section; `tests/main.rs` builds
+them all as one crate.
 
 | RFC | Section | Behavior |
 |---|---|---|

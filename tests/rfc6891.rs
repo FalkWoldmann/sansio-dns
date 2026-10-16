@@ -1,18 +1,9 @@
 //! RFC 6891, Extension Mechanisms for DNS (EDNS(0)).
 //! <https://rfc-annotations.research.icann.org/rfc6891.html>
 
-#![expect(
-    clippy::disallowed_methods,
-    clippy::indexing_slicing,
-    clippy::unwrap_used,
-    reason = "tests stand in for the driver, and helpers outside #[test] may panic"
-)]
-
-mod common;
-
 use std::time::Instant;
 
-use common::*;
+use crate::common::*;
 use hickory_proto::op::ResponseCode;
 use rstest::rstest;
 use sansio_dns::Resolver;

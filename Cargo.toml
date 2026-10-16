@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# The files in tests/ are modules of tests/main.rs, one crate that builds once.
+autotests = false
 
 [workspace]
 members = ["sansio-dns-tokio", "compare"]
@@ -136,6 +138,10 @@ zero_sized_map_values = "deny"
 assertions_on_result_states = "warn"
 string_slice = "warn"
 unreachable = "warn"
+
+[[test]]
+name = "integration"
+path = "tests/main.rs"
 
 [[example]]
 name = "dot"

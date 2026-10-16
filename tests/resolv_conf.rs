@@ -1,18 +1,9 @@
 //! `Config::from_resolv_conf`: settings as glibc reads them from resolv.conf.
 
-#![expect(
-    clippy::disallowed_methods,
-    clippy::indexing_slicing,
-    clippy::unwrap_used,
-    reason = "tests stand in for the driver, and helpers outside #[test] may panic"
-)]
-
-mod common;
-
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use common::*;
+use crate::common::*;
 use rstest::rstest;
 use sansio_dns::{Config, Resolver};
 use std::assert_matches;

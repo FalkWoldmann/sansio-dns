@@ -2,22 +2,12 @@
 //! padding. Runs against an in-process rustls server.
 //! <https://rfc-annotations.research.icann.org/rfc7858.html>
 
-#![cfg(feature = "tls")]
-#![expect(
-    clippy::disallowed_methods,
-    clippy::indexing_slicing,
-    clippy::unwrap_used,
-    reason = "tests stand in for the driver, and helpers outside #[test] may panic"
-)]
-
-mod common;
-
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::sync::Arc;
 use std::time::Instant;
 
-use common::*;
+use crate::common::*;
 use hickory_proto::op::Message;
 use hickory_proto::rr::{Name, RecordType};
 use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};

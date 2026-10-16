@@ -1,18 +1,9 @@
 //! `addresses` (RFC 1034 §3.6.2 CNAME handling) and `IpLookup`.
 
-#![expect(
-    clippy::disallowed_methods,
-    clippy::indexing_slicing,
-    clippy::unwrap_used,
-    reason = "tests stand in for the driver, and helpers outside #[test] may panic"
-)]
-
-mod common;
-
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Instant;
 
-use common::*;
+use crate::common::*;
 use hickory_proto::op::{Message, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::{A, CNAME};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
@@ -83,7 +74,6 @@ fn finish(lookup: IpLookup, resolver: &mut Resolver, codes: [ResponseCode; 2]) -
 }
 
 /// Pass `events` to `lookup` in order; it must not finish before the last.
-#[expect(clippy::panic, reason = "a test helper fails the test")]
 fn feed(lookup: IpLookup, events: impl IntoIterator<Item = Event>) -> Progress {
     events
         .into_iter()
