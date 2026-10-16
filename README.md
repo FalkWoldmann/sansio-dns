@@ -43,6 +43,11 @@ cargo run --example dot --features tls -- example.com 1.1.1.1:853 cloudflare-dns
 
 ### Configuration
 
+`Config::hosts = Hosts::parse(&bytes)` adds static entries from a hosts file (you read the
+file). Listed names are answered locally for A and AAAA, with the addresses of that family,
+before any DNS query, as glibc's `hosts: files dns` does.
+
+
 `Config::from_resolv_conf(&bytes)` reads the text of a `resolv.conf` (you read the file) with
 the [`resolv-conf`](https://crates.io/crates/resolv-conf) crate and applies glibc's rules:
 nameservers, `search`/`domain`, `ndots`, `timeout` and `attempts`. With search domains, a name

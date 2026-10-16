@@ -62,7 +62,9 @@ use hickory_proto::rr::rdata::opt::EdnsOption;
 use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 
+mod hosts;
 mod lookup;
+pub use hosts::Hosts;
 pub use lookup::{IpLookup, addresses};
 #[cfg(feature = "tls")]
 mod tls;
@@ -94,6 +96,9 @@ pub struct Config {
     /// How long a stream connection may sit without queries before the
     /// resolver asks for it to be closed (RFC 7766 §6.2.3).
     pub idle_timeout: Duration,
+    /// Static entries answered before DNS, like `/etc/hosts`. Empty by
+    /// default; fill it with [`Hosts::parse`].
+    pub hosts: Hosts,
     /// DNS over TLS settings; see `Config::with_tls`.
     #[cfg(feature = "tls")]
     tls: Option<tls::Settings>,
@@ -111,6 +116,7 @@ impl Config {
             search: Vec::new(),
             ndots: 1,
             idle_timeout: Duration::from_secs(10),
+            hosts: Hosts::default(),
             #[cfg(feature = "tls")]
             tls: None,
         }
@@ -430,6 +436,11 @@ impl Resolver {
     /// `localhost` gets the loopback address (RFC 6761 §6.3), and names
     /// under `invalid.`, `local.` and `onion.` get NXDOMAIN (RFC 6761 §6.4,
     /// RFC 6762 §3, RFC 7686 §2). Resolve `.local` names with mDNS instead.
+    ///
+    /// Names listed in [`Config::hosts`] are answered from there for A and
+    /// AAAA queries, with the addresses of that family (possibly none), as
+    /// glibc's `hosts: files dns` does. The name is matched as given, before
+    /// any search domain.
     pub fn query(
         &mut self,
         name: Name,
@@ -441,7 +452,9 @@ impl Resolver {
         absolute.set_fqdn(true);
         let id = QueryId(self.next_query);
         self.next_query += 1;
-        if let Some(response) = special_use(&absolute, record_type) {
+        let local = special_use(&absolute, record_type)
+            .or_else(|| self.config.hosts.answer(&absolute, record_type));
+        if let Some(response) = local {
             self.events.push_back(Event::Response {
                 query: id,
                 response,
