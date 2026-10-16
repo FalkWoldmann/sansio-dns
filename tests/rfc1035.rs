@@ -42,7 +42,7 @@ mod section_2_3_3 {
             let query = response.queries[0].clone();
             response.queries[0] = Query::query(name, query.query_type());
 
-            r.handle_datagram(S1, &encode(&response), now);
+            r.handle_datagram(udp(&sent), S1, &encode(&response), now);
 
             prop_assert!(is_response(r.poll_event()));
         }
@@ -61,7 +61,7 @@ mod section_3_1 {
         let now = Instant::now();
         let sent = start_name(&mut resolver, name, now);
 
-        resolver.handle_datagram(S1, &encode(&reply(&sent)), now);
+        resolver.handle_datagram(udp(&sent), S1, &encode(&reply(&sent)), now);
 
         let Some(Event::Response { response, .. }) = resolver.poll_event() else {
             panic!("expected a response");
@@ -91,7 +91,7 @@ mod section_4_1_1 {
         let now = Instant::now();
         let sent = start(&mut resolver, now);
 
-        resolver.handle_datagram(S1, &encode(&with_code(reply(&sent), code)), now);
+        resolver.handle_datagram(udp(&sent), S1, &encode(&with_code(reply(&sent), code)), now);
 
         let Some(Event::Response { response, .. }) = resolver.poll_event() else {
             panic!("expected a response");
@@ -109,12 +109,12 @@ mod section_4_1_1 {
         let now = Instant::now();
         let sent = start(&mut resolver, now);
 
-        resolver.handle_datagram(S1, &encode(&with_code(reply(&sent), code)), now);
+        resolver.handle_datagram(udp(&sent), S1, &encode(&with_code(reply(&sent), code)), now);
 
         assert!(resolver.poll_event().is_none());
         let retry = resolver.poll_transmit().unwrap();
         assert_eq!(retry.destination, S2);
-        resolver.handle_datagram(S2, &encode(&reply(&retry)), now);
+        resolver.handle_datagram(udp(&retry), S2, &encode(&reply(&retry)), now);
         assert!(is_response(resolver.poll_event()));
     }
 
@@ -128,7 +128,7 @@ mod section_4_1_1 {
         let now = Instant::now();
         let sent = start(&mut r, now);
 
-        r.handle_datagram(S1, &encode(&with_code(reply(&sent), code)), now);
+        r.handle_datagram(udp(&sent), S1, &encode(&with_code(reply(&sent), code)), now);
 
         assert_matches!(
             r.poll_event(),
@@ -149,7 +149,7 @@ mod section_4_2_1 {
         let mut response = reply(&sent);
         response.metadata.truncation = true;
 
-        resolver.handle_datagram(S1, &encode(&response), now);
+        resolver.handle_datagram(udp(&sent), S1, &encode(&response), now);
 
         assert!(resolver.poll_event().is_none());
         assert!(is_connect(&resolver.poll_transmit().unwrap()));
@@ -199,7 +199,7 @@ mod section_7_2 {
         let sent = start(&mut r, now);
 
         assert_eq!(r.poll_timeout(), None);
-        r.handle_datagram(S1, &encode(&reply(&sent)), now);
+        r.handle_datagram(udp(&sent), S1, &encode(&reply(&sent)), now);
         assert!(is_response(r.poll_event()));
     }
 }
@@ -215,7 +215,7 @@ mod section_7_3 {
         let mut response = reply(&sent);
         response.metadata.message_type = MessageType::Query;
 
-        resolver.handle_datagram(S1, &encode(&response), now);
+        resolver.handle_datagram(udp(&sent), S1, &encode(&response), now);
 
         assert!(resolver.poll_event().is_none());
     }
@@ -227,7 +227,7 @@ mod section_7_3 {
         let mut response = reply(&sent);
         response.metadata.op_code = OpCode::Status;
 
-        resolver.handle_datagram(S1, &encode(&response), now);
+        resolver.handle_datagram(udp(&sent), S1, &encode(&response), now);
 
         assert!(resolver.poll_event().is_none());
     }
@@ -238,8 +238,8 @@ mod section_7_3 {
         fn garbage_is_discarded(data in proptest::collection::vec(any::<u8>(), 0..600)) {
             let mut r = resolver();
             let now = Instant::now();
-            start(&mut r, now);
-            r.handle_datagram(S1, &data, now);
+            let sent = start(&mut r, now);
+            r.handle_datagram(udp(&sent), S1, &data, now);
             prop_assert!(r.poll_event().is_none());
             prop_assert!(r.poll_timeout().is_some());
         }

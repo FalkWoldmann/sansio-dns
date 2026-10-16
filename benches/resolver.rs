@@ -55,8 +55,8 @@ fn busy_resolver(in_flight: usize, now: Instant) -> Resolver {
 }
 
 /// A query, its datagram and the answer, with other queries in flight.
-/// Matching an answer scans the queries in flight, so this shows how that
-/// scales.
+/// Matching an answer looks up the query it was received for, so this
+/// should not depend on how many are in flight.
 fn udp(c: &mut Criterion) {
     let now = Instant::now();
     let template = answer("example.com.", false);
@@ -73,15 +73,27 @@ fn udp(c: &mut Criterion) {
                         .query(name("example.com."), RecordType::A, now)
                         .unwrap();
                     let sent = resolver.poll_transmit().unwrap();
-                    resolver.handle_datagram(SERVER, &answering(&template, &sent.payload), now);
+                    let Transport::Udp(query) = sent.transport else {
+                        unreachable!("queries start over UDP");
+                    };
+                    resolver.handle_datagram(
+                        query,
+                        SERVER,
+                        &answering(&template, &sent.payload),
+                        now,
+                    );
                     black_box(resolver.poll_event().unwrap());
                 });
             },
         );
+        let target = resolver
+            .query(name("example.com."), RecordType::A, now)
+            .unwrap();
+        while resolver.poll_transmit().is_some() {}
         group.bench_with_input(
             BenchmarkId::new("reject_spoofed", in_flight),
             &in_flight,
-            |b, _| b.iter(|| resolver.handle_datagram(SERVER, black_box(&spoofed), now)),
+            |b, _| b.iter(|| resolver.handle_datagram(target, SERVER, black_box(&spoofed), now)),
         );
     }
     group.finish();
@@ -98,7 +110,10 @@ fn tcp_reassembly(c: &mut Criterion) {
             .query(name("example.com."), RecordType::A, now)
             .unwrap();
         let udp = resolver.poll_transmit().unwrap();
-        resolver.handle_datagram(SERVER, &answering(&truncated, &udp.payload), now);
+        let Transport::Udp(query) = udp.transport else {
+            unreachable!("queries start over UDP");
+        };
+        resolver.handle_datagram(query, SERVER, &answering(&truncated, &udp.payload), now);
         let tcp = resolver.poll_transmit().unwrap();
         let Transport::TcpConnect(connection) = tcp.transport else {
             unreachable!("a truncated answer switches to TCP");

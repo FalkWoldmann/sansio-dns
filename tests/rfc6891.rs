@@ -44,13 +44,13 @@ mod section_7 {
         let mut response = with_code(reply(&sent), ResponseCode::FormErr);
         response.edns = None;
 
-        resolver.handle_datagram(S1, &encode(&response), now);
+        resolver.handle_datagram(udp(&sent), S1, &encode(&response), now);
 
         let retry = resolver.poll_transmit().unwrap();
         assert_eq!(retry.destination, S1);
         assert!(decode(&retry).edns.is_none());
         assert_eq!(decode(&retry).metadata.id, decode(&sent).metadata.id);
-        resolver.handle_datagram(S1, &encode(&reply(&retry)), now);
+        resolver.handle_datagram(udp(&retry), S1, &encode(&reply(&retry)), now);
         assert!(is_response(resolver.poll_event()));
     }
 
@@ -60,6 +60,7 @@ mod section_7 {
         let sent = start(&mut resolver, now);
 
         resolver.handle_datagram(
+            udp(&sent),
             S1,
             &encode(&with_code(reply(&sent), ResponseCode::FormErr)),
             now,
@@ -80,7 +81,7 @@ mod section_7 {
         for _ in 0..3 {
             let mut response = with_code(reply(&sent), ResponseCode::FormErr);
             response.edns = None;
-            resolver.handle_datagram(sent.destination, &encode(&response), now);
+            resolver.handle_datagram(udp(&sent), sent.destination, &encode(&response), now);
             let Some(next) = resolver.poll_transmit() else {
                 break;
             };

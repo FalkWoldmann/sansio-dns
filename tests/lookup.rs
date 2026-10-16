@@ -75,7 +75,7 @@ fn finish(lookup: &mut IpLookup, resolver: &mut Resolver, codes: [ResponseCode; 
     let now = Instant::now();
     let sent: Vec<_> = std::iter::from_fn(|| resolver.poll_transmit()).collect();
     for (t, code) in sent.iter().zip(codes) {
-        resolver.handle_datagram(S1, &encode(&with_code(reply(t), code)), now);
+        resolver.handle_datagram(udp(t), S1, &encode(&with_code(reply(t), code)), now);
     }
     // Feed the events in reverse, to show the result doesn't depend on order.
     let events: Vec<Event> = std::iter::from_fn(|| resolver.poll_event()).collect();
@@ -125,7 +125,7 @@ mod ip_lookup {
             IpLookup::start(&mut resolver, name("example.com."), Instant::now()).unwrap();
         while resolver.poll_transmit().is_some() {}
         let other = start(&mut resolver, Instant::now());
-        resolver.handle_datagram(S1, &encode(&reply(&other)), Instant::now());
+        resolver.handle_datagram(udp(&other), S1, &encode(&reply(&other)), Instant::now());
 
         assert!(!lookup.handle_event(&resolver.poll_event().unwrap()));
         assert_eq!(lookup.result(), None);

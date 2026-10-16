@@ -12,7 +12,7 @@ loop {
     while let Some(t) = resolver.poll_transmit() { /* send t.payload to t.destination */ }
     if let Some(event) = resolver.poll_event() { /* Response or Failed */ break; }
     // wait for a datagram or until resolver.poll_timeout(), then call
-    // resolver.handle_datagram(from, &bytes, now) or resolver.handle_timeout(now)
+    // resolver.handle_datagram(query, from, &bytes, now) or resolver.handle_timeout(now)
 }
 ```
 
@@ -91,7 +91,7 @@ Tests live in `tests/rfc<number>.rs`, with one module per section.
 
 RFC 5452 §9.2 requires an unpredictable source port per outstanding query. A sans-IO core
 can't pick ports, so `Transport::Udp(query)` names the query: bind a fresh ephemeral socket
-per query, and only pass datagrams received on that socket to `handle_datagram`.
+per query, and pass that query along with each datagram the socket receives to `handle_datagram`.
 
 Stream connections are named by a `ConnectionId`: `TcpConnect(id)` means open a connection
 to the destination and write the payload, `TcpWrite(id)` write to it, `TcpClose(id)` close

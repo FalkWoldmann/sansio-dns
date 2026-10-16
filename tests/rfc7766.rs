@@ -25,7 +25,7 @@ fn switch_to_tcp(resolver: &mut Resolver, now: Instant) -> Transmit {
     let sent = start(resolver, now);
     let mut truncated = reply(&sent);
     truncated.metadata.truncation = true;
-    resolver.handle_datagram(S1, &encode(&truncated), now);
+    resolver.handle_datagram(udp(&sent), S1, &encode(&truncated), now);
     resolver.poll_transmit().unwrap()
 }
 
@@ -36,25 +36,28 @@ mod section_5 {
     #[rstest]
     fn truncation_retries_the_same_query_over_tcp(mut resolver: Resolver) {
         let now = Instant::now();
-        let udp = start(&mut resolver, now);
-        let mut truncated = reply(&udp);
+        let sent = start(&mut resolver, now);
+        let mut truncated = reply(&sent);
         truncated.metadata.truncation = true;
 
-        resolver.handle_datagram(S1, &encode(&truncated), now);
+        resolver.handle_datagram(udp(&sent), S1, &encode(&truncated), now);
 
         let tcp = resolver.poll_transmit().unwrap();
         assert!(is_connect(&tcp));
         assert_eq!(tcp.destination, S1);
-        assert_eq!(tcp.payload, frame(&udp.payload));
+        assert_eq!(tcp.payload, frame(&sent.payload));
     }
 
     /// Once on TCP, a UDP answer could only be spoofed or late; ignore it.
     #[rstest]
     fn udp_answer_after_switch_is_ignored(mut resolver: Resolver) {
         let now = Instant::now();
-        let tcp = switch_to_tcp(&mut resolver, now);
+        let sent = start(&mut resolver, now);
+        let mut truncated = reply(&sent);
+        truncated.metadata.truncation = true;
+        resolver.handle_datagram(udp(&sent), S1, &encode(&truncated), now);
 
-        resolver.handle_datagram(S1, &encode(&reply(&tcp)), now);
+        resolver.handle_datagram(udp(&sent), S1, &encode(&reply(&sent)), now);
 
         assert!(resolver.poll_event().is_none());
     }

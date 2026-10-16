@@ -169,7 +169,9 @@ impl Harness {
                 if let Some(sent) = self.sent.get(to % self.sent.len().max(1)) {
                     let (from, bytes) = datagram(sent, reply);
                     match sent.transport {
-                        Transport::Udp(_) => self.resolver.handle_datagram(from, &bytes, self.now),
+                        Transport::Udp(q) => {
+                            self.resolver.handle_datagram(q, from, &bytes, self.now);
+                        }
                         Transport::TcpConnect(c) | Transport::TcpWrite(c) => {
                             let framed = frame(&bytes);
                             let (a, b) = framed.split_at(split % (framed.len() + 1));
@@ -206,7 +208,11 @@ impl Harness {
                     self.resolver.handle_stream_closed(c, self.now);
                 }
             }
-            Op::Garbage(bytes) => self.resolver.handle_datagram(S1, bytes, self.now),
+            Op::Garbage(bytes) => {
+                if let Some(&q) = self.live.first() {
+                    self.resolver.handle_datagram(q, S1, bytes, self.now);
+                }
+            }
         }
     }
 

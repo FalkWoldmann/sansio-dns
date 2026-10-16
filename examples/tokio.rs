@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     let mut tcp: Option<(ConnectionId, TcpStream)> = None;
     let mut resolver = Resolver::new(Config::new(server, []));
-    resolver.query(name, RecordType::A, Instant::now())?;
+    let query = resolver.query(name, RecordType::A, Instant::now())?;
 
     let mut buf = [0; 4096];
     loop {
@@ -84,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::select! {
             received = socket.recv_from(&mut buf) => {
                 let (n, from) = received?;
-                resolver.handle_datagram(from, &buf[..n], Instant::now());
+                resolver.handle_datagram(query, from, &buf[..n], Instant::now());
             }
             () = sleep_until(deadline.into()) => resolver.handle_timeout(Instant::now()),
         }

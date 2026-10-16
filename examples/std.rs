@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => Config::from_resolv_conf(&std::fs::read("/etc/resolv.conf")?)?,
     };
     let mut resolver = Resolver::new(config);
-    resolver.query(name, RecordType::A, Instant::now())?;
+    let query = resolver.query(name, RecordType::A, Instant::now())?;
 
     let mut buf = [0; 4096];
     loop {
@@ -85,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         socket.set_read_timeout(Some(wait))?;
         match socket.recv_from(&mut buf) {
-            Ok((n, from)) => resolver.handle_datagram(from, &buf[..n], Instant::now()),
+            Ok((n, from)) => resolver.handle_datagram(query, from, &buf[..n], Instant::now()),
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                 resolver.handle_timeout(Instant::now());
             }

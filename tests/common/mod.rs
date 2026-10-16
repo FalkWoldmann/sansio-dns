@@ -9,7 +9,7 @@ use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use rstest::fixture;
-use sansio_dns::{Config, ConnectionId, Event, Resolver, Transmit, Transport};
+use sansio_dns::{Config, ConnectionId, Event, QueryId, Resolver, Transmit, Transport};
 
 pub const S1: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 53);
 pub const S2: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 53);
@@ -50,6 +50,18 @@ pub fn conn(transmit: &Transmit) -> ConnectionId {
     match transmit.transport {
         Transport::TcpConnect(c) | Transport::TcpWrite(c) | Transport::TcpClose(c) => c,
         Transport::Udp(_) => panic!("not a stream transmit: {transmit:?}"),
+    }
+}
+
+/// The query a datagram transmit belongs to, i.e. the socket it uses.
+#[expect(
+    clippy::panic,
+    reason = "calling it on a stream transmit is a bug in the test"
+)]
+pub fn udp(transmit: &Transmit) -> QueryId {
+    match transmit.transport {
+        Transport::Udp(query) => query,
+        _ => panic!("not a datagram transmit: {transmit:?}"),
     }
 }
 

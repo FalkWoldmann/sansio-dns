@@ -39,11 +39,11 @@
 //!
 //! For UDP, [RFC 5452 §9.2] requires an unpredictable source port, and a
 //! different one for each outstanding query. The resolver can't choose
-//! ports, so the driver must: bind a fresh ephemeral socket per query
-//! ([`Transport::Udp`] names it), and only feed a datagram to
-//! [`Resolver::handle_datagram`] if it arrived on the socket that query was
-//! sent from. The resolver checks everything else §9.1 asks for: source
-//! address and port, message ID and question.
+//! ports, so the driver must bind a fresh ephemeral socket per query
+//! ([`Transport::Udp`] names it) and pass that query along with every
+//! datagram the socket receives to [`Resolver::handle_datagram`]. The
+//! resolver checks everything else §9.1 asks for: source address and port,
+//! message ID and question.
 //!
 //! [RFC 5452 §9.2]: https://rfc-annotations.research.icann.org/rfc5452.html
 
@@ -517,26 +517,25 @@ impl Resolver {
         true
     }
 
-    /// Process a datagram received from `from`.
+    /// Process a datagram received from `from` on the socket of `query`,
+    /// the one its [`Transport::Udp`] transmits were sent from.
     ///
-    /// Datagrams that aren't a response to an in-flight UDP query (wrong
-    /// source address, message ID, opcode or question, RFC 5452 §9.1 and
-    /// RFC 1035 §7.3) are ignored, so spoofed or late responses can't
-    /// complete a query. Once a query has switched to TCP, UDP replies to it
-    /// are ignored too.
-    pub fn handle_datagram(&mut self, from: SocketAddr, data: &[u8], now: Instant) {
+    /// Datagrams that aren't a response to that query (wrong source address,
+    /// message ID, opcode or question, RFC 5452 §9.1 and RFC 1035 §7.3) are
+    /// ignored, so spoofed or late responses can't complete it. Naming the
+    /// socket keeps each query's source port its own (§9.2). Once the query
+    /// has switched to TCP, UDP replies to it are ignored too.
+    pub fn handle_datagram(&mut self, query: QueryId, from: SocketAddr, data: &[u8], now: Instant) {
         let Ok(response) = Message::from_vec(data) else {
             return;
         };
-        let Some(id) = self
-            .pending
-            .iter()
-            .find(|(_, p)| !p.stream && p.server == from && is_reply(&p.request, &response))
-            .map(|(id, _)| *id)
-        else {
+        let Some(pending) = self.pending.get(&query) else {
             return;
         };
-        self.handle_response(id, response, now);
+        if pending.stream || pending.server != from || !is_reply(&pending.request, &response) {
+            return;
+        }
+        self.handle_response(query, response, now);
     }
 
     /// Process bytes read from `connection`.

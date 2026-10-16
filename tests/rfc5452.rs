@@ -55,10 +55,10 @@ mod section_9_1 {
         let mut forged = reply(&sent);
         tamper(&mut forged);
 
-        resolver.handle_datagram(S1, &encode(&forged), now);
+        resolver.handle_datagram(udp(&sent), S1, &encode(&forged), now);
 
         assert!(resolver.poll_event().is_none());
-        resolver.handle_datagram(S1, &encode(&reply(&sent)), now);
+        resolver.handle_datagram(udp(&sent), S1, &encode(&reply(&sent)), now);
         assert!(
             is_response(resolver.poll_event()),
             "genuine answer still accepted"
@@ -72,7 +72,7 @@ mod section_9_1 {
         let now = Instant::now();
         let sent = start(&mut resolver, now);
 
-        resolver.handle_datagram(from, &encode(&reply(&sent)), now);
+        resolver.handle_datagram(udp(&sent), from, &encode(&reply(&sent)), now);
 
         assert!(resolver.poll_event().is_none());
     }
@@ -85,7 +85,7 @@ mod section_9_1 {
         resolver.handle_timeout(resolver.poll_timeout().unwrap());
         assert_eq!(resolver.poll_transmit().unwrap().destination, S2);
 
-        resolver.handle_datagram(S1, &encode(&reply(&first)), now);
+        resolver.handle_datagram(udp(&first), S1, &encode(&reply(&first)), now);
 
         assert!(resolver.poll_event().is_none());
     }
@@ -96,10 +96,10 @@ mod section_9_1 {
         let a = start(&mut resolver, now);
         let b = start(&mut resolver, now);
 
-        resolver.handle_datagram(S1, &encode(&reply(&b)), now);
+        resolver.handle_datagram(udp(&b), S1, &encode(&reply(&b)), now);
         assert!(is_response(resolver.poll_event()));
         assert!(resolver.poll_timeout().is_some(), "a is still pending");
-        resolver.handle_datagram(S1, &encode(&reply(&a)), now);
+        resolver.handle_datagram(udp(&a), S1, &encode(&reply(&a)), now);
         assert!(is_response(resolver.poll_event()));
     }
 
@@ -113,7 +113,7 @@ mod section_9_1 {
             let mut forged = reply(&sent);
             forged.metadata.id ^= 1 << bit;
 
-            r.handle_datagram(S1, &encode(&forged), now);
+            r.handle_datagram(udp(&sent), S1, &encode(&forged), now);
 
             prop_assert!(r.poll_event().is_none());
         }
@@ -130,8 +130,8 @@ mod section_4_6 {
         let sent = start(&mut resolver, now);
         let answer = encode(&reply(&sent));
 
-        resolver.handle_datagram(S1, &answer, now);
-        resolver.handle_datagram(S1, &answer, now);
+        resolver.handle_datagram(udp(&sent), S1, &answer, now);
+        resolver.handle_datagram(udp(&sent), S1, &answer, now);
 
         assert!(is_response(resolver.poll_event()));
         assert!(resolver.poll_event().is_none());
@@ -163,5 +163,17 @@ mod section_9_2 {
             .map(|_| decode(&start(&mut resolver, now)).metadata.id)
             .collect();
         assert!(ids.windows(2).any(|w| w[1] != w[0].wrapping_add(1)));
+    }
+
+    /// An answer that arrives on another query's port doesn't match.
+    #[rstest]
+    fn answer_on_another_querys_socket_is_ignored(mut resolver: Resolver) {
+        let now = Instant::now();
+        let a = start(&mut resolver, now);
+        let b = start(&mut resolver, now);
+
+        resolver.handle_datagram(udp(&a), S1, &encode(&reply(&b)), now);
+
+        assert!(resolver.poll_event().is_none());
     }
 }

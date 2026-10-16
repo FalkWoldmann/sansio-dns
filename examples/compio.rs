@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     let mut tcp: Option<(ConnectionId, TcpStream)> = None;
     let mut resolver = Resolver::new(Config::new(server, []));
-    resolver.query(name, RecordType::A, Instant::now())?;
+    let query = resolver.query(name, RecordType::A, Instant::now())?;
 
     let mut buf = Vec::with_capacity(4096);
     loop {
@@ -98,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(BufResult(received, returned)) => {
                 buf = returned;
                 let (n, from) = received?;
-                resolver.handle_datagram(from, &buf[..n], Instant::now());
+                resolver.handle_datagram(query, from, &buf[..n], Instant::now());
             }
             Err(_elapsed) => {
                 buf = Vec::with_capacity(4096);

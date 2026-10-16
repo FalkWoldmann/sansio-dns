@@ -92,7 +92,12 @@ mod search {
         while let Some(t) = resolver.poll_transmit() {
             let request = decode(&t);
             asked.push(request.queries[0].name().to_ascii());
-            resolver.handle_datagram(t.destination, &encode(&with_code(reply(&t), code)), now);
+            resolver.handle_datagram(
+                udp(&t),
+                t.destination,
+                &encode(&with_code(reply(&t), code)),
+                now,
+            );
         }
         (asked, resolver.poll_event())
     }
