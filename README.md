@@ -115,8 +115,9 @@ per query, and pass that query along with each datagram the socket receives to `
 Stream connections are named by a `ConnectionId`: `TcpConnect(id)` means open a connection
 to the destination and write the payload, `TcpWrite(id)` write to it, `TcpClose(id)` close
 it. Payloads are already length-prefixed or TLS-encrypted. Pass everything read to
-`handle_stream_data(id, …)`, and call `handle_stream_closed(id, …)` if the connection ends
-on its own. The resolver keeps one connection per server and pipelines queries over it;
+`handle_stream_data(id, …)`. Call `handle_stream_closed(id, …)` if the server closes the
+connection, and `handle_stream_error(id, kind, …)` if connecting, reading or writing fails,
+so a query out of attempts fails with that error. The resolver keeps one connection per server and pipelines queries over it;
 it closes the connection after `Config::idle_timeout` (10 s) without queries, or when a
 query on it times out.
 

@@ -42,13 +42,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Transport::TcpConnect(c) => match open(&t) {
                     Ok(stream) => tcp = Some((c, stream)),
-                    Err(_) => resolver.handle_stream_closed(c, Instant::now()),
+                    Err(e) => resolver.handle_stream_error(c, e.kind(), Instant::now()),
                 },
                 Transport::TcpWrite(c) => {
                     if let Some((_, stream)) = tcp.as_mut().filter(|(open, _)| *open == c)
-                        && stream.write_all(&t.payload).is_err()
+                        && let Err(e) = stream.write_all(&t.payload)
                     {
-                        resolver.handle_stream_closed(c, Instant::now());
+                        resolver.handle_stream_error(c, e.kind(), Instant::now());
                     }
                 }
                 Transport::TcpClose(c) => {
@@ -78,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     resolver.handle_timeout(Instant::now());
                     tcp = Some((connection, stream));
                 }
-                Err(_) => resolver.handle_stream_closed(connection, Instant::now()),
+                Err(e) => resolver.handle_stream_error(connection, e.kind(), Instant::now()),
             }
             continue;
         }

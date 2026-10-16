@@ -1,10 +1,10 @@
 //! Random sequences of driver calls, checking invariants after every step.
 //!
 //! The resolver only ever sees `query`, `handle_datagram`,
-//! `handle_stream_data`, `handle_stream_closed`, `handle_timeout` and
-//! `cancel`, so any sequence of those is a valid input. Replies go to recent
-//! transmits over their transport, often tampered with and, over TCP, split
-//! into two chunks; there is raw garbage too.
+//! `handle_stream_data`, `handle_stream_closed`, `handle_stream_error`,
+//! `handle_timeout` and `cancel`, so any sequence of those is a valid input.
+//! Replies go to recent transmits over their transport, often tampered with
+//! and, over TCP, split into two chunks; there is raw garbage too.
 
 #![expect(
     clippy::disallowed_methods,
@@ -16,6 +16,7 @@
 mod common;
 
 use std::collections::{HashMap, HashSet};
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -55,6 +56,7 @@ enum Op {
     },
     StreamClosed {
         which: usize,
+        failed: bool,
     },
     Garbage(Vec<u8>),
 }
@@ -86,7 +88,8 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         1 => any::<u16>().prop_map(|millis| Op::Elapse { millis }),
         1 => Just(Op::Timeout),
         1 => any::<usize>().prop_map(|which| Op::Cancel { which }),
-        1 => any::<usize>().prop_map(|which| Op::StreamClosed { which }),
+        1 => (any::<usize>(), any::<bool>())
+            .prop_map(|(which, failed)| Op::StreamClosed { which, failed }),
         1 => prop::collection::vec(any::<u8>(), 0..64).prop_map(Op::Garbage),
     ]
 }
@@ -199,13 +202,18 @@ impl Harness {
                     self.done.insert(id);
                 }
             }
-            Op::StreamClosed { which } => {
+            Op::StreamClosed { which, failed } => {
                 let mut open: Vec<_> = self.open.iter().copied().collect();
                 open.sort_unstable();
                 if !open.is_empty() {
                     let c = open[which % open.len()];
                     self.open.remove(&c);
-                    self.resolver.handle_stream_closed(c, self.now);
+                    if *failed {
+                        self.resolver
+                            .handle_stream_error(c, ErrorKind::ConnectionReset, self.now);
+                    } else {
+                        self.resolver.handle_stream_closed(c, self.now);
+                    }
                 }
             }
             Op::Garbage(bytes) => {

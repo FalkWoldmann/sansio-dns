@@ -145,8 +145,11 @@ impl Resolver {
                     Input::Stream(connection, data) => {
                         resolver.handle_stream_data(connection, &data, Instant::now());
                     }
-                    Input::Closed(connection) => {
+                    Input::Closed(connection, Ok(())) => {
                         resolver.handle_stream_closed(connection, Instant::now());
+                    }
+                    Input::Closed(connection, Err(error)) => {
+                        resolver.handle_stream_error(connection, error, Instant::now());
                     }
                 },
                 () = sleep_until(deadline) => resolver.handle_timeout(Instant::now()),
@@ -166,7 +169,8 @@ async fn sleep_until(deadline: Option<Instant>) {
 enum Input {
     Datagram(QueryId, SocketAddr, Vec<u8>),
     Stream(ConnectionId, Vec<u8>),
-    Closed(ConnectionId),
+    /// The connection ended: closed by the server, or with an I/O error.
+    Closed(ConnectionId, Result<(), io::ErrorKind>),
 }
 
 /// The sockets and connections of one lookup. Dropping it aborts their tasks.
@@ -262,9 +266,10 @@ async fn stream(
     queued: mpsc::UnboundedReceiver<Vec<u8>>,
     input: mpsc::UnboundedSender<Input>,
 ) {
-    // However the connection ended, the resolver only needs to know it did.
-    let _ended = carry(connection, to, first, queued, &input).await;
-    input.send(Input::Closed(connection)).ok();
+    let ended = carry(connection, to, first, queued, &input).await;
+    input
+        .send(Input::Closed(connection, ended.map_err(|e| e.kind())))
+        .ok();
 }
 
 async fn carry(

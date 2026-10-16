@@ -69,8 +69,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Transport::Udp(_) => return Err("DNS over TLS never uses UDP".into()),
             };
-            if written.is_err() {
-                resolver.handle_stream_closed(connection, Instant::now());
+            if let Err(e) = written {
+                resolver.handle_stream_error(connection, e.kind(), Instant::now());
             }
         }
         if let Some(event) = resolver.poll_event() {
@@ -103,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 resolver.handle_timeout(Instant::now());
                 tcp = Some((connection, stream));
             }
-            Err(_) => resolver.handle_stream_closed(connection, Instant::now()),
+            Err(e) => resolver.handle_stream_error(connection, e.kind(), Instant::now()),
         }
     }
 }

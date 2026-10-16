@@ -11,6 +11,7 @@
     reason = "a driver owns the sockets, the clock and the output; read and recv_from never return more than buf.len()"
 )]
 
+use std::io::ErrorKind;
 use std::time::{Duration, Instant};
 
 use sansio_dns::hickory_proto::rr::{Name, RecordType};
@@ -39,13 +40,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Transport::TcpConnect(c) => match timeout(Duration::from_secs(2), open(&t)).await {
                     Ok(Ok(stream)) => tcp = Some((c, stream)),
-                    _ => resolver.handle_stream_closed(c, Instant::now()),
+                    Ok(Err(e)) => resolver.handle_stream_error(c, e.kind(), Instant::now()),
+                    Err(_elapsed) => {
+                        resolver.handle_stream_error(c, ErrorKind::TimedOut, Instant::now());
+                    }
                 },
                 Transport::TcpWrite(c) => {
                     if let Some((_, stream)) = tcp.as_mut().filter(|(open, _)| *open == c)
-                        && stream.write_all(&t.payload).await.is_err()
+                        && let Err(e) = stream.write_all(&t.payload).await
                     {
-                        resolver.handle_stream_closed(c, Instant::now());
+                        resolver.handle_stream_error(c, e.kind(), Instant::now());
                     }
                 }
                 Transport::TcpClose(c) => {
@@ -72,7 +76,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     resolver.handle_stream_data(connection, &buf[..n], Instant::now());
                     tcp = Some((connection, stream));
                 }
-                Ok(_) => resolver.handle_stream_closed(connection, Instant::now()),
+                Ok(Ok(_)) => resolver.handle_stream_closed(connection, Instant::now()),
+                Ok(Err(e)) => {
+                    resolver.handle_stream_error(connection, e.kind(), Instant::now());
+                }
                 Err(_elapsed) => {
                     resolver.handle_timeout(Instant::now());
                     tcp = Some((connection, stream));

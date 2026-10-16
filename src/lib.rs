@@ -28,9 +28,10 @@
 //! the destination under that id and write the payload; for
 //! [`Transport::TcpWrite`], write the payload to that connection; for
 //! [`Transport::TcpClose`], close it. Pass everything read from a connection
-//! to [`Resolver::handle_stream_data`], and call
-//! [`Resolver::handle_stream_closed`] when it ends or fails on its own.
-//! Payloads are already length-prefixed (RFC 7766 §8) or TLS-encrypted.
+//! to [`Resolver::handle_stream_data`]. Call
+//! [`Resolver::handle_stream_closed`] when the server closes it, and
+//! [`Resolver::handle_stream_error`] when connecting, reading or writing
+//! fails. Payloads are already length-prefixed (RFC 7766 §8) or TLS-encrypted.
 //!
 //! The resolver keeps one connection per server open and sends further
 //! queries over it, several at a time (RFC 7766 §6.2.1, RFC 7858 §3.4). It
@@ -49,6 +50,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
+use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
@@ -280,6 +282,9 @@ pub enum Error {
     Timeout,
     /// The last TCP connection closed before a complete response arrived.
     ConnectionClosed,
+    /// The last TCP connection failed with this I/O error, for example
+    /// when connecting was refused.
+    Connection(io::ErrorKind),
     /// The last TLS session failed, for example on an invalid certificate.
     /// Only with the `tls` feature.
     Tls(String),
@@ -292,6 +297,7 @@ impl fmt::Display for Error {
         match self {
             Self::Timeout => f.write_str("no response from any name server"),
             Self::ConnectionClosed => f.write_str("connection closed before a response"),
+            Self::Connection(kind) => write!(f, "connection failed: {kind}"),
             Self::Tls(error) => write!(f, "TLS failed: {error}"),
             Self::Server(code) => write!(f, "name server returned {code}"),
         }
@@ -606,11 +612,25 @@ impl Resolver {
         }
     }
 
-    /// `connection` ended or failed on its own. Its queries move on to their
-    /// next attempt, still over a stream.
+    /// The server closed `connection`. Its queries move on to their next
+    /// attempt, still over a stream.
     pub fn handle_stream_closed(&mut self, connection: ConnectionId, now: Instant) {
         if self.connections.remove(&connection).is_some() {
             self.retry_all_on(connection, now, &Error::ConnectionClosed);
+        }
+    }
+
+    /// Connecting, reading or writing failed on `connection` with `error`.
+    /// Its queries move on as with [`Resolver::handle_stream_closed`], and
+    /// one out of attempts fails with [`Error::Connection`].
+    pub fn handle_stream_error(
+        &mut self,
+        connection: ConnectionId,
+        error: io::ErrorKind,
+        now: Instant,
+    ) {
+        if self.connections.remove(&connection).is_some() {
+            self.retry_all_on(connection, now, &Error::Connection(error));
         }
     }
 

@@ -11,6 +11,7 @@
 mod common;
 
 use std::assert_matches;
+use std::io::ErrorKind;
 use std::time::{Duration, Instant};
 
 use common::*;
@@ -18,7 +19,7 @@ use hickory_proto::rr::RData;
 use hickory_proto::rr::rdata::A;
 use proptest::prelude::*;
 use rstest::rstest;
-use sansio_dns::{ConnectionId, Event, Resolver, Transmit, Transport};
+use sansio_dns::{ConnectionId, Error, Event, Resolver, Transmit, Transport};
 
 /// Start a query, answer it with TC set over UDP, and return the TCP transmit.
 fn switch_to_tcp(resolver: &mut Resolver, now: Instant) -> Transmit {
@@ -77,6 +78,9 @@ mod section_5 {
     fn close(resolver: &mut Resolver, tcp: &Transmit, now: Instant) {
         resolver.handle_stream_closed(conn(tcp), now);
     }
+    fn refuse(resolver: &mut Resolver, tcp: &Transmit, now: Instant) {
+        resolver.handle_stream_error(conn(tcp), ErrorKind::ConnectionRefused, now);
+    }
     fn time_out(resolver: &mut Resolver, _: &Transmit, _: Instant) {
         resolver.handle_timeout(resolver.poll_timeout().unwrap());
     }
@@ -85,6 +89,7 @@ mod section_5 {
     /// answer is known not to fit in UDP.
     #[rstest]
     #[case::connection_closed(close)]
+    #[case::connection_failed(refuse)]
     #[case::timeout(time_out)]
     fn failed_tcp_attempt_retries_next_server_over_tcp(
         mut resolver: Resolver,
@@ -99,6 +104,28 @@ mod section_5 {
             .find(is_connect)
             .unwrap();
         assert_eq!(retry.destination, S2);
+    }
+
+    #[rstest]
+    #[case::closed(close, Error::ConnectionClosed)]
+    #[case::failed(refuse, Error::Connection(ErrorKind::ConnectionRefused))]
+    fn query_out_of_attempts_fails_with_the_last_connection_error(
+        mut resolver: Resolver,
+        #[case] fail: fn(&mut Resolver, &Transmit, Instant),
+        #[case] expected: Error,
+    ) {
+        let now = Instant::now();
+        let mut attempt = Some(switch_to_tcp(&mut resolver, now));
+
+        while let Some(tcp) = attempt {
+            fail(&mut resolver, &tcp, now);
+            attempt = resolver.poll_transmit();
+        }
+
+        assert_matches!(
+            resolver.poll_event(),
+            Some(Event::Failed { error, .. }) if error == expected
+        );
     }
 }
 
@@ -195,6 +222,9 @@ mod section_6_2_1 {
     fn close(resolver: &mut Resolver, connection: ConnectionId, now: Instant) {
         resolver.handle_stream_closed(connection, now);
     }
+    fn reset(resolver: &mut Resolver, connection: ConnectionId, now: Instant) {
+        resolver.handle_stream_error(connection, ErrorKind::ConnectionReset, now);
+    }
     fn time_out(resolver: &mut Resolver, _: ConnectionId, _: Instant) {
         resolver.handle_timeout(resolver.poll_timeout().unwrap());
     }
@@ -203,6 +233,7 @@ mod section_6_2_1 {
     /// a new connection to the next server.
     #[rstest]
     #[case::closed(close)]
+    #[case::reset(reset)]
     #[case::timed_out(time_out)]
     fn failure_moves_all_queries_to_one_new_connection(
         mut resolver: Resolver,
