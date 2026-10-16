@@ -114,7 +114,10 @@ impl Resolver {
     }
 
     /// The IPv4 and then the IPv6 addresses of `host`, which may also be an
-    /// IP address itself.
+    /// IP address itself. A name with non-ASCII characters is converted to
+    /// its ASCII form first (IDNA, so `bücher.example` asks for
+    /// `xn--bcher-kva.example`); an ASCII name is used as given, so names
+    /// like `my_host.example` work too.
     pub async fn lookup_ip(&self, host: &str) -> Result<Vec<IpAddr>, Error> {
         if let Ok(ip) = host.parse() {
             return Ok(vec![ip]);
@@ -123,7 +126,12 @@ impl Resolver {
         // the second try runs on a task of this lookup's own runtime.
         let mut stopped = None;
         for _ in 0..2 {
-            let name = Name::from_ascii(host).map_err(Error::InvalidName)?;
+            let name = if host.is_ascii() {
+                Name::from_ascii(host)
+            } else {
+                Name::from_utf8(host)
+            }
+            .map_err(Error::InvalidName)?;
             let (reply, answer) = oneshot::channel();
             let id = self.shared.next_lookup.fetch_add(1, Ordering::Relaxed);
             let request = Request::Lookup { id, name, reply };

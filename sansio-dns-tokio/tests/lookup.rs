@@ -31,6 +31,26 @@ async fn finds_both_families(#[case] truncate_udp: bool) {
 }
 
 #[tokio::test]
+async fn non_ascii_name_is_looked_up_in_its_ascii_form() {
+    let server = name_server("xn--bcher-kva.example.", false).await;
+    let resolver = Resolver::new(Config::new(server, []));
+
+    let addresses = resolver.lookup_ip("bücher.example").await.unwrap();
+
+    assert_eq!(addresses, [IpAddr::V4(V4), IpAddr::V6(V6)]);
+}
+
+#[tokio::test]
+async fn underscore_name_is_looked_up_as_given() {
+    let server = name_server("my_host.example.", false).await;
+    let resolver = Resolver::new(Config::new(server, []));
+
+    let addresses = resolver.lookup_ip("my_host.example").await.unwrap();
+
+    assert_eq!(addresses, [IpAddr::V4(V4), IpAddr::V6(V6)]);
+}
+
+#[tokio::test]
 async fn unknown_name_is_not_found() {
     let server = name_server("app.example.", false).await;
     let resolver = Resolver::new(Config::new(server, []));
