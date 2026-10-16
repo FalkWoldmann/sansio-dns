@@ -222,6 +222,35 @@ fn later_query_reuses_the_session() {
     assert!(is_response(resolver.poll_event()));
 }
 
+/// Bytes after the server's close_notify are ignored (RFC 8446 §6.1), and
+/// don't keep the resolver spinning on them.
+#[test]
+fn data_after_close_notify_is_ignored() {
+    let (client, server_config) = configs("dns.example");
+    let now = Instant::now();
+    let mut resolver = tls_resolver(client, now);
+    let mut server = Server::new(server_config);
+    let connection = conn(&run(&mut resolver, &mut server, now)[0]);
+    assert!(is_response(resolver.poll_event()));
+    let (session, _) = server.sessions.get_mut(&connection).unwrap();
+    session.send_close_notify();
+    let mut close_notify = Vec::new();
+    while session.wants_write() {
+        session.write_tls(&mut close_notify).unwrap();
+    }
+    resolver.handle_stream_data(connection, &close_notify, now);
+
+    let (done, returned) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        resolver.handle_stream_data(connection, &[0x17, 3, 3, 0, 2, 0, 0], now);
+        done.send(()).unwrap();
+    });
+
+    returned
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+}
+
 /// A query started during the handshake waits for it on the same
 /// connection, as with the A and AAAA queries of an `IpLookup`.
 #[test]

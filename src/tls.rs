@@ -42,8 +42,13 @@ pub(crate) fn receive(
     mut data: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
     while !data.is_empty() {
-        session.read_tls(&mut data).map_err(|e| e.to_string())?;
-        session.process_new_packets().map_err(|e| e.to_string())?;
+        let read = session.read_tls(&mut data).map_err(|e| e.to_string())?;
+        let state = session.process_new_packets().map_err(|e| e.to_string())?;
+        // After the server's close_notify, rustls reads nothing more; what
+        // follows is ignored (RFC 8446 §6.1).
+        if read == 0 || state.peer_has_closed() {
+            break;
+        }
     }
     let mut plaintext = Vec::new();
     match session.reader().read_to_end(&mut plaintext) {
