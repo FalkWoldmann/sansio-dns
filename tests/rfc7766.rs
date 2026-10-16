@@ -247,12 +247,13 @@ mod section_6_2_1 {
 }
 
 /// A query that times out on a stream suggests a dead connection: it is
-/// closed, and queries still waiting on it move on too.
+/// closed. Only the late query moves on to its next attempt; the others on
+/// the connection try the same server again, keeping their deadlines.
 mod stream_timeout {
     use super::*;
 
     #[rstest]
-    fn closes_the_connection_and_moves_its_other_queries(mut resolver: Resolver) {
+    fn closes_the_connection_and_moves_only_the_late_query_on(mut resolver: Resolver) {
         let now = Instant::now();
         let first = switch_to_tcp(&mut resolver, now);
         let later = now + Duration::from_secs(1);
@@ -261,9 +262,39 @@ mod stream_timeout {
         resolver.handle_timeout(now + Duration::from_secs(2));
 
         let sent: Vec<Transmit> = std::iter::from_fn(|| resolver.poll_transmit()).collect();
+        assert_eq!(sent.len(), 3, "{sent:?}");
         assert_matches!(sent[0].transport, Transport::TcpClose(c) if c == conn(&first));
-        assert_eq!(sent.len(), 3, "both queries resent: {sent:?}");
-        assert!(sent[1..].iter().all(|t| t.destination == S2));
+        assert!(is_connect(&sent[1]) && sent[1].destination == S2);
+        assert!(is_connect(&sent[2]) && sent[2].destination == S1);
+        assert_eq!(
+            resolver.poll_timeout(),
+            Some(later + Duration::from_secs(2))
+        );
+    }
+
+    /// A query moved off one timed-out connection uses up its attempt when a
+    /// neighbour times out on the next one too.
+    #[rstest]
+    fn moves_a_query_for_free_only_once(mut resolver: Resolver) {
+        let now = Instant::now();
+        switch_to_tcp(&mut resolver, now);
+        switch_to_tcp(&mut resolver, now + Duration::from_millis(500));
+        switch_to_tcp(&mut resolver, now + Duration::from_secs(1));
+        resolver.handle_timeout(now + Duration::from_secs(2));
+        let moved: Vec<Transmit> = std::iter::from_fn(|| resolver.poll_transmit()).collect();
+        assert_eq!(
+            moved.iter().filter(|t| t.destination == S1).count(),
+            3,
+            "{moved:?}"
+        );
+
+        resolver.handle_timeout(now + Duration::from_millis(2500));
+
+        let sent: Vec<Transmit> = std::iter::from_fn(|| resolver.poll_transmit())
+            .filter(|t| !matches!(t.transport, Transport::TcpClose(_)))
+            .collect();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert!(sent.iter().all(|t| t.destination == S2));
     }
 
     /// A query still waiting keeps its connection open past the idle timeout.
@@ -278,6 +309,103 @@ mod stream_timeout {
         resolver.handle_timeout(now + Duration::from_secs(10));
 
         assert!(resolver.poll_transmit().is_none());
+    }
+}
+
+/// A connection that has answered and then goes away was most likely closed
+/// by the server for being idle (§6.2.3), so its queries try the same server
+/// again once without using up an attempt.
+mod lost_connection {
+    use super::*;
+
+    fn close(resolver: &mut Resolver, connection: ConnectionId, now: Instant) {
+        resolver.handle_stream_closed(connection, now);
+    }
+    fn reset(resolver: &mut Resolver, connection: ConnectionId, now: Instant) {
+        resolver.handle_stream_error(connection, ErrorKind::ConnectionReset, now);
+    }
+
+    /// A query written to a connection that already answered another one.
+    fn on_working_connection(resolver: &mut Resolver, now: Instant) -> Transmit {
+        let first = switch_to_tcp(resolver, now);
+        resolver.handle_stream_data(conn(&first), &frame(&encode(&reply(&first))), now);
+        assert!(is_response(resolver.poll_event()));
+        switch_to_tcp(resolver, now)
+    }
+
+    #[rstest]
+    #[case::closed(close)]
+    #[case::reset(reset)]
+    fn query_is_resent_to_the_same_server(
+        mut resolver: Resolver,
+        #[case] lose: fn(&mut Resolver, ConnectionId, Instant),
+    ) {
+        let now = Instant::now();
+        let second = on_working_connection(&mut resolver, now);
+
+        lose(&mut resolver, conn(&second), now);
+
+        let resent = resolver.poll_transmit().unwrap();
+        assert!(is_connect(&resent));
+        assert_eq!(resent.destination, S1);
+    }
+
+    /// The new connection answers too before it goes away, so only the
+    /// query's own flag stops a second free resend.
+    #[rstest]
+    fn only_once(mut resolver: Resolver) {
+        let now = Instant::now();
+        let second = on_working_connection(&mut resolver, now);
+        resolver.handle_stream_closed(conn(&second), now);
+        let resent = resolver.poll_transmit().unwrap();
+        let third = switch_to_tcp(&mut resolver, now);
+        assert_eq!(conn(&third), conn(&resent));
+        resolver.handle_stream_data(conn(&third), &frame(&encode(&reply(&third))), now);
+        assert!(is_response(resolver.poll_event()));
+
+        resolver.handle_stream_closed(conn(&resent), now);
+
+        assert_eq!(resolver.poll_transmit().unwrap().destination, S2);
+    }
+
+    #[rstest]
+    fn uses_up_no_attempt(mut resolver: Resolver) {
+        let now = Instant::now();
+        let second = on_working_connection(&mut resolver, now);
+        resolver.handle_stream_closed(conn(&second), now);
+
+        let mut attempts = 0;
+        while let Some(attempt) = resolver.poll_transmit() {
+            attempts += 1;
+            resolver.handle_stream_closed(conn(&attempt), now);
+        }
+
+        assert_eq!(attempts, 4, "all of Config::new(S1, [S2])'s attempts");
+        assert_matches!(resolver.poll_event(), Some(Event::Failed { .. }));
+    }
+
+    #[rstest]
+    fn gives_the_resent_query_a_new_deadline(mut resolver: Resolver) {
+        let now = Instant::now();
+        let second = on_working_connection(&mut resolver, now);
+        let later = now + Duration::from_millis(1500);
+
+        resolver.handle_stream_closed(conn(&second), later);
+
+        assert_eq!(
+            resolver.poll_timeout(),
+            Some(later + Duration::from_secs(2))
+        );
+    }
+
+    #[rstest]
+    fn not_for_a_connection_that_never_answered(mut resolver: Resolver) {
+        let now = Instant::now();
+        let tcp = switch_to_tcp(&mut resolver, now);
+
+        resolver.handle_stream_closed(conn(&tcp), now);
+
+        assert_eq!(resolver.poll_transmit().unwrap().destination, S2);
     }
 }
 

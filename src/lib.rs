@@ -316,6 +316,10 @@ struct Pending {
     route: Route,
     /// Search candidates still to try if this name doesn't exist.
     rest: VecDeque<Name>,
+    /// Whether its attempt was already sent again for free, after losing a
+    /// working connection or being moved off a timed-out one. That happens
+    /// once per query; see `Resolver::forgive`.
+    forgiven: bool,
 }
 
 /// How a query's current attempt travels.
@@ -337,6 +341,8 @@ struct Connection {
     /// When it last carried data; the idle timeout counts from here once
     /// no query uses it.
     last_active: Instant,
+    /// Whether an answer has arrived on it, so it is known to work.
+    answered: bool,
     /// The TLS session, when using DNS over TLS.
     #[cfg(feature = "tls")]
     tls: Option<Box<rustls::ClientConnection>>,
@@ -509,6 +515,7 @@ impl Resolver {
                 Route::Udp
             },
             rest,
+            forgiven: false,
         })
     }
 
@@ -607,30 +614,53 @@ impl Resolver {
                 })
                 .map(|(id, _)| *id);
             if let Some(id) = id {
+                if let Some(conn) = self.connections.get_mut(&connection) {
+                    conn.answered = true;
+                }
                 self.handle_response(id, response, now);
             }
         }
     }
 
     /// The server closed `connection`. Its queries move on to their next
-    /// attempt, still over a stream.
+    /// attempt, still over a stream; see [`Resolver::handle_stream_error`]
+    /// for when they don't use one up.
     pub fn handle_stream_closed(&mut self, connection: ConnectionId, now: Instant) {
-        if self.connections.remove(&connection).is_some() {
-            self.retry_all_on(connection, now, &Error::ConnectionClosed);
-        }
+        self.lost(connection, now, &Error::ConnectionClosed);
     }
 
     /// Connecting, reading or writing failed on `connection` with `error`.
     /// Its queries move on as with [`Resolver::handle_stream_closed`], and
     /// one out of attempts fails with [`Error::Connection`].
+    ///
+    /// A connection that has answered before was most likely closed by the
+    /// server for being idle while a query was on its way (RFC 7766
+    /// §6.2.3). Each query on it is then sent once more to the same server,
+    /// on a new connection, without using up an attempt.
     pub fn handle_stream_error(
         &mut self,
         connection: ConnectionId,
         error: io::ErrorKind,
         now: Instant,
     ) {
-        if self.connections.remove(&connection).is_some() {
-            self.retry_all_on(connection, now, &Error::Connection(error));
+        self.lost(connection, now, &Error::Connection(error));
+    }
+
+    /// `connection` went away without being asked to; see
+    /// [`Resolver::handle_stream_error`].
+    fn lost(&mut self, connection: ConnectionId, now: Instant, error: &Error) {
+        let Some(conn) = self.connections.remove(&connection) else {
+            return;
+        };
+        for id in self.queries_on(connection) {
+            if conn.answered && self.forgive(id) {
+                if let Some(pending) = self.pending.get_mut(&id) {
+                    pending.deadline = now.checked_add(self.config.timeout);
+                }
+                self.resend(id, now);
+            } else {
+                self.retry(id, now, error.clone());
+            }
         }
     }
 
@@ -662,7 +692,9 @@ impl Resolver {
     /// close connections that have been idle for too long.
     ///
     /// A query that times out on a stream suggests the connection is dead,
-    /// so the connection is closed and all its queries move on.
+    /// so the connection is closed. The queries that timed out move on to
+    /// their next attempt, and the others go to a new connection to the same
+    /// server with their attempt and deadline unchanged, once per query.
     pub fn handle_timeout(&mut self, now: Instant) {
         let expired: Vec<QueryId> = self
             .pending
@@ -680,7 +712,7 @@ impl Resolver {
             }
             match pending.route {
                 Route::Stream(Some(connection)) if self.connections.contains_key(&connection) => {
-                    self.close(connection, now, &Error::Timeout);
+                    self.time_out_stream(connection, now);
                 }
                 _ => self.retry(id, now, Error::Timeout),
             }
@@ -755,20 +787,63 @@ impl Resolver {
         self.emit(id, now);
     }
 
-    /// Move every query on `connection` on to its next attempt.
-    fn retry_all_on(&mut self, connection: ConnectionId, now: Instant, error: &Error) {
-        let affected: Vec<QueryId> = self
-            .pending
+    /// The queries whose current attempt was written to `connection`.
+    fn queries_on(&self, connection: ConnectionId) -> Vec<QueryId> {
+        self.pending
             .iter()
             .filter(|(_, p)| p.route == Route::Stream(Some(connection)))
             .map(|(id, _)| *id)
-            .collect();
-        for id in affected {
-            self.retry(id, now, error.clone());
+            .collect()
+    }
+
+    /// A query on `connection` timed out, which suggests the connection is
+    /// dead: close it. The queries that timed out move on to their next
+    /// attempt. The others are sent again on a new connection to the same
+    /// server, keeping their attempt and deadline, since another lookup's
+    /// slow answer is no fault of theirs; but only once per query, so a
+    /// server that stops answering costs each query a bounded number of
+    /// sends.
+    fn time_out_stream(&mut self, connection: ConnectionId, now: Instant) {
+        let Some(conn) = self.connections.remove(&connection) else {
+            return;
+        };
+        self.transmits.push_back(Transmit {
+            transport: Transport::TcpClose(connection),
+            destination: conn.server,
+            payload: Vec::new(),
+        });
+        for id in self.queries_on(connection) {
+            let expired = self
+                .pending
+                .get(&id)
+                .is_some_and(|p| p.deadline.is_some_and(|d| d <= now));
+            if !expired && self.forgive(id) {
+                self.resend(id, now);
+            } else {
+                self.retry(id, now, Error::Timeout);
+            }
         }
     }
 
-    /// Ask the driver to close `connection`, and move its queries on.
+    /// Whether `id` may send its attempt again for free, which it may once.
+    fn forgive(&mut self, id: QueryId) -> bool {
+        self.pending
+            .get_mut(&id)
+            .is_some_and(|p| !std::mem::replace(&mut p.forgiven, true))
+    }
+
+    /// Send `id`'s current attempt again over a stream to the same server,
+    /// without using up an attempt.
+    fn resend(&mut self, id: QueryId, now: Instant) {
+        if let Some(pending) = self.pending.get_mut(&id) {
+            pending.route = Route::Stream(None);
+            self.emit(id, now);
+        }
+    }
+
+    /// Ask the driver to close `connection`, and move its queries on to
+    /// their next attempt.
+    #[cfg(feature = "tls")]
     fn close(&mut self, connection: ConnectionId, now: Instant, error: &Error) {
         let Some(conn) = self.connections.remove(&connection) else {
             return;
@@ -778,7 +853,9 @@ impl Resolver {
             destination: conn.server,
             payload: Vec::new(),
         });
-        self.retry_all_on(connection, now, error);
+        for id in self.queries_on(connection) {
+            self.retry(id, now, error.clone());
+        }
     }
 
     /// Re-send `id` to the same server over TCP (RFC 7766 §5). Doesn't
@@ -879,6 +956,7 @@ impl Resolver {
             server,
             received: Vec::new(),
             last_active: now,
+            answered: false,
             #[cfg(feature = "tls")]
             tls,
         };
