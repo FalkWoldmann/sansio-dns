@@ -49,7 +49,6 @@
 //! [RFC 5452 §9.2]: https://rfc-annotations.research.icann.org/rfc5452.html
 
 use std::collections::{BTreeMap, VecDeque};
-use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::num::NonZeroUsize;
@@ -278,35 +277,26 @@ pub enum Event {
 }
 
 /// Why a query failed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
     /// No server answered within the configured attempts.
+    #[error("no response from any name server")]
     Timeout,
     /// The last TCP connection closed before a complete response arrived.
+    #[error("connection closed before a response")]
     ConnectionClosed,
     /// The last TCP connection failed with this I/O error, for example
     /// when connecting was refused.
+    #[error("connection failed: {0}")]
     Connection(io::ErrorKind),
     /// The last TLS session failed, for example on an invalid certificate.
     /// Only with the `tls` feature.
+    #[error("TLS failed: {0}")]
     Tls(String),
     /// The last server answered with this error code (e.g. `SERVFAIL`).
+    #[error("name server returned {0}")]
     Server(ResponseCode),
 }
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Timeout => f.write_str("no response from any name server"),
-            Self::ConnectionClosed => f.write_str("connection closed before a response"),
-            Self::Connection(kind) => write!(f, "connection failed: {kind}"),
-            Self::Tls(error) => write!(f, "TLS failed: {error}"),
-            Self::Server(code) => write!(f, "name server returned {code}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
 
 #[derive(Debug)]
 struct Pending {

@@ -38,7 +38,6 @@ mod reqwest;
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -71,39 +70,22 @@ struct Shared {
 }
 
 /// Why a lookup found no addresses.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
     /// The host is neither an IP address nor a valid domain name.
-    InvalidName(ProtoError),
+    #[error("invalid host name: {0}")]
+    InvalidName(#[source] ProtoError),
     /// No name server gave a usable answer.
-    Resolve(sansio_dns::Error),
+    #[error("{0}")]
+    Resolve(#[source] sansio_dns::Error),
     /// The name exists but has no addresses, or doesn't exist.
+    #[error("no addresses found")]
     NotFound,
     /// The background task stopped without answering, even after the lookup
     /// restarted it on its own runtime: it panicked.
+    #[error("resolver task stopped before answering")]
     Stopped,
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidName(e) => write!(f, "invalid host name: {e}"),
-            Self::Resolve(e) => write!(f, "{e}"),
-            Self::NotFound => f.write_str("no addresses found"),
-            Self::Stopped => f.write_str("resolver task stopped before answering"),
-        }
-    }
-}
-
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidName(e) => Some(e),
-            Self::Resolve(e) => Some(e),
-            Self::NotFound | Self::Stopped => None,
-        }
-    }
 }
 
 impl Resolver {

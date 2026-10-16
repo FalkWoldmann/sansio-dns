@@ -24,11 +24,13 @@ sansio-dns = { path = ".", version = "0.1.0" }
 sansio-dns-tokio = { path = "sansio-dns-tokio", version = "0.1.0" }
 reqwest = { version = "0.13.5", default-features = false }
 rstest = "0.27.0"
+thiserror = "2.0.21"
 tokio = "1.53.3"
 
 [dependencies]
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 resolv-conf = "0.7.6"
+thiserror.workspace = true
 rustls = { version = "0.23.46", default-features = false, features = ["std"], optional = true }
 
 [features]

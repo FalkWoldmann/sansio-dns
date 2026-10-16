@@ -2077,6 +2077,7 @@ dependencies = [
  "resolv-conf",
  "rstest",
  "rustls",
+ "thiserror",
  "tokio",
  "webpki-roots",
 ]
@@ -2088,6 +2089,7 @@ dependencies = [
  "reqwest",
  "rstest",
  "sansio-dns",
+ "thiserror",
  "tokio",
 ]
 
