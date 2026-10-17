@@ -22,6 +22,9 @@ use crate::{Config, ConnectionId, Error, Event, QueryId, Transmit, Transport};
 struct Pending {
     request: Message,
     payload: Vec<u8>,
+    /// Where in the server list its attempts start: attempt `n` goes to
+    /// server `first + n`, so it skips servers that failed recently.
+    first: usize,
     attempt: usize,
     /// `None` if `now + timeout` overflows: the query then waits forever.
     deadline: Option<Instant>,
@@ -44,6 +47,13 @@ struct Pending {
     /// Every `QueryId` in flight is in exactly one place: a key of
     /// `Resolver::pending`, or one leader's followers.
     followers: Vec<(QueryId, Instant)>,
+}
+
+impl Pending {
+    /// The server of the current attempt.
+    fn server(&self, config: &Config) -> SocketAddr {
+        config.server(self.first + self.attempt)
+    }
 }
 
 /// How a query's current attempt travels.
@@ -80,6 +90,9 @@ pub struct Resolver {
     pending: BTreeMap<QueryId, Pending>,
     next_connection: u64,
     connections: BTreeMap<ConnectionId, Connection>,
+    /// Servers whose last attempt failed without an answer, and until when
+    /// new queries start after them (`Config::failure_memory`).
+    failed: BTreeMap<SocketAddr, Instant>,
     transmits: VecDeque<Transmit>,
     events: VecDeque<Event>,
 }
@@ -93,6 +106,7 @@ impl Resolver {
             pending: BTreeMap::new(),
             next_connection: 0,
             connections: BTreeMap::new(),
+            failed: BTreeMap::new(),
             transmits: VecDeque::new(),
             events: VecDeque::new(),
         }
@@ -197,6 +211,7 @@ impl Resolver {
         Ok(Pending {
             request,
             payload,
+            first: self.first_server(now),
             attempt: 0,
             deadline: now.checked_add(self.config.timeout),
             route: if self.config.uses_tls() {
@@ -210,6 +225,17 @@ impl Resolver {
             started: now,
             followers: Vec::new(),
         })
+    }
+
+    /// The first server in the list that hasn't failed within
+    /// `Config::failure_memory`, or the first of all if every one has.
+    fn first_server(&self, now: Instant) -> usize {
+        (0..self.config.servers().len())
+            .find(|&i| {
+                let until = self.failed.get(&self.config.server(i));
+                !until.is_some_and(|until| *until > now)
+            })
+            .unwrap_or(0)
     }
 
     /// Replace `id`'s attempt with one for its next search candidate.
@@ -256,7 +282,7 @@ impl Resolver {
         let Some(pending) = self.pending.get(&query) else {
             return;
         };
-        if pending.route != Route::Udp || self.config.server(pending.attempt) != from {
+        if pending.route != Route::Udp || pending.server(&self.config) != from {
             return;
         }
         let Ok(response) = Message::from_vec(data) else {
@@ -384,7 +410,7 @@ impl Resolver {
         let Some(pending) = self.pending.get(&query) else {
             return;
         };
-        if pending.route == Route::Udp && self.config.server(pending.attempt) == to {
+        if pending.route == Route::Udp && pending.server(&self.config) == to {
             self.retry(query, now, Error::Io(error));
         }
     }
@@ -410,6 +436,10 @@ impl Resolver {
 
     /// Act on a response already matched to `id`.
     fn handle_response(&mut self, id: QueryId, response: Message, now: Instant) {
+        // Any answer, even an error code, shows the server is reachable.
+        if let Some(pending) = self.pending.get(&id) {
+            self.failed.remove(&pending.server(&self.config));
+        }
         if response.metadata.truncation && self.switch_to_tcp(id, now) {
             return;
         }
@@ -562,7 +592,7 @@ impl Resolver {
         let (heir, _) = pending.followers.remove(0);
         let resend = (pending.route == Route::Udp).then(|| Transmit {
             transport: Transport::Udp(heir),
-            destination: self.config.server(pending.attempt),
+            destination: pending.server(&self.config),
             payload: pending.payload.clone(),
         });
         if resend.is_some() {
@@ -600,6 +630,13 @@ impl Resolver {
         let Some(pending) = self.pending.get_mut(&id) else {
             return;
         };
+        // An error code is an answer; anything else means the server didn't
+        // give one, so new queries start after it for a while.
+        if !matches!(error, Error::Server(_))
+            && let Some(until) = now.checked_add(self.config.failure_memory)
+        {
+            self.failed.insert(pending.server(&self.config), until);
+        }
         pending.attempt += 1;
         if pending.attempt >= self.config.attempts.get() {
             self.give_up(id, error, now);
@@ -724,7 +761,7 @@ impl Resolver {
         let Some(pending) = self.pending.get(&id) else {
             return;
         };
-        let server = self.config.server(pending.attempt);
+        let server = pending.server(&self.config);
         if pending.route == Route::Udp {
             self.transmits.push_back(Transmit {
                 transport: Transport::Udp(id),

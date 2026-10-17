@@ -113,7 +113,7 @@ Where the two behave differently:
 | Address families | Both, IPv6 first, by default; or IPv4 first, or one family | The same, plus asking for the second family only when the first has no address |
 | Names with `_` | Resolved | Rejected |
 | Cache | None | Positive and negative, 8192 entries |
-| Server order | As configured, for every query | By measured latency, two servers raced |
+| Server order | As configured; one that failed to answer goes after the others for a minute | By measured latency, two servers raced |
 | Transports | UDP, TCP, DoT | Also DoH, DoH3, DoQ and DNSSEC validation |
 | System configuration | `resolv.conf` and hosts | Also Windows, and macOS through SystemConfiguration |
 | Tokio lookups | `lookup_ip` | Any record type, reverse lookups, typed helpers |
@@ -134,7 +134,7 @@ modules; and `rfc7766.rs` also has `stream_timeout` and `lost_connection` module
 | 1035 | §3.1 | Names are absolute: without search domains, `example.com` and `example.com.` ask the same question |
 | 1035 | §4.1.1 | `RD` set; `NOERROR` ends the query, and `NXDOMAIN` does once no search candidate is left; `SERVFAIL`/`NOTIMP`/`REFUSED` fail over |
 | 1035 | §4.2.1 | `TC` set → retry over TCP (RFC 7766) |
-| 1035 | §7.2 | Retransmit on timeout, or at once when the datagram can't be sent, rotating through servers |
+| 1035 | §7.2 | Retransmit on timeout, or at once when the datagram can't be sent, rotating through servers; new queries start after a server that recently failed to answer |
 | 1035 | §7.3 | Non-responses (`QR=0`) and wrong opcodes are discarded |
 | 5452 | §9.1 | Responses must match source address, port, ID, QNAME, QTYPE and QCLASS |
 | 5452 | §4.6 | Only the first matching response is accepted |

@@ -163,7 +163,9 @@ mod section_4_2_1 {
     }
 }
 
-/// §7.2: retransmit on timeout, cycling through the configured servers.
+/// §7.2: retransmit on timeout, cycling through the configured servers, and
+/// keep track of how they did: new queries start after a server that
+/// recently failed to answer.
 mod section_7_2 {
     use super::*;
 
@@ -251,6 +253,115 @@ mod section_7_2 {
         t=2s udp q0 to S2 error NetworkUnreachable
           next t=4s
         ");
+    }
+
+    /// S1 times out, so queries in the next minute start at S2; after that,
+    /// at S1 again.
+    #[rstest]
+    fn failed_server_is_tried_after_the_others(mut trace: Trace) {
+        trace.query("a.example.", RecordType::A);
+        trace.timeout();
+        let sent = trace.last();
+        trace.answer(&sent, &reply(&sent));
+        trace.query("b.example.", RecordType::A);
+        let sent = trace.last();
+        trace.answer(&sent, &reply(&sent));
+        trace.at(Duration::from_secs(62));
+        trace.query("c.example.", RecordType::A);
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 a.example. A
+          -> S1 udp q0: a.example. A
+          next t=2s
+        t=2s timeout
+          -> S2 udp q0: a.example. A
+          next t=4s
+        t=2s <- S2 udp q0: a.example. A: NoError, 1 answer
+          => q0 Response a.example. A: NoError, 1 answer
+          next none
+        t=2s query q1 b.example. A
+          -> S2 udp q1: b.example. A
+          next t=4s
+        t=2s <- S2 udp q1: b.example. A: NoError, 1 answer
+          => q1 Response b.example. A: NoError, 1 answer
+          next none
+        t=62s query q2 c.example. A
+          -> S1 udp q2: c.example. A
+          next t=64s
+        ");
+    }
+
+    /// An answer ends a failure early: S1 answers q1 after S2's SERVFAIL,
+    /// which isn't a failure, so q2 starts at S1 again.
+    #[rstest]
+    fn answer_ends_the_failure(mut trace: Trace) {
+        trace.query("a.example.", RecordType::A);
+        trace.timeout();
+        let sent = trace.last();
+        trace.answer(&sent, &reply(&sent));
+        trace.query("b.example.", RecordType::A);
+        let sent = trace.last();
+        trace.answer(&sent, &with_code(reply(&sent), ResponseCode::ServFail));
+        let sent = trace.last();
+        trace.answer(&sent, &reply(&sent));
+        trace.query("c.example.", RecordType::A);
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 a.example. A
+          -> S1 udp q0: a.example. A
+          next t=2s
+        t=2s timeout
+          -> S2 udp q0: a.example. A
+          next t=4s
+        t=2s <- S2 udp q0: a.example. A: NoError, 1 answer
+          => q0 Response a.example. A: NoError, 1 answer
+          next none
+        t=2s query q1 b.example. A
+          -> S2 udp q1: b.example. A
+          next t=4s
+        t=2s <- S2 udp q1: b.example. A: ServFail, 0 answers
+          -> S1 udp q1: b.example. A
+          next t=4s
+        t=2s <- S1 udp q1: b.example. A: NoError, 1 answer
+          => q1 Response b.example. A: NoError, 1 answer
+          next none
+        t=2s query q2 c.example. A
+          -> S1 udp q2: c.example. A
+          next t=4s
+        ");
+    }
+
+    /// A server that answers with an error code is up, so it stays first.
+    #[rstest]
+    fn server_error_is_not_a_failure(mut trace: Trace) {
+        trace.query("a.example.", RecordType::A);
+        let sent = trace.last();
+        trace.answer(&sent, &with_code(reply(&sent), ResponseCode::ServFail));
+        trace.query("b.example.", RecordType::A);
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 a.example. A
+          -> S1 udp q0: a.example. A
+          next t=2s
+        t=0s <- S1 udp q0: a.example. A: ServFail, 0 answers
+          -> S2 udp q0: a.example. A
+          next t=2s
+        t=0s query q1 b.example. A
+          -> S1 udp q1: b.example. A
+          next t=2s
+        ");
+    }
+
+    #[test]
+    fn zero_failure_memory_always_starts_at_the_first_server() {
+        let mut config = sansio_dns::Config::new(S1, [S2]);
+        config.failure_memory = Duration::ZERO;
+        let mut trace = Trace::new(Resolver::new(config));
+        trace.query("a.example.", RecordType::A);
+        trace.timeout();
+        trace.query("b.example.", RecordType::A);
+
+        assert_eq!(trace.last().destination, S1);
     }
 
     #[rstest]

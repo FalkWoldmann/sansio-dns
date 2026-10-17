@@ -55,7 +55,8 @@ pub struct Config {
     /// to add to an `Instant`, such as `Duration::MAX`, means wait forever.
     pub timeout: Duration,
     /// Total number of attempts per query, across all servers: attempt `n`
-    /// goes to server `n` modulo their number. Switching to TCP, dropping
+    /// goes to server `first + n` modulo their number, where `first` is the
+    /// first one that hasn't failed recently (see `failure_memory`). Switching to TCP, dropping
     /// EDNS and resending after a lost connection don't count as one; see
     /// the crate docs on how a query moves on.
     pub attempts: NonZeroUsize,
@@ -70,6 +71,12 @@ pub struct Config {
     /// the resolver asks for it to be closed (RFC 7766 §6.2.3), counted
     /// from the last write or read on it.
     pub idle_timeout: Duration,
+    /// How long a server that failed to answer, by timing out or with a
+    /// network error, stays failed: until then, new queries start at the
+    /// next server in the list instead, and their attempts rotate on from
+    /// there. An answer from the server, even an error code, ends it early.
+    /// Zero turns it off.
+    pub failure_memory: Duration,
     /// Static entries answered before DNS, like `/etc/hosts`. Empty by
     /// default; fill it with [`Hosts::parse`].
     pub hosts: Hosts,
@@ -83,6 +90,8 @@ pub struct Config {
 
 impl Config {
     /// `first` and then `more`, two attempts per server, two seconds each.
+    /// A server that fails to answer is tried after the others for a
+    /// minute.
     pub fn new(first: SocketAddr, more: impl IntoIterator<Item = SocketAddr>) -> Self {
         let servers: Vec<SocketAddr> = std::iter::once(first).chain(more).collect();
         let attempts = NonZeroUsize::new(servers.len() * 2).unwrap_or(NonZeroUsize::MIN);
@@ -93,6 +102,7 @@ impl Config {
             search: Vec::new(),
             ndots: 1,
             idle_timeout: Duration::from_secs(10),
+            failure_memory: Duration::from_secs(60),
             hosts: Hosts::default(),
             ip_strategy: IpStrategy::default(),
             #[cfg(feature = "tls")]
@@ -201,6 +211,10 @@ impl Config {
         } else {
             searched.chain(std::iter::once(absolute)).collect()
         }
+    }
+
+    pub(crate) fn servers(&self) -> &[SocketAddr] {
+        &self.servers
     }
 
     /// The server for the given attempt, rotating through the list.

@@ -67,8 +67,9 @@ The `Resolver` is a state machine over two maps: pending queries
 `handle_stream_data/closed/error`, `handle_timeout` and `cancel`; outputs are drained with
 `poll_transmit`, `poll_event` and `poll_timeout`.
 
-- A query's `attempt` index picks its server (`Config::server` rotates through the list) and is
-  bounded by `Config::attempts`. Its `Route` is `Udp` or `Stream(Option<ConnectionId>)`.
+- A query's `first + attempt` picks its server (`Config::server` rotates through the list);
+  `first` skips servers in `Resolver::failed` (no answer within `Config::failure_memory`), and
+  `attempt` is bounded by `Config::attempts`. Its `Route` is `Udp` or `Stream(Option<ConnectionId>)`.
 - Streams: one connection per server, shared and pipelined by all queries to it (RFC 7766), with
   answers matched by ID and question. DoT sessions live inside `Connection` and are driven
   in memory through `src/tls.rs`; the driver only moves bytes.

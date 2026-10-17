@@ -24,11 +24,13 @@
 //!
 //! # How a query moves on
 //!
-//! Each query has [`Config::attempts`] attempts, and attempt `n` goes to
-//! server `n` modulo the number of servers, so with one server every attempt
-//! goes to it. Answers are matched by message ID and question, which are
-//! the same for every attempt, so an answer to an earlier attempt still
-//! counts if it comes from the server of the current one.
+//! Each query has [`Config::attempts`] attempts. Its first goes to the first
+//! server in the list that hasn't failed to answer within
+//! [`Config::failure_memory`], and each next attempt to the server after
+//! that, wrapping around, so with one server every attempt goes to it.
+//! Answers are matched by message ID and question, which are the same for
+//! every attempt, so an answer to an earlier attempt still counts if it
+//! comes from the server of the current one.
 //!
 //! | What happens | What the query does next | Server | Uses an attempt | Deadline |
 //! |---|---|---|---|---|
@@ -40,7 +42,7 @@
 //! | Another query on its connection times out | is sent again over another connection, once per query, shared with the row above | same | no | kept |
 //! | The same, a second time | sends its next attempt | next | yes | fresh |
 //! | A connection that never answered is lost, or TLS rejects bytes received on any connection | sends its next attempt | next | yes | fresh |
-//! | `NXDOMAIN` with search candidates left | starts over with the next candidate: new message ID, with EDNS, back on UDP unless over TLS, a new free resend | first | fresh attempts | fresh |
+//! | `NXDOMAIN` with search candidates left | starts over with the next candidate: new message ID, with EDNS, back on UDP unless over TLS, a new free resend | first that hasn't failed | fresh attempts | fresh |
 //! | It was the first to join a query that is cancelled (see below) | takes the query over; over UDP the current attempt is sent again from its own socket | same | no | fresh over UDP, kept on a stream |
 //! | Out of attempts | fails with the last error | | | |
 //!
