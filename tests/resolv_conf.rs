@@ -112,6 +112,19 @@ mod search {
         assert_eq!(response.metadata.response_code, ResponseCode::NXDomain);
     }
 
+    /// resolv-conf's default `ndots` is 1, as glibc's.
+    #[rstest]
+    #[case::no_dots("db", &["db.a.example.", "db.b.example.", "db."])]
+    #[case::one_dot("db.x", &["db.x.", "db.x.a.example.", "db.x.b.example."])]
+    fn default_ndots_is_one(#[case] name: &str, #[case] expected: &[&str]) {
+        let conf = "nameserver 192.0.2.53\nsearch a.example b.example\n";
+        assert_eq!(Config::from_resolv_conf(conf.as_bytes()).unwrap().ndots, 1);
+
+        let (asked, _) = tried(conf, name, ResponseCode::NXDomain);
+
+        assert_eq!(asked, expected);
+    }
+
     /// NOERROR, with or without records, means the name exists: stop.
     #[test]
     fn existing_name_ends_the_search() {

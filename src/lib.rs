@@ -29,27 +29,37 @@
 //! the same for every attempt, so an answer to an earlier attempt still
 //! counts if it comes from the server of the current one.
 //!
-//! | What happens | What the query does next | Server | Uses an attempt |
-//! |---|---|---|---|
-//! | No answer by its deadline | sends its next attempt | next | yes |
-//! | `SERVFAIL`, `REFUSED`, `NOTIMP`, or `FORMERR` with OPT | sends its next attempt | next | yes |
-//! | Truncated answer over UDP | switches to TCP, once: later attempts stay on TCP | same | no |
-//! | `FORMERR` without OPT (not over TLS) | drops EDNS, once: later attempts stay without it | same | no |
-//! | A connection that had answered is lost, or another query on its connection times out | is sent again on a new connection, once per query | same | no |
-//! | A connection that never answered is lost, or TLS fails | sends its next attempt | next | yes |
-//! | `NXDOMAIN` with search candidates left | starts over with the next candidate | first | fresh attempts |
-//! | Out of attempts | fails with the last error | | |
+//! | What happens | What the query does next | Server | Uses an attempt | Deadline |
+//! |---|---|---|---|---|
+//! | No answer by its deadline | sends its next attempt | next | yes | fresh |
+//! | `SERVFAIL`, `REFUSED`, `NOTIMP`, or any other `FORMERR` | sends its next attempt | next | yes | fresh |
+//! | Truncated answer over UDP | switches to TCP; later attempts stay on TCP | same | no | fresh |
+//! | `FORMERR` without OPT to a query that still has EDNS (not over TLS) | drops EDNS, once; later attempts stay without it | same | no | fresh |
+//! | The server closes, or I/O fails on, a connection that had answered | is sent again over another connection to that server, once per query | same | no | fresh |
+//! | Another query on its connection times out | is sent again over another connection, once per query, shared with the row above | same | no | kept |
+//! | The same, a second time | sends its next attempt | next | yes | fresh |
+//! | A connection that never answered is lost, or TLS rejects bytes received on any connection | sends its next attempt | next | yes | fresh |
+//! | `NXDOMAIN` with search candidates left | starts over with the next candidate: new message ID, with EDNS, back on UDP unless over TLS, a new free resend | first | fresh attempts | fresh |
+//! | It was the first to join a query that is cancelled (see below) | takes the query over; over UDP the current attempt is sent again from its own socket | same | no | fresh over UDP, kept on a stream |
+//! | Out of attempts | fails with the last error | | | |
 //!
-//! Over a lost connection the query gets a fresh deadline; after another
-//! query's timeout it keeps its own. So for one name, a query is sent at
-//! most `attempts + 3` times. Any other answer (`NOERROR`, or `NXDOMAIN`
-//! with no candidate left) ends the query, and so does a server error on
-//! the last attempt: the search moves on only on `NXDOMAIN`.
+//! If a TLS session can't be started or written to, the query fails at once
+//! with [`Error::Tls`]. Any answer other than those above (`NOERROR`, or
+//! `NXDOMAIN` with no candidate left) ends the query, and so does a server
+//! error on the last attempt: the search moves on only on `NXDOMAIN`.
 //!
-//! A query for the same name and type as one in flight joins it instead of
-//! being sent, and gets its outcome. One that joined after the first one
-//! started starts over with attempts of its own if the first runs out.
-//! [`Resolver::cancel`] hands a query that others joined to the next of
+//! Each search candidate is sent at most `attempts + 3` times: once per
+//! attempt, plus at most one switch to TCP, one EDNS drop and one free
+//! resend. With k candidates that is k × (`attempts` + 3). Not counted are
+//! the datagram a query sends again when it takes over a cancelled one, and
+//! a late joiner starting over with attempts of its own.
+//!
+//! A query for the same name (as given, trailing dot included, case ignored)
+//! and type as one in flight joins it instead of being sent, and gets its
+//! outcome. If the first one runs out of attempts, the queries that joined
+//! after its current search candidate started don't share the failure: the
+//! first of them starts over as a new query, and the others join it.
+//! [`Resolver::cancel`] hands a query that others joined to the first of
 //! them.
 //!
 //! # Driver obligations
@@ -67,7 +77,13 @@
 //! The resolver keeps one connection per server open and sends further
 //! queries over it, several at a time (RFC 7766 §6.2.1, RFC 7858 §3.4). It
 //! asks for the connection to be closed once it has been idle for
-//! [`Config::idle_timeout`], or when a query on it times out.
+//! [`Config::idle_timeout`], when a query on it times out, or, with `tls`,
+//! when TLS rejects bytes received on it.
+//!
+//! A [`Transport::TcpWrite`] can follow its [`Transport::TcpConnect`]
+//! before connecting has finished: queue it. After reporting a connection
+//! closed or failed, forget it; no [`Transport::TcpClose`] follows. A UDP
+//! send that fails needs no call: the query times out and moves on.
 //!
 //! For UDP, [RFC 5452 §9.2] requires an unpredictable source port, and a
 //! different one for each outstanding query. The resolver can't choose
@@ -75,7 +91,10 @@
 //! ([`Transport::Udp`] names it) and pass that query along with every
 //! datagram the socket receives to [`Resolver::handle_datagram`]. The
 //! resolver checks everything else §9.1 asks for: source address and port,
-//! message ID and question.
+//! message ID and question. Bind each socket in the destination's address
+//! family, pass the source address as received (an IPv4 server seen as
+//! `::ffff:a.b.c.d` on a dual-stack socket won't match), and read into a
+//! buffer of at least 1232 bytes, the payload size the queries advertise.
 //!
 //! [RFC 5452 §9.2]: https://rfc-annotations.research.icann.org/rfc5452.html
 
@@ -157,7 +176,8 @@ pub enum Event {
 /// Why a query failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
-    /// No server answered within the configured attempts.
+    /// The last attempt got no answer by its deadline, or its connection was
+    /// closed because another query on it timed out.
     #[error("no response from any name server")]
     Timeout,
     /// The last TCP connection closed before a complete response arrived.

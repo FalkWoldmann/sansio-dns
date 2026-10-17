@@ -67,6 +67,8 @@ pub(crate) fn special_use(name: &Name, record_type: RecordType) -> Option<Messag
 }
 
 /// Whether `response` answers `request` (RFC 5452 §9.1, RFC 1035 §7.3).
+/// `Query` equality compares name, type and class, and hickory's `Name`
+/// equality ignores case (RFC 1035 §2.3.3) but not the trailing dot.
 pub(crate) fn is_reply(request: &Message, response: &Message) -> bool {
     response.metadata.message_type == MessageType::Response
         && request.metadata.id == response.metadata.id

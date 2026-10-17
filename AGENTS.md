@@ -57,8 +57,10 @@ doesn't start with `tests/`) keeps `#![expect(...)]`.
 
 ## Architecture
 
-The core is split into `src/lib.rs` (crate docs and public types), `src/config.rs`,
-`src/wire.rs` (framing, padding, reply matching, special-use answers) and `src/resolver.rs`.
+The core has seven modules: `src/lib.rs` (crate docs and public types), `src/config.rs`
+(`Config`, resolv.conf), `src/hosts.rs` (hosts file entries), `src/wire.rs` (framing, padding,
+reply matching, special-use answers), `src/resolver.rs` (the state machine), `src/lookup.rs`
+(`IpLookup`) and `src/tls.rs` (DoT sessions driven in memory, `tls` feature).
 The `Resolver` is a state machine over two maps: pending queries
 (`QueryId` -> `Pending`) and stream connections (`ConnectionId` -> `Connection`). Inputs are
 `query`, `handle_datagram(query, from, ..)`, `handle_stream_data/closed/error`, `handle_timeout`
@@ -73,11 +75,14 @@ and `cancel`; outputs are drained with `poll_transmit`, `poll_event` and `poll_t
   (next server, uses an attempt), `switch_to_tcp` and `drop_edns` (same server, free), `resend`
   (same server, free once per query via `forgive`, used by `lost` and `time_out_stream`),
   `next_candidate` (next search name, fresh attempts), `give_up` and `fail`. The crate docs'
-  "How a query moves on" table states the rules (at most `attempts + 3` sends per name): change
-  these functions together and keep the table in sync.
+  "How a query moves on" table states the rules (at most `attempts + 3` sends per search
+  candidate, not counting a cancel hand-over's resend or a late joiner's fresh start), and a
+  comment above `retry` maps each row to its function: change these functions together and keep
+  the table in sync.
 - A query for the same name (as given) and type as a pending one joins it as a follower
   (`Pending::followers`) and gets its outcome. When the leader runs out of attempts, followers
-  that joined after it started start over (`give_up`); `cancel(id, now)` hands a query with
+  that joined after its current search candidate started start over (`give_up`);
+  `cancel(id, now)` hands a query with
   followers to the first of them, re-sending a UDP attempt from the follower's own socket.
 - Special-use names (`localhost.`, `invalid.`, `onion.`) and `Config::hosts` entries are answered
   without a transmit. `IpLookup` (`src/lookup.rs`) runs the A and AAAA queries on a `Resolver`
@@ -96,18 +101,22 @@ that limitation is documented, not handled.
 
 ## Tests
 
-`tests/rfc<number>.rs` hold one module per RFC section, and the README's spec coverage table
-lists the behaviour each section pins: keep the table in sync when behaviour changes.
+`tests/rfc<number>.rs` mostly hold one module per RFC section (the README lists the
+exceptions), and the README's spec coverage table lists the behaviour each section pins: keep
+the table in sync when behaviour changes.
 `tests/common/mod.rs` has the fixtures (a resolver with servers `S1`, `S2`, and helpers to
 start a query, build replies, frame and encode them; `start_distinct` for queries that must
 not coalesce) and `Trace`, which drives a resolver and renders each input, its events, its
 transmits and the next deadline as text. Tests of a query's lifecycle assert that text as an
 insta inline snapshot (`assert_snapshot!(trace, @"...")`): after a deliberate behaviour change,
 run `cargo insta test --review` (or `--accept`) and read every changed snapshot against the
-crate docs' lifecycle table before accepting it. `tests/state_machine.rs` is a
-proptest-state-machine test: random driver-call sequences against a reference model, with
-invariants checked after every step and failures shrunk to short call sequences. It doesn't
-check deadlines; the snapshots pin those.
+crate docs' lifecycle table before accepting it. `Trace` decodes plaintext DNS only, so the
+DoT lifecycle tests in `tests/rfc7858.rs` (`tls` feature) use their in-process rustls server
+and plain assertions. `tests/state_machine.rs` is a proptest-state-machine test: random
+driver-call sequences against a reference model, with invariants checked after every step and
+failures shrunk to short call sequences. Of the deadlines it only checks that there is one
+exactly when queries are pending or connections are open, and that it is in the future; the
+snapshots pin their values.
 
 ## Conventions
 

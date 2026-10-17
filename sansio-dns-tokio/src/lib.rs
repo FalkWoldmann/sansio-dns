@@ -22,9 +22,13 @@
 //! it while some thread is blocked on it: while that runtime sits idle,
 //! lookups from the others hang. When the task's runtime shuts down, the
 //! next lookup, or one that was waiting on it, starts a new task on its own
-//! runtime; only a stopped task is ever replaced. The task ends when the
-//! last clone is dropped: a lookup borrows its resolver (and reqwest's
-//! holds a clone), so no lookup can outlive every clone and keep it going.
+//! runtime; only a stopped task is ever replaced. Connections and queries
+//! in flight on a stopped task are lost. A waiting lookup that finds its
+//! stopped task already replaced by one that still runs gets a task of its
+//! own, not shared with the clones, which ends with that lookup. The shared
+//! task ends when the last clone is dropped: a lookup borrows its resolver
+//! (and reqwest's holds a clone), so no lookup can outlive every clone and
+//! keep it going.
 //!
 //! With the `reqwest` feature, [`Resolver`] also implements
 //! `reqwest::dns::Resolve`:
@@ -177,10 +181,16 @@ impl Shared {
     }
 
     /// Hand `request` to a new task on the current runtime, since the task
-    /// behind `stale` stopped without answering. Another lookup may have
-    /// replaced that task already, on a runtime that might sit idle, so the
-    /// new task is used either way; it becomes the shared one if `stale`'s
-    /// still is.
+    /// behind `stale` stopped without answering. The new task is used for
+    /// this lookup in any case, and becomes the shared one when the shared
+    /// slot:
+    ///
+    /// - is empty or still holds `stale`: nobody replaced it yet;
+    /// - holds a task that has stopped since: it's no better than `stale`.
+    ///
+    /// If another lookup already replaced it with a live task, possibly on
+    /// a runtime that sits idle, that one stays shared, and the new task
+    /// serves only this lookup and ends with it.
     fn restart(
         &self,
         stale: &mpsc::UnboundedSender<Request>,

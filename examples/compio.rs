@@ -3,8 +3,11 @@
 //! compio is completion-based, so buffers are moved into each operation and
 //! handed back with the result. The resolver doesn't care: it only sees bytes.
 //!
-//! Handles one query. While a TCP connection is open it reads only from that,
-//! since the resolver ignores UDP replies once a query has switched to TCP.
+//! Handles one query, so the socket bound up front stands in for that
+//! query's own; a driver with several binds one per `Transport::Udp` query,
+//! in the server's address family, as sansio-dns-tokio does. While a TCP
+//! connection is open it reads only from that, since the resolver ignores
+//! UDP replies once a query has switched to TCP.
 
 #![expect(
     clippy::disallowed_methods,

@@ -31,10 +31,12 @@ pub struct Config {
     /// Empty means every name is used as given.
     pub search: Vec<Name>,
     /// A name with at least this many dots is tried as given before the
-    /// search domains; one with fewer, after them.
+    /// search domains; one with fewer, after them. `db` has no dots and
+    /// `db.x` has one.
     pub ndots: u8,
-    /// How long a stream connection may sit without queries before the
-    /// resolver asks for it to be closed (RFC 7766 §6.2.3).
+    /// How long a stream connection may go without any query on it before
+    /// the resolver asks for it to be closed (RFC 7766 §6.2.3), counted
+    /// from the last write or read on it.
     pub idle_timeout: Duration,
     /// Static entries answered before DNS, like `/etc/hosts`. Empty by
     /// default; fill it with [`Hosts::parse`].
@@ -146,6 +148,7 @@ impl Config {
             .iter()
             .filter_map(|domain| name.clone().append_domain(domain).ok())
             .filter(|candidate| !is_special_use(candidate));
+        // `num_labels` doesn't count the root label.
         let dots = usize::from(name.num_labels()).saturating_sub(1);
         if dots >= usize::from(self.ndots) {
             std::iter::once(absolute).chain(searched).collect()

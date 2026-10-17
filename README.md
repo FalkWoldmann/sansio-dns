@@ -118,20 +118,23 @@ Where the two behave differently:
 
 Behavior follows the RFCs as listed and annotated at
 [rfc-annotations.research.icann.org](https://rfc-annotations.research.icann.org/).
-Tests live in `tests/rfc<number>.rs`, with one module per section; `tests/main.rs` builds
-them all as one crate.
+Tests mostly live in `tests/rfc<number>.rs`, with one module per section. The exceptions:
+RFC 1034 is in `tests/lookup.rs`; RFC 6762 and 7686 are tested in `rfc6761.rs`'s §6.4 module;
+`rfc7858.rs` holds the RFC 7858, 8310 and 8467 tests as plain functions, without section
+modules; and `rfc7766.rs` also has `stream_timeout` and `lost_connection` modules.
+`tests/main.rs` builds them all as one crate.
 
 | RFC | Section | Behavior |
 |---|---|---|
 | 1035 | §2.3.3 | Question names are compared case-insensitively |
-| 1035 | §3.1 | Names are absolute; `example.com` and `example.com.` are the same query |
-| 1035 | §4.1.1 | `RD` set; `NOERROR`/`NXDOMAIN` end the query; `SERVFAIL`/`NOTIMP`/`REFUSED` fail over |
+| 1035 | §3.1 | Names are absolute: without search domains, `example.com` and `example.com.` ask the same question |
+| 1035 | §4.1.1 | `RD` set; `NOERROR` ends the query, and `NXDOMAIN` does once no search candidate is left; `SERVFAIL`/`NOTIMP`/`REFUSED` fail over |
 | 1035 | §4.2.1 | `TC` set → retry over TCP (RFC 7766) |
 | 1035 | §7.2 | Retransmit on timeout, rotating through servers |
 | 1035 | §7.3 | Non-responses (`QR=0`) and wrong opcodes are discarded |
 | 5452 | §9.1 | Responses must match source address, port, ID, QNAME, QTYPE and QCLASS |
 | 5452 | §4.6 | Only the first matching response is accepted |
-| 5452 | §9.2 | IDs from a CSPRNG, unique among outstanding queries; per-query source ports are the driver's job (see below) |
+| 5452 | §9.2 | IDs from a CSPRNG, avoiding those of outstanding queries (up to 16 picks); per-query source ports are the driver's job (see below) |
 | 6891 | §6.2.3 | One OPT record, 1232-byte payload (DNS Flag Day 2020) |
 | 6891 | §7, §6.2.2 | `FORMERR` without OPT → same server once more without EDNS (over TLS: fail over, since EDNS carries the padding); with OPT → fail over |
 | 7766 | §5 | Truncated UDP response → same server over TCP; later attempts stay on TCP; UDP replies then ignored |
@@ -159,9 +162,16 @@ to the destination and write the payload, `TcpWrite(id)` write to it, `TcpClose(
 it. Payloads are already length-prefixed or TLS-encrypted. Pass everything read to
 `handle_stream_data(id, …)`. Call `handle_stream_closed(id, …)` if the server closes the
 connection, and `handle_stream_error(id, kind, …)` if connecting, reading or writing fails,
-so a query out of attempts fails with that error. The resolver keeps one connection per server and pipelines queries over it;
-it closes the connection after `Config::idle_timeout` (10 s) without queries, or when a
-query on it times out.
+so a query out of attempts fails with that error. The resolver keeps one connection per
+server and pipelines queries over it; it closes the connection after `Config::idle_timeout`
+(10 s) without queries, when a query on it times out, or, with `tls`, when TLS rejects bytes
+received on it.
+
+A `TcpWrite` can follow its `TcpConnect` before connecting has finished, so queue it. After
+reporting a connection closed or failed, forget it: no `TcpClose` follows. A UDP send that
+fails needs no call, since the query times out and moves on. Bind each socket in the
+destination's address family, pass the source address as received (an IPv4 server seen as
+`::ffff:a.b.c.d` won't match), and read datagrams into a buffer of at least 1232 bytes.
 
 ### Not implemented
 
@@ -171,7 +181,7 @@ query on it times out.
 - `resolv.conf` options other than the ones above (`rotate`, `use-vc`, `sortlist`, …).
 - `IpLookup` searches A and AAAA independently, so the two could end on different candidates.
 - Once EDNS is dropped for a query, it stays off for that query's remaining attempts,
-  including other servers.
+  including other servers, until the search moves to the next candidate.
 
 ## Testing
 
@@ -187,12 +197,12 @@ Parameterized cases use [rstest](https://crates.io/crates/rstest); properties su
 The `fuzz/` crate has [cargo-fuzz](https://crates.io/crates/cargo-fuzz) targets that
 drive the resolver with arbitrary datagrams (`datagram`), TCP bytes (`stream`), DoT
 records (`tls_stream`), hosts and resolv.conf files (`system_files`) and call sequences
-(`driver_ops`). After every step they check what the state machine proptest checks: one
-event per query, transmits only for live queries and open connections, a bounded number
-of sends per query, and a timer exactly while something is pending. `system_files` also
-checks the local answers for hosts and special-use names and the order of the search
-candidates, and `tls_stream` checks that every query the server decrypts keeps EDNS and is
-padded to a multiple of 128 octets. They need nightly:
+(`driver_ops`). After every step they check one event per query, transmits only for live
+queries and open connections, and a timer exactly while something is pending; `datagram`,
+`stream` and `driver_ops` also bound the sends per query. `system_files` checks the local
+answers for hosts and special-use names and the order of the search candidates, and
+`tls_stream` checks that every query the server decrypts keeps EDNS, is padded to a multiple
+of 128 octets and is sent at most `attempts + 3` times. They need nightly:
 
 ```sh
 cd fuzz && cargo fuzz run driver_ops -- -max_total_time=60 -timeout=5

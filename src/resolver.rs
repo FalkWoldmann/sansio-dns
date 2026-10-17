@@ -29,15 +29,20 @@ struct Pending {
     /// Search candidates still to try if this name doesn't exist.
     rest: VecDeque<Name>,
     /// Whether its attempt was already sent again for free, after losing a
-    /// working connection or being moved off a timed-out one. That happens
-    /// once per query; see `Resolver::forgive`.
+    /// working connection or being moved off a timed-out one. The two
+    /// share it: after one free resend, from either, the next one from
+    /// either uses up an attempt. Reset for each search candidate; see `Resolver::forgive`.
     forgiven: bool,
     /// The name and type as asked, before search domains. A later query
-    /// for the same pair joins this one instead of being sent.
+    /// for the same pair joins this one instead of being sent. hickory's
+    /// `Name` equality ignores case but not the trailing dot.
     asked: (Name, RecordType),
-    /// When this query, or its current search candidate, started.
+    /// When this query's current search candidate started; joiners from
+    /// after this instant don't share its failure (`Resolver::give_up`).
     started: Instant,
     /// Queries that joined this one, and when; each gets its outcome too.
+    /// Every `QueryId` in flight is in exactly one place: a key of
+    /// `Resolver::pending`, or one leader's followers.
     followers: Vec<(QueryId, Instant)>,
 }
 
@@ -100,7 +105,9 @@ impl Resolver {
     /// candidate is tried while the answer is NXDOMAIN, and the event carries
     /// the last answer. Any other answer, or a server error on the last
     /// attempt, ends the search. Without search domains, `example.com` and
-    /// `example.com.` are the same query.
+    /// `example.com.` send the same question, but only a query for the same
+    /// name as given (trailing dot included, case ignored) joins one in
+    /// flight.
     ///
     /// Special-use names are answered at once, without a transmit:
     /// `localhost` gets the loopback address (RFC 6761 §6.3), and names
@@ -235,8 +242,10 @@ impl Resolver {
     /// compared case-insensitively. Spoofed answers and answers from servers
     /// tried before can't complete it, but a late answer from the current
     /// server to an earlier attempt can, since attempts keep their message
-    /// ID. Naming the socket keeps each query's source port its own (§9.2).
-    /// Once the query has switched to TCP, UDP replies to it are ignored.
+    /// ID. For the same reason a duplicated answer is acted on again: with
+    /// one server, a repeated `SERVFAIL` uses up another attempt. Naming the
+    /// socket keeps each query's source port its own (§9.2). Once the query
+    /// has switched to TCP, UDP replies to it are ignored.
     pub fn handle_datagram(&mut self, query: QueryId, from: SocketAddr, data: &[u8], now: Instant) {
         // The cheap checks first, so stray datagrams cost no parsing.
         let Some(pending) = self.pending.get(&query) else {
@@ -327,11 +336,13 @@ impl Resolver {
     ///
     /// If the connection had answered before, the server most likely closed
     /// it for being idle while a query was on its way (RFC 7766 §6.2.3):
-    /// each query on it is sent once more to the same server, on a new
-    /// connection, with a fresh deadline and without using up an attempt.
-    /// Otherwise, and for a query already resent this way, the query moves on
-    /// to its next attempt, still over a stream, and a query out of attempts
-    /// fails with [`Error::ConnectionClosed`].
+    /// each query on it is sent once more to the same server, over another
+    /// connection, without using up an attempt. Its deadline starts over:
+    /// the close can come at any time, even just before the old deadline,
+    /// and the query most likely never reached the server. Otherwise, and
+    /// for a query already resent for free, the query moves on to its next
+    /// attempt, still over a stream, and a query out of attempts fails with
+    /// [`Error::ConnectionClosed`]. No [`Transport::TcpClose`] follows.
     pub fn handle_stream_closed(&mut self, connection: ConnectionId, now: Instant) {
         self.lost(connection, now, &Error::ConnectionClosed);
     }
@@ -350,7 +361,8 @@ impl Resolver {
     }
 
     /// `connection` went away without being asked to; see
-    /// [`Resolver::handle_stream_error`].
+    /// [`Resolver::handle_stream_closed`]. Emits no `TcpClose`: the driver
+    /// reported the connection gone.
     fn lost(&mut self, connection: ConnectionId, now: Instant, error: &Error) {
         let Some(conn) = self.connections.remove(&connection) else {
             return;
@@ -408,8 +420,14 @@ impl Resolver {
     ///
     /// A query that times out on a stream suggests the connection is dead,
     /// so the connection is closed. The queries that timed out move on to
-    /// their next attempt, and the others go to a new connection to the same
-    /// server with their attempt and deadline unchanged, once per query.
+    /// their next attempt, and the others go to another connection to the
+    /// same server with their attempt and deadline unchanged, once per query.
+    ///
+    /// Calling it before [`Resolver::poll_timeout`]'s instant does nothing.
+    /// Calling it late handles every deadline that has passed in one step,
+    /// with new deadlines counted from `now`; queries on a timed-out
+    /// connection whose own deadline has also passed then use up an
+    /// attempt instead of moving for free.
     pub fn handle_timeout(&mut self, now: Instant) {
         let expired: Vec<QueryId> = self
             .pending
@@ -429,7 +447,11 @@ impl Resolver {
                 Route::Stream(Some(connection)) if self.connections.contains_key(&connection) => {
                     self.time_out_stream(connection, now);
                 }
-                _ => self.retry(id, now, Error::Timeout),
+                // A stream query only lands here if its connection is gone or
+                // it waits for one, which can't happen: every path that removes
+                // a connection moves its queries on first. Treated as a plain
+                // timeout to be safe.
+                Route::Udp | Route::Stream(_) => self.retry(id, now, Error::Timeout),
             }
         }
         let idle: Vec<ConnectionId> = self
@@ -449,12 +471,17 @@ impl Resolver {
         }
     }
 
-    /// Next datagram to send, if any.
+    /// Next transmit to carry out, if any: a datagram, or a stream connect,
+    /// write or close.
     pub fn poll_transmit(&mut self) -> Option<Transmit> {
         self.transmits.pop_front()
     }
 
     /// Earliest instant at which [`Resolver::handle_timeout`] must be called.
+    /// `None` means no timer is needed: no pending query has a deadline
+    /// (there is none, or [`Config::timeout`] is too large for an `Instant`)
+    /// and no open connection is waiting out [`Config::idle_timeout`]. An
+    /// idle connection keeps a timer running after the last query is done.
     pub fn poll_timeout(&self) -> Option<Instant> {
         let queries = self.pending.values().filter_map(|p| p.deadline);
         let idle = self
@@ -483,12 +510,16 @@ impl Resolver {
         self.events.pop_front()
     }
 
-    /// Stop tracking a query. No event is emitted for it.
+    /// Stop tracking a query. No event is queued for it from now on (one
+    /// already queued, such as a special-use answer, still comes out of
+    /// [`Resolver::poll_event`]), so the driver can close its socket now.
     ///
-    /// Queries that joined it go on: the first of them takes it over. If it
-    /// waits for a datagram, its current attempt is sent again from that
-    /// query's own socket ([`Transport::Udp`]), to the same server, with a
-    /// fresh deadline.
+    /// Queries that joined it go on, and the first of them takes it over. If
+    /// its attempt went over UDP, that attempt is sent again as
+    /// [`Transport::Udp`] for the heir, to the same server, with a fresh
+    /// deadline: bind a new socket for it. Over a stream nothing is sent; the
+    /// answer still arrives on the same connection, and the heir keeps the
+    /// deadline.
     pub fn cancel(&mut self, id: QueryId, now: Instant) {
         let Some(mut pending) = self.pending.remove(&id) else {
             for p in self.pending.values_mut() {
@@ -512,9 +543,29 @@ impl Resolver {
         self.transmits.extend(resend);
     }
 
+    // How a query moves on, row by row of the crate docs' table, and the
+    // state that keeps each free step to once per search candidate:
+    //
+    // - no answer by its deadline, server error: `retry`
+    // - truncated over UDP: `switch_to_tcp`, once because `route` never goes
+    //   back to `Route::Udp`
+    // - FORMERR without OPT: `drop_edns`, once because `request.edns` is
+    //   taken
+    // - working connection lost: `lost`, then `forgive` and `resend`
+    // - neighbour timed out on the connection: `time_out_stream`, then
+    //   `forgive` and `resend` (the same `forgiven` flag), else `retry`
+    // - connection that never answered lost, TLS error on received bytes:
+    //   `lost` or `close`, then `retry`
+    // - NXDOMAIN with candidates left: `next_candidate`, which resets all of
+    //   the above with a new `Pending`
+    // - joined query cancelled: `cancel`, not limited (each hand-over over
+    //   UDP sends again; the crate docs' send bound leaves it out)
+    // - out of attempts: `give_up`, then `fail`
+
     /// Send `id` to the next server, or fail it with `error` if it is out of
-    /// attempts. The route stays: after a truncated answer, later attempts
-    /// also go over TCP.
+    /// attempts. The route stays, so after a truncated answer later attempts
+    /// also go over TCP, and with TLS every attempt stays off UDP (RFC 7858
+    /// §3): `emit` opens or reuses a connection to the new server.
     fn retry(&mut self, id: QueryId, now: Instant, error: Error) {
         let Some(pending) = self.pending.get_mut(&id) else {
             return;
@@ -539,9 +590,11 @@ impl Resolver {
 
     /// A query on `connection` timed out, which suggests the connection is
     /// dead: close it. The queries that timed out move on to their next
-    /// attempt. The others are sent again on a new connection to the same
-    /// server, keeping their attempt and deadline, since another lookup's
-    /// slow answer is no fault of theirs; but only once per query, so a
+    /// attempt. The others are sent again over another connection to the
+    /// same server, keeping their attempt, since another lookup's slow
+    /// answer is no fault of theirs. They keep their deadline too: they have
+    /// been waiting on the same unresponsive server, and a free move must
+    /// not stretch how long it can hold them. Only once per query, so a
     /// server that stops answering costs each query a bounded number of
     /// sends.
     fn time_out_stream(&mut self, connection: ConnectionId, now: Instant) {
@@ -574,7 +627,7 @@ impl Resolver {
     }
 
     /// Send `id`'s current attempt again over a stream to the same server,
-    /// without using up an attempt.
+    /// on its open connection or a new one, without using up an attempt.
     fn resend(&mut self, id: QueryId, now: Instant) {
         if let Some(pending) = self.pending.get_mut(&id) {
             pending.route = Route::Stream(None);
@@ -746,9 +799,12 @@ impl Resolver {
         Ok(())
     }
 
-    /// `id` is out of attempts. Queries that joined it after it started
-    /// haven't had attempts of their own yet: instead of sharing the failure
-    /// they start over, the first as a new query that the others join.
+    /// `id` is out of attempts. Queries that joined it after its current
+    /// search candidate started haven't had attempts of their own yet:
+    /// instead of sharing the failure they start over, the first as a new
+    /// query that the others join. The comparison is strict on purpose: a
+    /// query that joined at the very instant the candidate started, such as
+    /// a duplicate issued in the same tick, shares its failure.
     fn give_up(&mut self, id: QueryId, error: Error, now: Instant) {
         let Some(pending) = self.pending.get_mut(&id) else {
             return;
