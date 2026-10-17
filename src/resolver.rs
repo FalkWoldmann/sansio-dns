@@ -1,5 +1,32 @@
 //! The resolver state machine: queries in flight, stream connections, and
 //! how a query moves on.
+//!
+//! A query in flight is a `Pending`, under its `QueryId` in
+//! `Resolver::pending`, or a `QueryId` that joined one
+//! (`Pending::followers`). `Pending` has the table of a query's states. A
+//! stream connection is a `Connection`, under its `ConnectionId` in
+//! `Resolver::connections`. `Connection` lists the ways it ends, and over
+//! TLS it holds a `tls::Session`, which lists its phases. The cache's
+//! `Entry` and `IpLookup` document theirs where they are defined. The
+//! crate docs' "How a query moves on" table says which server, attempt and
+//! deadline each move of a query takes, and the comment above
+//! `Resolver::retry` maps its rows to the functions here.
+//!
+//! `Resolver::poll_timeout` is the earliest of the queries' deadlines
+//! (`Pending::deadline`) and the connections' idle deadlines
+//! (`Resolver::idle_deadline`). The cache and the failure memory
+//! (`Resolver::failed`) read `now` only when they are used, so they add no
+//! deadline.
+//!
+//! `Resolver::pending` and `Resolver::connections` are `BTreeMap`s, so the
+//! order of their IDs shows in the outputs. `Resolver::handle_timeout`
+//! takes the queries whose deadline has passed in `QueryId` order, the
+//! queries on a connection that closes move on in that order, and
+//! `Resolver::stream_match` tries a connection's queries in that order
+//! before its orphans for a reply with a question; one without a question
+//! matches only if exactly one of them could be its query. Idle
+//! connections, and every connection at `Resolver::shutdown`, close in
+//! `ConnectionId` order.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
@@ -28,50 +55,93 @@ use crate::{Config, ConnectionId, Error, Event, QueryId, Transmit, Transport};
 /// otherwise use up the ID space (RFC 7766 §6.2.1, §6.2.4).
 const MAX_ORPHANS: usize = 256;
 
+/// A query in flight that is sent, for itself and the queries that joined
+/// it.
+///
+/// A `QueryId` is in one of these states: none, an ID that `query` hasn't
+/// issued yet; a leader, whose current attempt went over UDP (Udp,
+/// `Route::Udp`) or to connection c (Stream(c), `Route::Stream`); a
+/// follower, in one leader's `followers`; or gone. In the table, a query
+/// that sends goes through `Resolver::emit`, which picks UDP or a stream,
+/// and stays a leader. One that moves on (`Resolver::advance`) sends its
+/// next attempt, or ends if it has no attempt or server left. One that ends
+/// is gone, with its event queued and then one for each of its followers
+/// (`Resolver::finish`). A send can end the query instead (a cached
+/// failure, a TLS session that can't start, a message that doesn't encode)
+/// or move it on (a write TLS refuses). For each input, the first row whose
+/// guard holds applies; an input that no row matches, such as a datagram or
+/// `handle_udp_error` for a query on a stream, is ignored. The crate docs'
+/// "How a query moves on" table says which server, attempt and deadline
+/// each move takes.
+///
+/// | State | Input \[guard\] | Next | Also |
+/// |---|---|---|---|
+/// | none | `query` [a meta type] | none (`Err`) | |
+/// | none | `query` [answered locally or by the cache] | ends | |
+/// | none | `query` [a leader asks for the same name and type] | follower | |
+/// | none | `query` [any other] | sends (none and `Err` if it doesn't encode) | |
+/// | Udp | reply [a truncated one] | sends over TCP, or moves on | |
+/// | leader | reply [records that don't decode] | moves on | |
+/// | leader | reply [FORMERR without OPT, not over TLS] | sends without EDNS, or moves on | |
+/// | leader | reply [a referral] | moves on | |
+/// | leader | reply [NOERROR with data] | ends | |
+/// | leader | reply [NXDOMAIN or NODATA, `Resolver::walk` finds a candidate to send] | sends that candidate | |
+/// | leader | reply [NXDOMAIN or NODATA] | ends | |
+/// | leader | reply | moves on | |
+/// | Udp | its deadline, or `handle_udp_error` [its server] | moves on | |
+/// | Stream(c) | its deadline [a response on c since `written_after`, room for an orphan] | moves on | an `Orphan` on c |
+/// | Stream(c) | its deadline | moves on | c closes (`Connection`) |
+/// | any | `shutdown` | gone | |
+/// | Stream(c) | c closes for another reason | sends, or moves on | |
+/// | follower | `cancel` | gone | |
+/// | leader | `cancel` [no followers] | gone | on Stream(c), an `Orphan` on c, or c closes |
+/// | Stream | `cancel` [with followers] | the first follower leads | |
+/// | Udp | `cancel` [with followers] | the first follower leads, and sends or moves on | |
 #[derive(Debug)]
 struct Pending {
-    request: Message,
-    payload: Vec<u8>,
-    /// Where in the server list its attempts start, so it skips servers
-    /// that failed recently.
-    first: usize,
-    /// Where in the rotation its current attempt is: it goes to
-    /// `Config::server(position)`. Starts at `first` and moves on by one
-    /// per attempt, past the servers in `excluded`, so how often it has
-    /// wrapped around is the number of rounds made.
-    position: usize,
-    /// How many attempts it has used up before the current one.
-    attempt: usize,
-    /// Servers that answered this search candidate with an error, a reply
-    /// that couldn't be decoded, or a referral: later attempts skip them
-    /// (RFC 1035 §7.2, RFC 1034 §5.3.3 step 4d).
-    excluded: Vec<SocketAddr>,
-    /// When the current attempt times out. Only `Resolver::emit` sets it;
-    /// `Resolver::new_pending` leaves a placeholder that the first `emit`
-    /// replaces, or that goes with the query if a cached failure ends it
-    /// there. `emit` starts it over (`Deadline::Fresh`) for every attempt
-    /// and resend except `Resolver::time_out_stream`'s free resend, which
-    /// keeps it (`Deadline::Kept`). An heir that takes a cancelled query
-    /// over on a stream sends nothing and keeps it too.
-    deadline: Instant,
-    /// How the current attempt went out; set by `Resolver::emit`.
-    route: Route,
-    /// Whether every send goes over a stream: after a truncated answer
-    /// over UDP, for the rest of the search candidate (RFC 1123 §6.1.3.2),
-    /// and always with DNS over TLS (RFC 7858 §3). Otherwise a send goes
-    /// over a stream only when a connection to its server is open (RFC
-    /// 7766 §5).
-    stream_only: bool,
-    /// How often this search candidate was sent to each server over each
-    /// channel, free sends included: at most `MAX_SENDS_PER_SERVER` times
-    /// (RFC 9520 §3.1).
-    sends: Vec<(SocketAddr, Channel, u8)>,
+    // The search, carried over from one candidate to the next.
+    /// The name and type as asked, before search domains. A later query
+    /// for the same two joins this one instead of being sent. hickory's
+    /// `Name` equality ignores case but not the trailing dot.
+    asked: Asked,
     /// Search candidates still to try if this name has no data of the type
     /// asked for.
     rest: VecDeque<Name>,
     /// The first NODATA answer of an earlier search candidate: the outcome
     /// if no later one has data.
     nodata: Option<Message>,
+    /// Queries that joined this one, in the order they joined; each gets
+    /// its outcome too. Every `QueryId` in flight is in exactly one place:
+    /// a key of `Resolver::pending`, or one leader's followers.
+    followers: Vec<QueryId>,
+
+    // The current search candidate: `Resolver::next_candidate` starts
+    // these over, and the attempt below.
+    request: Message,
+    payload: Vec<u8>,
+    /// Where in the server list its attempts start, so it skips servers
+    /// that failed recently.
+    first: usize,
+    /// Servers that answered this search candidate with an error, a reply
+    /// that couldn't be decoded, or a referral: later attempts skip them
+    /// (RFC 1035 §7.2, RFC 1034 §5.3.3 step 4d). Between inputs the
+    /// current server isn't one of them: `Resolver::reject` adds it and
+    /// moves the query on to a server that isn't, or ends it.
+    excluded: Vec<SocketAddr>,
+    /// How often this search candidate was sent to each server over each
+    /// channel, free sends included: at most `MAX_SENDS_PER_SERVER` times
+    /// (RFC 9520 §3.1). `Resolver::emit` counts each send, and every send
+    /// but a search candidate's first is checked with `Pending::may_send`
+    /// before it, for the channel `emit` then takes.
+    sends: Vec<(SocketAddr, Channel, u8)>,
+    /// Whether every send goes over a stream: after a truncated answer
+    /// over UDP, for the rest of the search candidate (RFC 1123 §6.1.3.2),
+    /// and always with DNS over TLS (RFC 7858 §3). Otherwise a send goes
+    /// over a stream only when a connection to its server is open (RFC
+    /// 7766 §5). Between inputs a query with it set is on a stream
+    /// (`Route::Stream`): it is set just before a send, and `emit` sends
+    /// such a query over nothing else.
+    stream_only: bool,
     /// Whether its attempt was already sent again for free, after its
     /// connection, which had answered only before the attempt was written
     /// or took its request back, was lost or ended by the server's
@@ -83,18 +153,34 @@ struct Pending {
     /// close_notify after a response arrived on it since then gives a free
     /// resend without it.
     free_resend_used: bool,
-    /// The name and type as asked, before search domains. A later query
-    /// for the same two joins this one instead of being sent. hickory's
-    /// `Name` equality ignores case but not the trailing dot.
-    asked: Asked,
     /// When this query's current search candidate was first sent, which
     /// decides whether its failure backs off from a cached one
     /// (`Cache::failed`).
     started: Instant,
-    /// Queries that joined this one, in the order they joined; each gets
-    /// its outcome too. Every `QueryId` in flight is in exactly one place:
-    /// a key of `Resolver::pending`, or one leader's followers.
-    followers: Vec<QueryId>,
+
+    // The current attempt.
+    /// Where in the rotation its current attempt is: it goes to
+    /// `Config::server(position)`. Starts at `first` and moves on by one
+    /// per attempt, past the servers in `excluded`, so how often it has
+    /// wrapped around is the number of rounds made.
+    position: usize,
+    /// How many attempts it has used up before the current one. Below
+    /// `Config::attempts` between inputs: a query that would reach it ends
+    /// (`Resolver::try_advance`).
+    attempt: usize,
+    /// When the current attempt times out. Only `Resolver::emit` sets it;
+    /// `Resolver::new_pending` leaves a placeholder that the first `emit`
+    /// replaces, or that goes with the query if a cached failure ends it
+    /// there. `emit` starts it over (`Deadline::Fresh`) for every attempt
+    /// and resend except `Resolver::time_out_stream`'s free resend, which
+    /// keeps it (`Deadline::Kept`). An heir that takes a cancelled query
+    /// over on a stream sends nothing and keeps it too.
+    deadline: Instant,
+    /// How the current attempt went out; set by `Resolver::emit`. Between
+    /// inputs a connection it names is in `Resolver::connections` and goes
+    /// to the current server: every path that removes a connection moves
+    /// its queries on in the same call.
+    route: Route,
 }
 
 impl Pending {
@@ -224,8 +310,26 @@ enum Deadline {
 }
 
 /// A stream connection to one server, shared by its queries.
+///
+/// It lives from `Resolver::connect` until it leaves
+/// `Resolver::connections`, in one of these ways:
+///
+/// | Input | Ends it | `TcpClose` | Its queries |
+/// |---|---|---|---|
+/// | `handle_stream_closed`, `handle_stream_error` | `lost` | no | sent again or moved on (`move_off`) |
+/// | the server's close_notify, in `handle_stream_data` | `shut` | yes | the same, after the answers that came before it |
+/// | a TLS error on bytes read from it, or a write TLS refuses | `abort` | yes | moved on (`retry`) |
+/// | a query on it times out with no response since `written_after`, or one more `Orphan` would go past `MAX_ORPHANS` | `time_out_stream` | yes | sent again if their deadline hasn't passed, they have room and their free resend is left (`use_free_resend`), else moved on |
+/// | its idle deadline passes (`handle_timeout`) | `shut` | yes | none: no query is on it |
+/// | `shutdown` | `shut` | yes | none left |
+///
+/// Every end but `lost` goes through `shut`, which also queues a TLS
+/// session's last bytes before the `TcpClose`.
 #[derive(Debug)]
 struct Connection {
+    /// Between inputs no other connection goes to this server:
+    /// `Resolver::emit` connects only when no connection to the server is
+    /// open, and one that is `closing` is gone by the end of the input.
     server: SocketAddr,
     /// Decrypted bytes not yet split into messages.
     received: Vec<u8>,
@@ -236,11 +340,16 @@ struct Connection {
     last_active: Instant,
     /// How many complete responses have arrived on it, matched or not.
     responses: u64,
-    /// Queries written to it that left it before their answer came.
+    /// Queries written to it that left it before their answer came. At
+    /// most `MAX_ORPHANS`. Their message IDs stay in use
+    /// (`Resolver::new_message`), so no two requests outstanding on it
+    /// share one unless all 65536 are in use.
     orphans: Vec<Orphan>,
     /// Whether the server ended it (its close_notify arrived) while the
     /// answers that came before are still being acted on: nothing more is
-    /// sent on it, and it is closed once they are done.
+    /// sent on it, and it is closed once they are done. True only within
+    /// the `handle_stream_data` call that took in the close_notify, which
+    /// removes the connection before it returns.
     closing: bool,
     /// The TLS session, when using DNS over TLS.
     #[cfg(feature = "tls")]
@@ -290,14 +399,16 @@ impl Connection {
 /// A query that left a connection before its answer came: it was
 /// cancelled, or timed out and moved on while the connection stayed open.
 /// The server may still answer it, so its message ID stays in use on the
-/// connection until the answer arrives, which is then dropped, or the
-/// connection ends (RFC 7766 §6.2.1).
+/// connection until the answer arrives, which is then dropped, a later
+/// attempt of the query takes it back (`Resolver::emit`), or the
+/// connection ends (RFC 7766 §6.2.1). It doesn't expire.
 #[derive(Debug)]
 struct Orphan {
     id: u16,
     question: Vec<Query>,
     /// Until when it counts as outstanding, keeping the connection from
-    /// going idle: the deadline the query had.
+    /// going idle: the deadline the query had, which for one left by a
+    /// timeout isn't in the future. Only the idle deadline reads it.
     until: Instant,
 }
 
@@ -937,23 +1048,23 @@ impl Resolver {
         }
         let payload = request.to_vec()?;
         Ok(Pending {
+            asked,
+            rest,
+            nodata: None,
+            followers: Vec::new(),
             request,
             payload,
             first,
+            excluded: Vec::new(),
+            sends: Vec::new(),
+            stream_only: self.config.uses_tls(),
+            free_resend_used: false,
+            started: now,
             position: first,
             attempt: 0,
-            excluded: Vec::new(),
             // A placeholder: the caller's `emit` starts the deadline.
             deadline: now,
             route: Route::Udp,
-            stream_only: self.config.uses_tls(),
-            sends: Vec::new(),
-            rest,
-            nodata: None,
-            free_resend_used: false,
-            asked,
-            started: now,
-            followers: Vec::new(),
         })
     }
 
@@ -984,7 +1095,11 @@ impl Resolver {
             return;
         };
         let Ok(mut next) = self.new_pending(name, asked.1, rest, asked, now) else {
-            // Can't fail for a name that was encoded once.
+            // Not expected: the fallible calls in `new_pending` (`to_vec`,
+            // and `protect`'s `pad` under `tls`) only encode the message,
+            // and only its name has limits to check. hickory's `Name`
+            // keeps each label within 63 octets and the name within 255,
+            // the limits that encoding a name checks.
             if let Some(response) = outcome.into_response() {
                 self.finish(id, Ok(response));
             }
@@ -1179,6 +1294,10 @@ impl Resolver {
     // `advance` (`drop_edns`, `switch_to_tcp`) or `try_advance` (`cancel`)
     // instead. That check is all that bounds the resends after a lost
     // connection that answered since.
+    //
+    // `retry`, `reject`, `try_advance`, `switch_to_tcp` and `drop_edns`
+    // return early for an `id` that isn't pending, which no caller passes;
+    // `try_advance` would report one as sent, so `advance` wouldn't fail it.
 
     /// The server of `id`'s current attempt gave no answer: new queries
     /// start after it for a while (`Config::failure_memory`). It stays in
@@ -1443,6 +1562,8 @@ impl Resolver {
         pending.count_send(server, Channel::Stream);
         let message = frame(&pending.payload);
         let written = self.write(connection, &message, now);
+        // Even a write TLS refuses puts the query on the connection, so
+        // that `abort` moves it on with the others there.
         self.written(id, connection);
         if let Err(error) = written {
             self.abort(connection, now, &error);
@@ -1733,6 +1854,8 @@ impl Resolver {
 
     /// When `connection` should close for being idle: `None` while a query
     /// uses it. An orphan keeps it busy until the deadline its query had.
+    /// `None` too if that instant would overflow `Instant`: the connection
+    /// then doesn't idle out.
     fn idle_deadline(&self, connection: ConnectionId) -> Option<Instant> {
         let conn = self.connections.get(&connection)?;
         if self.pending.values().any(|p| p.is_on(connection)) {

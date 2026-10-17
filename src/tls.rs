@@ -87,6 +87,15 @@ impl Settings {
 }
 
 /// A TLS session, and the messages that wait for its handshake.
+///
+/// It is handshaking first, holding the messages written meanwhile in
+/// `early`, and established once [`Session::receive`] finds the handshake
+/// done, when it sends them. In either phase, the server's close_notify
+/// ([`Received::closed`]) or a TLS error from `receive` or
+/// [`Session::send`] ends it, and the resolver then shuts its connection
+/// in the same call, which sends what [`Session::close`] returns. A
+/// connection the resolver shuts for another reason closes its session
+/// the same way, and one the driver reports gone drops it.
 #[derive(Debug)]
 pub(crate) struct Session {
     connection: ClientConnection,

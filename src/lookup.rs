@@ -107,7 +107,9 @@ pub struct IpLookup {
     types: [Option<RecordType>; 2],
     /// The queries for the current search candidate, one per type.
     queries: [Option<QueryId>; 2],
-    /// The outcome of each query, filled as its event arrives.
+    /// The outcome of each query, filled as its event arrives: `None` while
+    /// its query runs, and for a type not asked for, which has no query.
+    /// The search candidate is done once each query has its outcome.
     results: [Option<Result<Vec<IpAddr>, Error>>; 2],
     /// The search candidates still to try, as absolute names.
     rest: VecDeque<Name>,

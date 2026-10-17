@@ -67,7 +67,11 @@ The `Resolver` is a state machine over two maps: pending queries
 (`QueryId` -> `Pending`) and stream connections (`ConnectionId` -> `Connection`), plus the
 `Cache`. Inputs are `query`, `handle_datagram(query, from, ..)`, `handle_udp_error`,
 `handle_stream_data/closed/error`, `handle_timeout`, `cancel`, `flush_cache` and `shutdown`;
-outputs are drained with `poll_transmit`, `poll_event` and `poll_timeout`.
+outputs are drained with `poll_transmit`, `poll_event` and `poll_timeout`. The module docs of
+`src/resolver.rs` say where each entity documents its states (`Pending`'s table, the ways a
+`Connection` ends, `tls::Session`, the cache's `Entry`, `IpLookup`), what `poll_timeout` is
+made of, and where map order shows in the outputs; keep them and the invariants on the
+fields in sync with the code.
 
 - A query's current server is `Config::server(position)` (the list, rotated). `position`
   starts at `first`, the first server not in `Resolver::failed` (no answer within

@@ -57,6 +57,25 @@ struct Slot {
 
 /// A cached outcome. A positive answer would be one more variant, holding a
 /// response as `Negative` does.
+///
+/// A key holds no entry, or a `Negative` or `Failed` one, which is live or
+/// expired by `now` (`Entry::is_live`). A question's keys (`Key::of`) are
+/// its own and the one of its name without a type, which NXDOMAIN uses.
+/// Only these calls change what a key holds:
+///
+/// | Call | Effect |
+/// |---|---|
+/// | `Cache::get` | drops an expired `Negative` under either key of the question |
+/// | `Cache::answered` | drops whatever either key of the question holds |
+/// | `Cache::negative` | first does what `answered` does for the answer's question, then may store a `Negative` under the last name of the answer's CNAME chain, with the question's type after NODATA and none after NXDOMAIN |
+/// | `Cache::failed` | stores a `Failed` under the question's own key |
+/// | `Cache::flush` | drops every entry |
+///
+/// A store replaces what the key held. A store under a new key into a full
+/// cache first drops every expired entry, and then, if it is still full,
+/// the oldest. So an expired `Failed` entry stays, for the backoff of the
+/// next failure of its question, until a store replaces it, an answer
+/// drops it, the cache needs room or it is flushed.
 #[derive(Debug)]
 enum Entry {
     /// NXDOMAIN or NODATA, with the authority section it came with (RFC
