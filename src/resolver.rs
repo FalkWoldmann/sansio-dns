@@ -359,6 +359,8 @@ impl Resolver {
         &self.config
     }
 
+    // Inputs, from the driver or an `IpLookup`.
+
     /// Start a recursive lookup of `name`/`record_type`.
     ///
     /// A name ending in a dot is used as given. Other names are tried with
@@ -454,6 +456,386 @@ impl Resolver {
             || self.config.hosts.lookup(&absolute).is_some()
             || self.config.never_sent_as_given(name)
     }
+
+    /// Process a datagram received from `from` on the socket of `query`,
+    /// the one its [`Transport::Udp`] transmits were sent from.
+    ///
+    /// Datagrams that aren't a response to that query are ignored (RFC 5452
+    /// §9.1, RFC 1035 §7.3): the source must be the server of the current
+    /// attempt, and message ID, opcode and question must match, the name
+    /// compared case-insensitively. Spoofed answers and answers from servers
+    /// tried before can't complete it, but a late answer from the current
+    /// server to an earlier attempt can, since attempts keep their message
+    /// ID. For the same reason a duplicated answer is acted on again: a
+    /// repeated `FORMERR` without OPT, after the first one made the query
+    /// drop EDNS, counts as the server's answer to the query without it.
+    /// Naming the socket keeps each query's source port its own (§9.2).
+    /// While the query's current attempt is on a stream, UDP replies to it
+    /// are ignored.
+    ///
+    /// A reply whose header and question match but whose records don't
+    /// decode isn't dropped (RFC 1035 §7.2's "bizarre response"): with TC
+    /// set, the query switches to TCP as for any truncated answer (RFC 2181
+    /// §9); otherwise it moves on to the next server at once.
+    pub fn handle_datagram(&mut self, query: QueryId, from: SocketAddr, data: &[u8], now: Instant) {
+        // The cheap checks first, so stray datagrams cost no parsing.
+        let Some(pending) = self.pending.get(&query) else {
+            return;
+        };
+        if pending.route != Route::Udp || pending.server(&self.config) != from {
+            return;
+        }
+        let Some(reply) = Reply::decode(data) else {
+            return;
+        };
+        if reply.answers(pending.request.metadata.id, &pending.request.queries) {
+            self.handle_reply(query, reply, now);
+        }
+    }
+
+    /// Process bytes read from `connection`.
+    ///
+    /// Bytes may arrive in any chunking, and answers in any order: each
+    /// complete message goes to the query on this connection it answers,
+    /// and is ignored if there is none (RFC 7766 §7). A response is matched
+    /// by message ID and question; one without a question section is
+    /// matched by message ID alone, as RFC 7766 §7 and RFC 7858 §3.3 allow,
+    /// if exactly one query on the connection has that ID, and is then
+    /// taken as answering that query's question. Datagrams get no such
+    /// leeway (RFC 5452 §9.1). The answer to a query that left the
+    /// connection before it came, cancelled or moved on after a timeout,
+    /// is dropped. One whose records don't decode moves that query on to
+    /// the next server, as in [`Resolver::handle_datagram`].
+    ///
+    /// Only a complete response counts as activity for the idle timeout
+    /// and shows the connection works (RFC 7766 §6.2.3): a server that
+    /// trickles bytes can't keep it open. Over TLS, the bytes go through
+    /// the session first, which may queue a [`Transport::TcpWrite`]: the
+    /// rest of the handshake, and then the queries that waited for it. A
+    /// TLS error closes the connection, after the alert rustls queued for
+    /// it (RFC 8446 §6.2), and moves its queries on to their next attempt.
+    /// When the server's close_notify arrives, the answers before it count
+    /// and anything after it is ignored (RFC 8446 §6.1): the resolver
+    /// sends its own close_notify, closes the connection and moves its
+    /// queries on as [`Resolver::handle_stream_closed`] does. A query that
+    /// one of those answers moves on to the same server (the next search
+    /// candidate, say) goes to a new connection. A later
+    /// `handle_stream_closed` or `handle_stream_error` for the connection
+    /// is ignored.
+    pub fn handle_stream_data(&mut self, connection: ConnectionId, data: &[u8], now: Instant) {
+        let Some(conn) = self.connections.get_mut(&connection) else {
+            return;
+        };
+        let Incoming { to_send, closed } = match conn.receive(data) {
+            Ok(incoming) => incoming,
+            Err(error) => {
+                self.close(connection, now, &error);
+                return;
+            }
+        };
+        // Answers that move a query on must not send it here.
+        conn.closing = closed;
+        if !to_send.is_empty() {
+            self.transmits.push_back(Transmit {
+                transport: Transport::TcpWrite(connection),
+                destination: conn.server,
+                payload: to_send,
+            });
+        }
+        // One message at a time: acting on an answer may change this
+        // connection too.
+        while let Some(message) = self.next_message(connection) {
+            let Some(mut reply) = Reply::decode(&message) else {
+                continue;
+            };
+            if !reply.is_response() {
+                continue;
+            }
+            let Some(conn) = self.connections.get_mut(&connection) else {
+                return;
+            };
+            conn.responses += 1;
+            conn.last_active = now;
+            match self.stream_match(connection, &reply) {
+                Some(Matched::Query(id)) => {
+                    if let Some(pending) = self.pending.get(&id) {
+                        reply.fill_question(&pending.request.queries);
+                    }
+                    self.handle_reply(id, reply, now);
+                }
+                Some(Matched::Orphan(index)) => {
+                    if let Some(conn) = self.connections.get_mut(&connection) {
+                        conn.orphans.swap_remove(index);
+                    }
+                }
+                None => {}
+            }
+        }
+        if closed && let Some(conn) = self.shut(connection) {
+            self.move_off(connection, conn.responses, now, &Error::ConnectionClosed);
+        }
+    }
+
+    /// The server closed `connection`, or reading from it ended.
+    ///
+    /// If the connection had answered before, the server most likely closed
+    /// it for being idle while a query was on its way (RFC 7766 §6.2.3), or
+    /// after the number of queries it allows per connection (RFC 9210
+    /// §4.2): each query on it is sent once more to the same server,
+    /// without using up an attempt (RFC 7766 §6.2.4). That happens every
+    /// time a connection is lost that answered something after the query
+    /// was written to it, and otherwise once per query. Its deadline starts
+    /// over: the close can come at any time, even just before the old
+    /// deadline, and the query most likely never reached the server. The
+    /// resend goes over a new connection if the query must use a stream
+    /// and over UDP if not, unless a connection to the server is open again
+    /// by then. Otherwise, and for a query already sent to the server
+    /// three times over that channel (RFC 9520 §3.1), the query moves on to
+    /// its next attempt, and a query out of attempts fails with
+    /// [`Error::ConnectionClosed`]. No [`Transport::TcpClose`] follows.
+    pub fn handle_stream_closed(&mut self, connection: ConnectionId, now: Instant) {
+        self.lost(connection, now, &Error::ConnectionClosed);
+    }
+
+    /// Connecting, reading or writing failed on `connection` with `error`.
+    /// Its queries move on exactly as with [`Resolver::handle_stream_closed`];
+    /// the difference is that a query out of attempts fails with
+    /// [`Error::Io`] carrying `error`.
+    pub fn handle_stream_error(
+        &mut self,
+        connection: ConnectionId,
+        error: io::ErrorKind,
+        now: Instant,
+    ) {
+        self.lost(connection, now, &Error::Io(error));
+    }
+
+    /// Binding or connecting the socket of `query`, sending its datagram to
+    /// `to`, or receiving on the socket connected to `to` failed with
+    /// `error`, such as `ConnectionRefused` for an ICMP port unreachable
+    /// (RFC 1122 §4.1.3.3). The query moves on to its next attempt at once
+    /// instead of waiting out its deadline, and a query out of attempts
+    /// fails with [`Error::Io`] carrying `error`.
+    ///
+    /// Ignored unless the query's current attempt goes over UDP to `to`, so
+    /// a late report can't skip an attempt to another server. Report the
+    /// failure as soon as it happens: with one server, a late one would
+    /// still use up the current attempt.
+    pub fn handle_udp_error(
+        &mut self,
+        query: QueryId,
+        to: SocketAddr,
+        error: io::ErrorKind,
+        now: Instant,
+    ) {
+        let Some(pending) = self.pending.get(&query) else {
+            return;
+        };
+        if pending.route == Route::Udp && pending.server(&self.config) == to {
+            self.retry(query, now, Error::Io(error));
+        }
+    }
+
+    /// Retry or fail every query whose deadline is at or before `now`, and
+    /// close connections that have been idle for too long.
+    ///
+    /// A query that times out on a stream moves on to its next attempt. If
+    /// no response has arrived on its connection since it was written
+    /// there, the connection looks dead and is closed: the other queries
+    /// that timed out move on too, and the rest are sent again to the same
+    /// server, by the usual rule (a new connection if they must use a
+    /// stream, else UDP), with their attempt and deadline unchanged, once
+    /// per query and only if that isn't their fourth send to the server
+    /// over that transport (RFC 9520 §3.1); otherwise they move on too. If
+    /// a response has arrived since, the server is only slow with this
+    /// one, which RFC 7766 §7 expects of pipelined queries: the connection
+    /// stays open, and the query's request stays outstanding on it. Should
+    /// a later attempt come back to that connection, it waits for that
+    /// request's answer instead of writing the message ID again (RFC 7766
+    /// §6.2.1), and the connection is closed as above if no response
+    /// arrives by that attempt's deadline. A connection that already holds
+    /// 256 requests left unanswered this way or by [`Resolver::cancel`] is
+    /// closed instead of taking one more, which frees their IDs.
+    ///
+    /// Calling it before [`Resolver::poll_timeout`]'s instant does nothing.
+    /// Calling it late handles every deadline that has passed in one step,
+    /// with new deadlines counted from `now`; queries on a timed-out
+    /// connection whose own deadline has also passed then use up an
+    /// attempt instead of moving for free.
+    pub fn handle_timeout(&mut self, now: Instant) {
+        let expired: Vec<QueryId> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| p.deadline <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            // An earlier close may already have moved this query on.
+            let Some(pending) = self.pending.get(&id) else {
+                continue;
+            };
+            if pending.deadline > now {
+                continue;
+            }
+            let Route::Stream {
+                connection,
+                written_after,
+            } = pending.route
+            else {
+                self.retry(id, now, Error::Timeout);
+                continue;
+            };
+            match self.connections.get_mut(&connection) {
+                Some(conn)
+                    if conn.responses > written_after && conn.orphans.len() < MAX_ORPHANS =>
+                {
+                    conn.orphans.push(Orphan::of(pending));
+                    self.retry(id, now, Error::Timeout);
+                }
+                Some(_) => self.time_out_stream(connection, now),
+                // Can't happen: every path that removes a connection moves
+                // its queries on first. Treated as a plain timeout to be
+                // safe.
+                None => self.retry(id, now, Error::Timeout),
+            }
+        }
+        let idle: Vec<ConnectionId> = self
+            .connections
+            .keys()
+            .filter(|c| self.idle_deadline(**c).is_some_and(|d| d <= now))
+            .copied()
+            .collect();
+        for connection in idle {
+            self.shut(connection);
+        }
+    }
+
+    /// Stop tracking a query. No event is queued for it from now on (one
+    /// already queued, such as a special-use answer, still comes out of
+    /// [`Resolver::poll_event`]), so the driver can close its socket now.
+    ///
+    /// Queries that joined it go on, and the first of them takes it over. If
+    /// its attempt went over UDP, that attempt is sent again for the heir,
+    /// to the same server, with a fresh deadline: as [`Transport::Udp`],
+    /// from a new socket, or on the connection to that server if one has
+    /// opened since. If that would be the fourth send of the search
+    /// candidate to that server over that transport, the heir sends its
+    /// next attempt to the next server instead (RFC 9520 §3.1). If it has
+    /// none left, it fails with [`Error::Timeout`] at once, along with the
+    /// queries that joined it. That failure isn't cached: no server failed
+    /// to answer (RFC 9520 §2), since its answers may have gone to the
+    /// sockets of the cancelled queries, so the next query for the name is
+    /// sent as usual. Over a stream nothing is sent; the answer
+    /// still arrives on the same connection, and the heir keeps the
+    /// deadline.
+    ///
+    /// A query cancelled with no one to take it over after its request was
+    /// written to a connection keeps its message ID in use there until the
+    /// answer arrives or the connection ends, and keeps the connection from
+    /// going idle until the deadline it had (RFC 7766 §6.2.1, §6.2.3). If
+    /// the connection already holds 256 such requests, it is closed instead
+    /// and its other queries move as when one of them times out with no
+    /// response since (see [`Resolver::handle_timeout`]).
+    pub fn cancel(&mut self, id: QueryId, now: Instant) {
+        let Some(mut pending) = self.pending.remove(&id) else {
+            for p in self.pending.values_mut() {
+                p.followers.retain(|&follower| follower != id);
+            }
+            return;
+        };
+        if pending.followers.is_empty() {
+            // Its request is still outstanding on its connection.
+            if let Route::Stream { connection, .. } = pending.route
+                && let Some(conn) = self.connections.get_mut(&connection)
+            {
+                if conn.orphans.len() < MAX_ORPHANS {
+                    conn.orphans.push(Orphan::of(&pending));
+                } else {
+                    self.time_out_stream(connection, now);
+                }
+            }
+            return;
+        }
+        let heir = pending.followers.remove(0);
+        match pending.route {
+            // Nothing to send: the answer still arrives on the connection,
+            // and the heir keeps the deadline.
+            Route::Stream { .. } => {
+                self.pending.insert(heir, pending);
+            }
+            Route::Udp => {
+                let server = pending.server(&self.config);
+                if pending.may_send(server, channel(&self.connections, &pending, server)) {
+                    pending.deadline = pending.deadline(&self.config, now);
+                    self.pending.insert(heir, pending);
+                    self.emit(heir, now);
+                } else {
+                    self.pending.insert(heir, pending);
+                    // Not a resolution failure (RFC 9520 §2): the server may
+                    // well have answered, to the cancelled queries' sockets.
+                    if !self.step(heir, now) {
+                        self.finish(heir, Err(Error::Timeout));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Forget every cached failure and negative answer (see the crate docs),
+    /// and which servers recently failed to answer
+    /// ([`Config::failure_memory`]), as a driver should when the host's
+    /// network changes: what failed or didn't exist on the old network may
+    /// work on the new one, where the servers may be reachable again, and
+    /// a failure stays cached for up to five minutes. Queries in flight go
+    /// on as they are.
+    pub fn flush_cache(&mut self) {
+        self.cache.flush();
+        self.failed.clear();
+    }
+
+    /// Stop: forget every query in flight, as [`Resolver::cancel`] does but
+    /// without handing any over, and close every open connection, over TLS
+    /// after its close_notify alert (RFC 8446 §6.1). For a driver that is
+    /// about to drop its connections: carry out the transmits this queues
+    /// first. Events already queued still come out of
+    /// [`Resolver::poll_event`], and the resolver takes new queries
+    /// afterwards.
+    pub fn shutdown(&mut self) {
+        self.pending.clear();
+        let connections: Vec<ConnectionId> = self.connections.keys().copied().collect();
+        for connection in connections {
+            self.shut(connection);
+        }
+    }
+
+    // Outputs, which the driver polls after each input.
+
+    /// Next transmit to carry out, if any: a datagram, or a stream connect,
+    /// write or close.
+    pub fn poll_transmit(&mut self) -> Option<Transmit> {
+        self.transmits.pop_front()
+    }
+
+    /// Next completed query, if any.
+    pub fn poll_event(&mut self) -> Option<Event> {
+        self.events.pop_front()
+    }
+
+    /// Earliest instant at which [`Resolver::handle_timeout`] must be called.
+    /// `None` means no timer is needed: no query is pending and no open
+    /// connection is waiting out [`Config::idle_timeout`]. An idle
+    /// connection keeps a timer running after the last query is done.
+    pub fn poll_timeout(&self) -> Option<Instant> {
+        let queries = self.pending.values().map(|p| p.deadline);
+        let idle = self
+            .connections
+            .keys()
+            .filter_map(|c| self.idle_deadline(*c));
+        queries.chain(idle).min()
+    }
+
+    // A query's transitions: starting a search candidate, acting on its
+    // replies, moving on, and sending.
 
     /// [`Resolver::query`], with `hosts` deciding whether
     /// [`Config::hosts`] is consulted.
@@ -630,250 +1012,40 @@ impl Resolver {
         self.emit(id, now);
     }
 
-    /// Process a datagram received from `from` on the socket of `query`,
-    /// the one its [`Transport::Udp`] transmits were sent from.
+    /// A query message with an ID that is in use neither by a query in
+    /// flight nor by an orphan on a connection, so no connection ever
+    /// carries two outstanding queries with one ID (RFC 7766 §6.2.1).
     ///
-    /// Datagrams that aren't a response to that query are ignored (RFC 5452
-    /// §9.1, RFC 1035 §7.3): the source must be the server of the current
-    /// attempt, and message ID, opcode and question must match, the name
-    /// compared case-insensitively. Spoofed answers and answers from servers
-    /// tried before can't complete it, but a late answer from the current
-    /// server to an earlier attempt can, since attempts keep their message
-    /// ID. For the same reason a duplicated answer is acted on again: a
-    /// repeated `FORMERR` without OPT, after the first one made the query
-    /// drop EDNS, counts as the server's answer to the query without it.
-    /// Naming the socket keeps each query's source port its own (§9.2).
-    /// While the query's current attempt is on a stream, UDP replies to it
-    /// are ignored.
-    ///
-    /// A reply whose header and question match but whose records don't
-    /// decode isn't dropped (RFC 1035 §7.2's "bizarre response"): with TC
-    /// set, the query switches to TCP as for any truncated answer (RFC 2181
-    /// §9); otherwise it moves on to the next server at once.
-    pub fn handle_datagram(&mut self, query: QueryId, from: SocketAddr, data: &[u8], now: Instant) {
-        // The cheap checks first, so stray datagrams cost no parsing.
-        let Some(pending) = self.pending.get(&query) else {
-            return;
+    /// The ID comes from hickory-proto's `rand::random`, a CSPRNG, covering
+    /// the full 16-bit range as RFC 5452 §9.2 requires. If a few random
+    /// picks all hit IDs in use, the free ID that follows the last one is
+    /// taken. Only with all 65536 in use is a used one kept: a datagram is
+    /// matched by its query's own socket and a stream answer by ID and
+    /// question, so a duplicate ID then only pairs queries whose answers
+    /// are interchangeable.
+    fn new_message(&self) -> Message {
+        let used = |id: u16| {
+            self.pending.values().any(|p| p.request.metadata.id == id)
+                || self
+                    .connections
+                    .values()
+                    .any(|c| c.orphans.iter().any(|o| o.id == id))
         };
-        if pending.route != Route::Udp || pending.server(&self.config) != from {
-            return;
-        }
-        let Some(reply) = Reply::decode(data) else {
-            return;
-        };
-        if reply.answers(pending.request.metadata.id, &pending.request.queries) {
-            self.handle_reply(query, reply, now);
-        }
-    }
-
-    /// Process bytes read from `connection`.
-    ///
-    /// Bytes may arrive in any chunking, and answers in any order: each
-    /// complete message goes to the query on this connection it answers,
-    /// and is ignored if there is none (RFC 7766 §7). A response is matched
-    /// by message ID and question; one without a question section is
-    /// matched by message ID alone, as RFC 7766 §7 and RFC 7858 §3.3 allow,
-    /// if exactly one query on the connection has that ID, and is then
-    /// taken as answering that query's question. Datagrams get no such
-    /// leeway (RFC 5452 §9.1). The answer to a query that left the
-    /// connection before it came, cancelled or moved on after a timeout,
-    /// is dropped. One whose records don't decode moves that query on to
-    /// the next server, as in [`Resolver::handle_datagram`].
-    ///
-    /// Only a complete response counts as activity for the idle timeout
-    /// and shows the connection works (RFC 7766 §6.2.3): a server that
-    /// trickles bytes can't keep it open. Over TLS, the bytes go through
-    /// the session first, which may queue a [`Transport::TcpWrite`]: the
-    /// rest of the handshake, and then the queries that waited for it. A
-    /// TLS error closes the connection, after the alert rustls queued for
-    /// it (RFC 8446 §6.2), and moves its queries on to their next attempt.
-    /// When the server's close_notify arrives, the answers before it count
-    /// and anything after it is ignored (RFC 8446 §6.1): the resolver
-    /// sends its own close_notify, closes the connection and moves its
-    /// queries on as [`Resolver::handle_stream_closed`] does. A query that
-    /// one of those answers moves on to the same server (the next search
-    /// candidate, say) goes to a new connection. A later
-    /// `handle_stream_closed` or `handle_stream_error` for the connection
-    /// is ignored.
-    pub fn handle_stream_data(&mut self, connection: ConnectionId, data: &[u8], now: Instant) {
-        let Some(conn) = self.connections.get_mut(&connection) else {
-            return;
-        };
-        let Incoming { to_send, closed } = match conn.receive(data) {
-            Ok(incoming) => incoming,
-            Err(error) => {
-                self.close(connection, now, &error);
-                return;
+        let mut message = Message::query();
+        for _ in 0..16 {
+            if !used(message.metadata.id) {
+                return message;
             }
-        };
-        // Answers that move a query on must not send it here.
-        conn.closing = closed;
-        if !to_send.is_empty() {
-            self.transmits.push_back(Transmit {
-                transport: Transport::TcpWrite(connection),
-                destination: conn.server,
-                payload: to_send,
-            });
+            message = Message::query();
         }
-        // One message at a time: acting on an answer may change this
-        // connection too.
-        while let Some(message) = self.next_message(connection) {
-            let Some(mut reply) = Reply::decode(&message) else {
-                continue;
-            };
-            if !reply.is_response() {
-                continue;
-            }
-            let Some(conn) = self.connections.get_mut(&connection) else {
-                return;
-            };
-            conn.responses += 1;
-            conn.last_active = now;
-            match self.stream_match(connection, &reply) {
-                Some(Matched::Query(id)) => {
-                    if let Some(pending) = self.pending.get(&id) {
-                        reply.fill_question(&pending.request.queries);
-                    }
-                    self.handle_reply(id, reply, now);
-                }
-                Some(Matched::Orphan(index)) => {
-                    if let Some(conn) = self.connections.get_mut(&connection) {
-                        conn.orphans.swap_remove(index);
-                    }
-                }
-                None => {}
-            }
+        let last = message.metadata.id;
+        if let Some(free) = (1..=u16::MAX)
+            .map(|i| last.wrapping_add(i))
+            .find(|&id| !used(id))
+        {
+            message.metadata.id = free;
         }
-        if closed && let Some(conn) = self.shut(connection) {
-            self.move_off(connection, conn.responses, now, &Error::ConnectionClosed);
-        }
-    }
-
-    /// What the response `reply`, received on `connection`, answers: a
-    /// query whose current attempt was written there, or an orphan of the
-    /// connection.
-    fn stream_match(&self, connection: ConnectionId, reply: &Reply) -> Option<Matched> {
-        let conn = self.connections.get(&connection)?;
-        let queries = self.pending.iter().filter(|(_, p)| p.is_on(connection));
-        if reply.has_question() {
-            let query = queries
-                .filter(|(_, p)| reply.answers(p.request.metadata.id, &p.request.queries))
-                .map(|(id, _)| Matched::Query(*id));
-            let orphan = conn
-                .orphans
-                .iter()
-                .position(|o| reply.answers(o.id, &o.question))
-                .map(Matched::Orphan);
-            return query.chain(orphan).next();
-        }
-        let mut candidates = queries
-            .filter(|(_, p)| reply.responds_to(p.request.metadata.id))
-            .map(|(id, _)| Matched::Query(*id))
-            .chain(
-                (0..conn.orphans.len())
-                    .filter(|&i| conn.orphans.get(i).is_some_and(|o| reply.responds_to(o.id)))
-                    .map(Matched::Orphan),
-            );
-        let only = candidates.next();
-        candidates.next().map_or(only, |_| None)
-    }
-
-    /// Take the first complete length-prefixed message off `connection`'s
-    /// buffer, or `None` if there is none yet.
-    fn next_message(&mut self, connection: ConnectionId) -> Option<Vec<u8>> {
-        let conn = self.connections.get_mut(&connection)?;
-        let (len, rest) = conn.received.split_first_chunk::<2>()?;
-        let len = usize::from(u16::from_be_bytes(*len));
-        let message = rest.get(..len)?.to_vec();
-        conn.received.drain(..2 + len);
-        Some(message)
-    }
-
-    /// The server closed `connection`, or reading from it ended.
-    ///
-    /// If the connection had answered before, the server most likely closed
-    /// it for being idle while a query was on its way (RFC 7766 §6.2.3), or
-    /// after the number of queries it allows per connection (RFC 9210
-    /// §4.2): each query on it is sent once more to the same server,
-    /// without using up an attempt (RFC 7766 §6.2.4). That happens every
-    /// time a connection is lost that answered something after the query
-    /// was written to it, and otherwise once per query. Its deadline starts
-    /// over: the close can come at any time, even just before the old
-    /// deadline, and the query most likely never reached the server. The
-    /// resend goes over a new connection if the query must use a stream
-    /// and over UDP if not, unless a connection to the server is open again
-    /// by then. Otherwise, and for a query already sent to the server
-    /// three times over that channel (RFC 9520 §3.1), the query moves on to
-    /// its next attempt, and a query out of attempts fails with
-    /// [`Error::ConnectionClosed`]. No [`Transport::TcpClose`] follows.
-    pub fn handle_stream_closed(&mut self, connection: ConnectionId, now: Instant) {
-        self.lost(connection, now, &Error::ConnectionClosed);
-    }
-
-    /// Connecting, reading or writing failed on `connection` with `error`.
-    /// Its queries move on exactly as with [`Resolver::handle_stream_closed`];
-    /// the difference is that a query out of attempts fails with
-    /// [`Error::Io`] carrying `error`.
-    pub fn handle_stream_error(
-        &mut self,
-        connection: ConnectionId,
-        error: io::ErrorKind,
-        now: Instant,
-    ) {
-        self.lost(connection, now, &Error::Io(error));
-    }
-
-    /// Binding or connecting the socket of `query`, sending its datagram to
-    /// `to`, or receiving on the socket connected to `to` failed with
-    /// `error`, such as `ConnectionRefused` for an ICMP port unreachable
-    /// (RFC 1122 §4.1.3.3). The query moves on to its next attempt at once
-    /// instead of waiting out its deadline, and a query out of attempts
-    /// fails with [`Error::Io`] carrying `error`.
-    ///
-    /// Ignored unless the query's current attempt goes over UDP to `to`, so
-    /// a late report can't skip an attempt to another server. Report the
-    /// failure as soon as it happens: with one server, a late one would
-    /// still use up the current attempt.
-    pub fn handle_udp_error(
-        &mut self,
-        query: QueryId,
-        to: SocketAddr,
-        error: io::ErrorKind,
-        now: Instant,
-    ) {
-        let Some(pending) = self.pending.get(&query) else {
-            return;
-        };
-        if pending.route == Route::Udp && pending.server(&self.config) == to {
-            self.retry(query, now, Error::Io(error));
-        }
-    }
-
-    /// `connection` went away without being asked to; see
-    /// [`Resolver::handle_stream_closed`]. Emits no `TcpClose`: the driver
-    /// reported the connection gone.
-    fn lost(&mut self, connection: ConnectionId, now: Instant, error: &Error) {
-        if let Some(conn) = self.connections.remove(&connection) {
-            self.move_off(connection, conn.responses, now, error);
-        }
-    }
-
-    /// Move the queries on `connection`, which the server closed after
-    /// `responses` responses, as [`Resolver::handle_stream_closed`] says.
-    fn move_off(&mut self, connection: ConnectionId, responses: u64, now: Instant, error: &Error) {
-        for id in self.queries_on(connection) {
-            let progress = self.pending.get(&id).is_some_and(|p| {
-                matches!(p.route, Route::Stream { written_after, .. } if responses > written_after)
-            });
-            if self.may_resend(id) && (progress || (responses > 0 && self.forgive(id))) {
-                if let Some(pending) = self.pending.get_mut(&id) {
-                    pending.deadline = pending.deadline(&self.config, now);
-                }
-                self.emit(id, now);
-            } else {
-                self.retry(id, now, error.clone());
-            }
-        }
+        message
     }
 
     /// Act on a reply already matched to `id`.
@@ -951,233 +1123,6 @@ impl Resolver {
                     self.finish(id, Ok(response));
                 }
             }
-        }
-    }
-
-    /// End `id`, and the queries that joined it, with `outcome`: `id`'s
-    /// event first, then its followers' in the order they joined.
-    fn finish(&mut self, id: QueryId, mut outcome: Result<Message, Error>) {
-        if let Ok(response) = &mut outcome {
-            clamp_ttls(response);
-        }
-        let followers = self.pending.remove(&id).map(|p| p.followers);
-        let copies: Vec<Event> = followers
-            .into_iter()
-            .flatten()
-            .map(|query| event(query, outcome.clone()))
-            .collect();
-        self.events.push_back(event(id, outcome));
-        self.events.extend(copies);
-    }
-
-    /// Retry or fail every query whose deadline is at or before `now`, and
-    /// close connections that have been idle for too long.
-    ///
-    /// A query that times out on a stream moves on to its next attempt. If
-    /// no response has arrived on its connection since it was written
-    /// there, the connection looks dead and is closed: the other queries
-    /// that timed out move on too, and the rest are sent again to the same
-    /// server, by the usual rule (a new connection if they must use a
-    /// stream, else UDP), with their attempt and deadline unchanged, once
-    /// per query and only if that isn't their fourth send to the server
-    /// over that transport (RFC 9520 §3.1); otherwise they move on too. If
-    /// a response has arrived since, the server is only slow with this
-    /// one, which RFC 7766 §7 expects of pipelined queries: the connection
-    /// stays open, and the query's request stays outstanding on it. Should
-    /// a later attempt come back to that connection, it waits for that
-    /// request's answer instead of writing the message ID again (RFC 7766
-    /// §6.2.1), and the connection is closed as above if no response
-    /// arrives by that attempt's deadline. A connection that already holds
-    /// 256 requests left unanswered this way or by [`Resolver::cancel`] is
-    /// closed instead of taking one more, which frees their IDs.
-    ///
-    /// Calling it before [`Resolver::poll_timeout`]'s instant does nothing.
-    /// Calling it late handles every deadline that has passed in one step,
-    /// with new deadlines counted from `now`; queries on a timed-out
-    /// connection whose own deadline has also passed then use up an
-    /// attempt instead of moving for free.
-    pub fn handle_timeout(&mut self, now: Instant) {
-        let expired: Vec<QueryId> = self
-            .pending
-            .iter()
-            .filter(|(_, p)| p.deadline <= now)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in expired {
-            // An earlier close may already have moved this query on.
-            let Some(pending) = self.pending.get(&id) else {
-                continue;
-            };
-            if pending.deadline > now {
-                continue;
-            }
-            let Route::Stream {
-                connection,
-                written_after,
-            } = pending.route
-            else {
-                self.retry(id, now, Error::Timeout);
-                continue;
-            };
-            match self.connections.get_mut(&connection) {
-                Some(conn)
-                    if conn.responses > written_after && conn.orphans.len() < MAX_ORPHANS =>
-                {
-                    conn.orphans.push(Orphan::of(pending));
-                    self.retry(id, now, Error::Timeout);
-                }
-                Some(_) => self.time_out_stream(connection, now),
-                // Can't happen: every path that removes a connection moves
-                // its queries on first. Treated as a plain timeout to be
-                // safe.
-                None => self.retry(id, now, Error::Timeout),
-            }
-        }
-        let idle: Vec<ConnectionId> = self
-            .connections
-            .keys()
-            .filter(|c| self.idle_deadline(**c).is_some_and(|d| d <= now))
-            .copied()
-            .collect();
-        for connection in idle {
-            self.shut(connection);
-        }
-    }
-
-    /// Next transmit to carry out, if any: a datagram, or a stream connect,
-    /// write or close.
-    pub fn poll_transmit(&mut self) -> Option<Transmit> {
-        self.transmits.pop_front()
-    }
-
-    /// Earliest instant at which [`Resolver::handle_timeout`] must be called.
-    /// `None` means no timer is needed: no query is pending and no open
-    /// connection is waiting out [`Config::idle_timeout`]. An idle
-    /// connection keeps a timer running after the last query is done.
-    pub fn poll_timeout(&self) -> Option<Instant> {
-        let queries = self.pending.values().map(|p| p.deadline);
-        let idle = self
-            .connections
-            .keys()
-            .filter_map(|c| self.idle_deadline(*c));
-        queries.chain(idle).min()
-    }
-
-    /// When `connection` should close for being idle: `None` while a query
-    /// uses it. An orphan keeps it busy until the deadline its query had.
-    fn idle_deadline(&self, connection: ConnectionId) -> Option<Instant> {
-        let conn = self.connections.get(&connection)?;
-        if self.pending.values().any(|p| p.is_on(connection)) {
-            return None;
-        }
-        let busy = conn
-            .orphans
-            .iter()
-            .map(|o| o.until)
-            .fold(conn.last_active, Instant::max);
-        busy.checked_add(self.config.idle_timeout)
-    }
-
-    /// Next completed query, if any.
-    pub fn poll_event(&mut self) -> Option<Event> {
-        self.events.pop_front()
-    }
-
-    /// Stop tracking a query. No event is queued for it from now on (one
-    /// already queued, such as a special-use answer, still comes out of
-    /// [`Resolver::poll_event`]), so the driver can close its socket now.
-    ///
-    /// Queries that joined it go on, and the first of them takes it over. If
-    /// its attempt went over UDP, that attempt is sent again for the heir,
-    /// to the same server, with a fresh deadline: as [`Transport::Udp`],
-    /// from a new socket, or on the connection to that server if one has
-    /// opened since. If that would be the fourth send of the search
-    /// candidate to that server over that transport, the heir sends its
-    /// next attempt to the next server instead (RFC 9520 §3.1). If it has
-    /// none left, it fails with [`Error::Timeout`] at once, along with the
-    /// queries that joined it. That failure isn't cached: no server failed
-    /// to answer (RFC 9520 §2), since its answers may have gone to the
-    /// sockets of the cancelled queries, so the next query for the name is
-    /// sent as usual. Over a stream nothing is sent; the answer
-    /// still arrives on the same connection, and the heir keeps the
-    /// deadline.
-    ///
-    /// A query cancelled with no one to take it over after its request was
-    /// written to a connection keeps its message ID in use there until the
-    /// answer arrives or the connection ends, and keeps the connection from
-    /// going idle until the deadline it had (RFC 7766 §6.2.1, §6.2.3). If
-    /// the connection already holds 256 such requests, it is closed instead
-    /// and its other queries move as when one of them times out with no
-    /// response since (see [`Resolver::handle_timeout`]).
-    pub fn cancel(&mut self, id: QueryId, now: Instant) {
-        let Some(mut pending) = self.pending.remove(&id) else {
-            for p in self.pending.values_mut() {
-                p.followers.retain(|&follower| follower != id);
-            }
-            return;
-        };
-        if pending.followers.is_empty() {
-            // Its request is still outstanding on its connection.
-            if let Route::Stream { connection, .. } = pending.route
-                && let Some(conn) = self.connections.get_mut(&connection)
-            {
-                if conn.orphans.len() < MAX_ORPHANS {
-                    conn.orphans.push(Orphan::of(&pending));
-                } else {
-                    self.time_out_stream(connection, now);
-                }
-            }
-            return;
-        }
-        let heir = pending.followers.remove(0);
-        match pending.route {
-            // Nothing to send: the answer still arrives on the connection,
-            // and the heir keeps the deadline.
-            Route::Stream { .. } => {
-                self.pending.insert(heir, pending);
-            }
-            Route::Udp => {
-                let server = pending.server(&self.config);
-                if pending.may_send(server, channel(&self.connections, &pending, server)) {
-                    pending.deadline = pending.deadline(&self.config, now);
-                    self.pending.insert(heir, pending);
-                    self.emit(heir, now);
-                } else {
-                    self.pending.insert(heir, pending);
-                    // Not a resolution failure (RFC 9520 §2): the server may
-                    // well have answered, to the cancelled queries' sockets.
-                    if !self.step(heir, now) {
-                        self.finish(heir, Err(Error::Timeout));
-                    }
-                }
-            }
-        }
-    }
-
-    /// Forget every cached failure and negative answer (see the crate docs),
-    /// and which servers recently failed to answer
-    /// ([`Config::failure_memory`]), as a driver should when the host's
-    /// network changes: what failed or didn't exist on the old network may
-    /// work on the new one, where the servers may be reachable again, and
-    /// a failure stays cached for up to five minutes. Queries in flight go
-    /// on as they are.
-    pub fn flush_cache(&mut self) {
-        self.cache.flush();
-        self.failed.clear();
-    }
-
-    /// Stop: forget every query in flight, as [`Resolver::cancel`] does but
-    /// without handing any over, and close every open connection, over TLS
-    /// after its close_notify alert (RFC 8446 §6.1). For a driver that is
-    /// about to drop its connections: carry out the transmits this queues
-    /// first. Events already queued still come out of
-    /// [`Resolver::poll_event`], and the resolver takes new queries
-    /// afterwards.
-    pub fn shutdown(&mut self) {
-        self.pending.clear();
-        let connections: Vec<ConnectionId> = self.connections.keys().copied().collect();
-        for connection in connections {
-            self.shut(connection);
         }
     }
 
@@ -1299,96 +1244,6 @@ impl Resolver {
         true
     }
 
-    /// The queries whose current attempt was written to `connection`.
-    fn queries_on(&self, connection: ConnectionId) -> Vec<QueryId> {
-        self.pending
-            .iter()
-            .filter(|(_, p)| p.is_on(connection))
-            .map(|(id, _)| *id)
-            .collect()
-    }
-
-    /// A query on `connection` timed out with no response on it since the
-    /// query was written, which suggests the connection is dead, or the
-    /// connection holds `MAX_ORPHANS` requests that left it unanswered:
-    /// close it, as RFC 7766 §6.2.4 lets either end do under unusual
-    /// conditions. The queries that timed out move on to their next
-    /// attempt. The others are sent again to the same server, keeping
-    /// their attempt, since another lookup's slow answer is no fault of
-    /// theirs. They keep their deadline too: they have been waiting on the
-    /// same unresponsive server, and a free move must not stretch how long
-    /// it can hold them. Only once per query, so a server that stops
-    /// answering costs each query a bounded number of sends.
-    fn time_out_stream(&mut self, connection: ConnectionId, now: Instant) {
-        if self.shut(connection).is_none() {
-            return;
-        }
-        for id in self.queries_on(connection) {
-            let expired = self.pending.get(&id).is_some_and(|p| p.deadline <= now);
-            if !expired && self.may_resend(id) && self.forgive(id) {
-                self.emit(id, now);
-            } else {
-                self.retry(id, now, Error::Timeout);
-            }
-        }
-    }
-
-    /// Whether `id`'s current attempt may go to its server once more, over
-    /// the channel that send would take (RFC 9520 §3.1).
-    fn may_resend(&self, id: QueryId) -> bool {
-        self.pending.get(&id).is_some_and(|p| {
-            let server = p.server(&self.config);
-            p.may_send(server, channel(&self.connections, p, server))
-        })
-    }
-
-    /// Whether `id` may send its attempt again for free, which it may once.
-    fn forgive(&mut self, id: QueryId) -> bool {
-        self.pending
-            .get_mut(&id)
-            .is_some_and(|p| !std::mem::replace(&mut p.forgiven, true))
-    }
-
-    /// Ask the driver to close `connection`, after a TLS error, and move
-    /// its queries on to their next attempt.
-    fn close(&mut self, connection: ConnectionId, now: Instant, error: &Error) {
-        if self.shut(connection).is_none() {
-            return;
-        }
-        for id in self.queries_on(connection) {
-            self.retry(id, now, error.clone());
-        }
-    }
-
-    /// Forget `connection` and ask the driver to close it. A TLS session
-    /// first sends its close_notify alert (RFC 8446 §6.1), or after a TLS
-    /// error the alert for that error, which ends the session instead
-    /// (§6.2), as a [`Transport::TcpWrite`] the driver writes before
-    /// closing.
-    fn shut(&mut self, connection: ConnectionId) -> Option<Connection> {
-        #[cfg_attr(
-            not(feature = "tls"),
-            expect(unused_mut, reason = "only TLS changes it")
-        )]
-        let mut conn = self.connections.remove(&connection)?;
-        #[cfg(feature = "tls")]
-        if let Some(last) = conn.tls.as_mut().map(|session| session.close())
-            && !last.is_empty()
-        {
-            self.transmits.push_back(Transmit {
-                transport: Transport::TcpWrite(connection),
-                destination: conn.server,
-                payload: last,
-            });
-        }
-        self.transmits.push_back(Transmit {
-            transport: Transport::TcpClose(connection),
-            destination: conn.server,
-            payload: Vec::new(),
-        });
-        Some(conn)
-    }
-
     /// Re-send `id` to the same server over TCP, as RFC 1123 §6.1.3.2 asks
     /// after a truncated answer, and keep every later send of this search
     /// candidate on a stream. Doesn't consume an attempt. Returns `false`
@@ -1441,6 +1296,38 @@ impl Resolver {
         pending.payload = payload;
         pending.deadline = pending.deadline(&self.config, now);
         self.emit(id, now);
+    }
+
+    /// `id` is out of attempts, every server is excluded, or its TLS
+    /// session can't start: its search candidate failed to resolve (RFC
+    /// 9520 §2). The failure is cached for the candidate's question, so
+    /// nothing is sent for it for a while (§3.2), and `id` and every query
+    /// that joined it fail with `error`, however late they joined: a query
+    /// issued now would get the cached failure too.
+    fn give_up(&mut self, id: QueryId, error: Error, now: Instant) {
+        if let Some(pending) = self.pending.get(&id)
+            && let Some(question) = pending.request.queries.first()
+        {
+            self.cache
+                .failed(question, error.clone(), pending.started, &self.config, now);
+        }
+        self.finish(id, Err(error));
+    }
+
+    /// End `id`, and the queries that joined it, with `outcome`: `id`'s
+    /// event first, then its followers' in the order they joined.
+    fn finish(&mut self, id: QueryId, mut outcome: Result<Message, Error>) {
+        if let Ok(response) = &mut outcome {
+            clamp_ttls(response);
+        }
+        let followers = self.pending.remove(&id).map(|p| p.followers);
+        let copies: Vec<Event> = followers
+            .into_iter()
+            .flatten()
+            .map(|query| event(query, outcome.clone()))
+            .collect();
+        self.events.push_back(event(id, outcome));
+        self.events.extend(copies);
     }
 
     /// Send `id`'s current attempt and count the send: on the open
@@ -1538,6 +1425,9 @@ impl Resolver {
         }
     }
 
+    // A connection's transitions: opening, writing, matching what it reads,
+    // and closing.
+
     /// Open a connection to `server` with `message` as its first query.
     #[cfg_attr(
         not(feature = "tls"),
@@ -1622,55 +1512,175 @@ impl Resolver {
         Ok(())
     }
 
-    /// `id` is out of attempts, every server is excluded, or its TLS
-    /// session can't start: its search candidate failed to resolve (RFC
-    /// 9520 §2). The failure is cached for the candidate's question, so
-    /// nothing is sent for it for a while (§3.2), and `id` and every query
-    /// that joined it fail with `error`, however late they joined: a query
-    /// issued now would get the cached failure too.
-    fn give_up(&mut self, id: QueryId, error: Error, now: Instant) {
-        if let Some(pending) = self.pending.get(&id)
-            && let Some(question) = pending.request.queries.first()
-        {
-            self.cache
-                .failed(question, error.clone(), pending.started, &self.config, now);
+    /// What the response `reply`, received on `connection`, answers: a
+    /// query whose current attempt was written there, or an orphan of the
+    /// connection.
+    fn stream_match(&self, connection: ConnectionId, reply: &Reply) -> Option<Matched> {
+        let conn = self.connections.get(&connection)?;
+        let queries = self.pending.iter().filter(|(_, p)| p.is_on(connection));
+        if reply.has_question() {
+            let query = queries
+                .filter(|(_, p)| reply.answers(p.request.metadata.id, &p.request.queries))
+                .map(|(id, _)| Matched::Query(*id));
+            let orphan = conn
+                .orphans
+                .iter()
+                .position(|o| reply.answers(o.id, &o.question))
+                .map(Matched::Orphan);
+            return query.chain(orphan).next();
         }
-        self.finish(id, Err(error));
+        let mut candidates = queries
+            .filter(|(_, p)| reply.responds_to(p.request.metadata.id))
+            .map(|(id, _)| Matched::Query(*id))
+            .chain(
+                (0..conn.orphans.len())
+                    .filter(|&i| conn.orphans.get(i).is_some_and(|o| reply.responds_to(o.id)))
+                    .map(Matched::Orphan),
+            );
+        let only = candidates.next();
+        candidates.next().map_or(only, |_| None)
     }
 
-    /// A query message with an ID that is in use neither by a query in
-    /// flight nor by an orphan on a connection, so no connection ever
-    /// carries two outstanding queries with one ID (RFC 7766 §6.2.1).
-    ///
-    /// The ID comes from hickory-proto's `rand::random`, a CSPRNG, covering
-    /// the full 16-bit range as RFC 5452 §9.2 requires. If a few random
-    /// picks all hit IDs in use, the free ID that follows the last one is
-    /// taken. Only with all 65536 in use is a used one kept: a datagram is
-    /// matched by its query's own socket and a stream answer by ID and
-    /// question, so a duplicate ID then only pairs queries whose answers
-    /// are interchangeable.
-    fn new_message(&self) -> Message {
-        let used = |id: u16| {
-            self.pending.values().any(|p| p.request.metadata.id == id)
-                || self
-                    .connections
-                    .values()
-                    .any(|c| c.orphans.iter().any(|o| o.id == id))
-        };
-        let mut message = Message::query();
-        for _ in 0..16 {
-            if !used(message.metadata.id) {
-                return message;
+    /// Take the first complete length-prefixed message off `connection`'s
+    /// buffer, or `None` if there is none yet.
+    fn next_message(&mut self, connection: ConnectionId) -> Option<Vec<u8>> {
+        let conn = self.connections.get_mut(&connection)?;
+        let (len, rest) = conn.received.split_first_chunk::<2>()?;
+        let len = usize::from(u16::from_be_bytes(*len));
+        let message = rest.get(..len)?.to_vec();
+        conn.received.drain(..2 + len);
+        Some(message)
+    }
+
+    /// `connection` went away without being asked to; see
+    /// [`Resolver::handle_stream_closed`]. Emits no `TcpClose`: the driver
+    /// reported the connection gone.
+    fn lost(&mut self, connection: ConnectionId, now: Instant, error: &Error) {
+        if let Some(conn) = self.connections.remove(&connection) {
+            self.move_off(connection, conn.responses, now, error);
+        }
+    }
+
+    /// Move the queries on `connection`, which the server closed after
+    /// `responses` responses, as [`Resolver::handle_stream_closed`] says.
+    fn move_off(&mut self, connection: ConnectionId, responses: u64, now: Instant, error: &Error) {
+        for id in self.queries_on(connection) {
+            let progress = self.pending.get(&id).is_some_and(|p| {
+                matches!(p.route, Route::Stream { written_after, .. } if responses > written_after)
+            });
+            if self.may_resend(id) && (progress || (responses > 0 && self.forgive(id))) {
+                if let Some(pending) = self.pending.get_mut(&id) {
+                    pending.deadline = pending.deadline(&self.config, now);
+                }
+                self.emit(id, now);
+            } else {
+                self.retry(id, now, error.clone());
             }
-            message = Message::query();
         }
-        let last = message.metadata.id;
-        if let Some(free) = (1..=u16::MAX)
-            .map(|i| last.wrapping_add(i))
-            .find(|&id| !used(id))
+    }
+
+    /// The queries whose current attempt was written to `connection`.
+    fn queries_on(&self, connection: ConnectionId) -> Vec<QueryId> {
+        self.pending
+            .iter()
+            .filter(|(_, p)| p.is_on(connection))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// A query on `connection` timed out with no response on it since the
+    /// query was written, which suggests the connection is dead, or the
+    /// connection holds `MAX_ORPHANS` requests that left it unanswered:
+    /// close it, as RFC 7766 §6.2.4 lets either end do under unusual
+    /// conditions. The queries that timed out move on to their next
+    /// attempt. The others are sent again to the same server, keeping
+    /// their attempt, since another lookup's slow answer is no fault of
+    /// theirs. They keep their deadline too: they have been waiting on the
+    /// same unresponsive server, and a free move must not stretch how long
+    /// it can hold them. Only once per query, so a server that stops
+    /// answering costs each query a bounded number of sends.
+    fn time_out_stream(&mut self, connection: ConnectionId, now: Instant) {
+        if self.shut(connection).is_none() {
+            return;
+        }
+        for id in self.queries_on(connection) {
+            let expired = self.pending.get(&id).is_some_and(|p| p.deadline <= now);
+            if !expired && self.may_resend(id) && self.forgive(id) {
+                self.emit(id, now);
+            } else {
+                self.retry(id, now, Error::Timeout);
+            }
+        }
+    }
+
+    /// Whether `id`'s current attempt may go to its server once more, over
+    /// the channel that send would take (RFC 9520 §3.1).
+    fn may_resend(&self, id: QueryId) -> bool {
+        self.pending.get(&id).is_some_and(|p| {
+            let server = p.server(&self.config);
+            p.may_send(server, channel(&self.connections, p, server))
+        })
+    }
+
+    /// Whether `id` may send its attempt again for free, which it may once.
+    fn forgive(&mut self, id: QueryId) -> bool {
+        self.pending
+            .get_mut(&id)
+            .is_some_and(|p| !std::mem::replace(&mut p.forgiven, true))
+    }
+
+    /// Ask the driver to close `connection`, after a TLS error, and move
+    /// its queries on to their next attempt.
+    fn close(&mut self, connection: ConnectionId, now: Instant, error: &Error) {
+        if self.shut(connection).is_none() {
+            return;
+        }
+        for id in self.queries_on(connection) {
+            self.retry(id, now, error.clone());
+        }
+    }
+
+    /// Forget `connection` and ask the driver to close it. A TLS session
+    /// first sends its close_notify alert (RFC 8446 §6.1), or after a TLS
+    /// error the alert for that error, which ends the session instead
+    /// (§6.2), as a [`Transport::TcpWrite`] the driver writes before
+    /// closing.
+    fn shut(&mut self, connection: ConnectionId) -> Option<Connection> {
+        #[cfg_attr(
+            not(feature = "tls"),
+            expect(unused_mut, reason = "only TLS changes it")
+        )]
+        let mut conn = self.connections.remove(&connection)?;
+        #[cfg(feature = "tls")]
+        if let Some(last) = conn.tls.as_mut().map(|session| session.close())
+            && !last.is_empty()
         {
-            message.metadata.id = free;
+            self.transmits.push_back(Transmit {
+                transport: Transport::TcpWrite(connection),
+                destination: conn.server,
+                payload: last,
+            });
         }
-        message
+        self.transmits.push_back(Transmit {
+            transport: Transport::TcpClose(connection),
+            destination: conn.server,
+            payload: Vec::new(),
+        });
+        Some(conn)
+    }
+
+    /// When `connection` should close for being idle: `None` while a query
+    /// uses it. An orphan keeps it busy until the deadline its query had.
+    fn idle_deadline(&self, connection: ConnectionId) -> Option<Instant> {
+        let conn = self.connections.get(&connection)?;
+        if self.pending.values().any(|p| p.is_on(connection)) {
+            return None;
+        }
+        let busy = conn
+            .orphans
+            .iter()
+            .map(|o| o.until)
+            .fold(conn.last_active, Instant::max);
+        busy.checked_add(self.config.idle_timeout)
     }
 }
