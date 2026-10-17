@@ -2,16 +2,20 @@
 //! in-process rustls server that the input steers and tampers with: what
 //! it says inside the session, when it sends close_notify, and what
 //! follows. The server checks each query it decrypts: it keeps its OPT
-//! record, is padded to a multiple of 128 octets (RFC 8467 §4.1), and is
-//! sent at most `attempts + 3` times, and at most three times to one server
-//! (RFC 9520 §3.1). Run with `-timeout` so a receive loop that
-//! stops making progress shows up as a hang.
+//! record, carries a Client Subnet option with SOURCE PREFIX-LENGTH 0 for
+//! the server's address family (RFC 8310 §11.1, RFC 7871 §7.1.2), then one
+//! padding option, last, to a multiple of 128 octets (RFC 8467 §3, §4.1),
+//! and is sent at most `attempts + 3` times, and at most three times to one
+//! server (RFC 9520 §3.1). Every connection the resolver closes ends its
+//! session first, with close_notify or an alert (RFC 8446 §6). Run with
+//! `-timeout` so a receive loop that stops making progress shows up as a
+//! hang.
 
 #![no_main]
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 
 use arbitrary::Arbitrary;
@@ -20,9 +24,17 @@ use rustls::client::Resumption;
 use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection};
 use sansio_dns::hickory_proto::op::{Message, ResponseCode};
+use sansio_dns::hickory_proto::rr::rdata::opt::{EdnsCode, EdnsOption};
 use sansio_dns::hickory_proto::rr::{Name, RecordType};
 use sansio_dns::{Config, ConnectionId, Transport};
-use sansio_dns_fuzz::{Code, Harness, S1, S2, flip, frame, name, reply};
+use sansio_dns_fuzz::{Code, Harness, flip, frame, name, reply};
+
+/// Name servers on the DNS over TLS port, one of each address family.
+const T1: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 853);
+const T2: SocketAddr = SocketAddr::new(
+    IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2)),
+    853,
+);
 
 #[derive(Arbitrary, Debug)]
 enum Step {
@@ -64,6 +76,8 @@ enum Step {
     },
     Query,
     Elapse(u16),
+    /// The driver stops (`Resolver::shutdown`).
+    Shutdown,
 }
 
 /// A client trusting a self-signed `dns.example` certificate, and a server
@@ -107,8 +121,19 @@ struct Sends {
 impl Sends {
     fn check(&mut self, query: &[u8], server: SocketAddr) -> Message {
         let request = Message::from_vec(query).expect("the resolver sent garbage");
-        assert!(request.edns.is_some(), "query without EDNS over TLS");
+        let edns = request.edns.as_ref().expect("query without EDNS over TLS");
         assert_eq!(query.len() % 128, 0, "query not padded to 128 octets");
+        let options = edns.options().as_ref();
+        assert!(
+            matches!(
+                options,
+                [(EdnsCode::Subnet, EdnsOption::Subnet(subnet)), (EdnsCode::Padding, _)]
+                    if subnet.source_prefix() == 0
+                        && subnet.scope_prefix() == 0
+                        && subnet.addr().is_ipv6() == server.is_ipv6()
+            ),
+            "not a Client Subnet privacy election, then padding: {options:?}"
+        );
         let name = request.queries.first().map(|q| q.name().clone());
         let (id, name) = (request.metadata.id, name.unwrap_or_default());
         let count = self
@@ -140,6 +165,12 @@ struct Peer {
     outbox: Vec<u8>,
     /// Whether the session failed, so it takes no more input.
     failed: bool,
+    /// Whether the resolver ended the session, with close_notify or an
+    /// alert. An alert the server can't decrypt, because tampered
+    /// handshake bytes left the two ends with different keys, fails the
+    /// session instead: the bytes from the resolver are never tampered
+    /// with, so a failure on them comes from such an alert.
+    ended: bool,
 }
 
 impl Peer {
@@ -147,7 +178,13 @@ impl Peer {
         while !data.is_empty() && !self.failed {
             match self.session.read_tls(&mut data) {
                 Ok(0) | Err(_) => self.failed = true,
-                Ok(_) => self.failed = self.session.process_new_packets().is_err(),
+                Ok(_) => match self.session.process_new_packets() {
+                    Ok(state) => self.ended |= state.peer_has_closed(),
+                    Err(error) => {
+                        self.failed = true;
+                        self.ended |= matches!(error, rustls::Error::AlertReceived(_));
+                    }
+                },
             }
         }
         // EOF and WouldBlock both just mean nothing more for now.
@@ -205,6 +242,7 @@ fn pump(harness: &mut Harness, peers: &mut BTreeMap<ConnectionId, Peer>, sends: 
                     queries: Vec::new(),
                     outbox: Vec::new(),
                     failed: false,
+                    ended: false,
                 };
                 peer.receive(&t.payload, sends);
                 peers.insert(c, peer);
@@ -215,7 +253,12 @@ fn pump(harness: &mut Harness, peers: &mut BTreeMap<ConnectionId, Peer>, sends: 
                 }
             }
             Transport::TcpClose(c) => {
-                peers.remove(&c);
+                if let Some(peer) = peers.remove(&c) {
+                    assert!(
+                        peer.ended || peer.failed,
+                        "{c:?} closed without close_notify or an alert"
+                    );
+                }
             }
             Transport::Udp(_) => panic!("a DoT resolver sent a datagram"),
         }
@@ -225,15 +268,15 @@ fn pump(harness: &mut Harness, peers: &mut BTreeMap<ConnectionId, Peer>, sends: 
 fuzz_target!(|steps: Vec<Step>| {
     let (client, _) = configs();
     let server_name = ServerName::try_from("dns.example").expect("a valid name");
-    let Ok(config) = Config::new(S1, [S2]).with_tls(Arc::clone(client), server_name) else {
-        return;
-    };
+    let config = Config::new(T1, [T2])
+        .with_tls(Arc::clone(client), server_name)
+        .expect("a valid DNS over TLS configuration");
     let mut sends = Sends {
         max: config.attempts.get() + 3,
         counts: BTreeMap::new(),
         per_server: BTreeMap::new(),
     };
-    let mut harness = Harness::new(config, vec![S1, S2], None).tls();
+    let mut harness = Harness::new(config, vec![T1, T2], None).tls();
     let mut peers = BTreeMap::new();
     let mut queries = 0;
     let mut query = |harness: &mut Harness| {
@@ -295,8 +338,11 @@ fuzz_target!(|steps: Vec<Step>| {
                 }
             }
             Step::CloseNotify { connection } => {
+                // Not during the handshake: a rustls server that sent
+                // close_notify then and gets the resolver's close_notify
+                // trips a debug assertion of its own.
                 let peer = harness.open(*connection).and_then(|c| peers.get_mut(&c));
-                if let Some(peer) = peer {
+                if let Some(peer) = peer.filter(|p| !p.session.is_handshaking()) {
                     peer.session.send_close_notify();
                     peer.flush();
                 }
@@ -315,6 +361,7 @@ fuzz_target!(|steps: Vec<Step>| {
             }
             Step::Query => query(&mut harness),
             Step::Elapse(millis) => harness.elapse(*millis),
+            Step::Shutdown => harness.shutdown(),
         }
         pump(&mut harness, &mut peers, &mut sends);
     }

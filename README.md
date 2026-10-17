@@ -48,8 +48,9 @@ which still starts over rather than fail if it joined late.
 [`sansio-dns-tokio`](sansio-dns-tokio) is a ready-made driver: `lookup_ip(host)` runs an
 `IpLookup` on a background task shared by all clones of the resolver. Each UDP query gets its
 own socket, connected to its server, and TCP or TLS connections stay open between lookups
-until they go idle. With its
-`reqwest` feature, it plugs into reqwest as the DNS resolver:
+until they go idle; when the last clone is dropped, it closes them, over TLS after
+close_notify. Its `tls` feature turns on DNS over TLS in `sansio-dns`. With its `reqwest`
+feature, it plugs into reqwest as the DNS resolver:
 
 ```rust
 let client = reqwest::Client::builder()
@@ -63,9 +64,19 @@ small HTTP client built this way.
 ### DNS over TLS
 
 With the `tls` feature, `Config::with_tls(client, server_name)` sends every query over TLS
-(RFC 7858) and authenticates the servers as `server_name` (RFC 8310 strict profile). The crate
-brings rustls without a crypto provider or root store: build the `ClientConfig` with the ones
-you want. `examples/dot.rs` uses ring and the webpki roots:
+(RFC 7858) and authenticates the servers as `server_name` (RFC 8310 strict profile).
+`Config::with_tls_names(client, names)` gives each server its own name, so servers of
+different operators can be mixed (RFC 8310 §7.1). Servers on port 53 are refused: DNS over TLS
+uses port 853 or another agreed port, never 53 (RFC 7858 §3.1). Queries are padded to a multiple
+of 128 octets (RFC 8467) and carry an EDNS Client Subnet option with source prefix length 0, which
+asks the server not to pass the client's address on (RFC 8310 §11.1, RFC 7871).
+
+The crate brings rustls without a crypto provider or root store: build the `ClientConfig` with
+the ones you want. For the strict profile, keep rustls' default WebPKI verifier (a custom
+verifier that accepts more gives the profile up), TLS 1.3, session resumption and SNI, and set
+`alpn_protocols` to `[b"dot"]`, the ALPN identifier IANA registered for DNS over TLS (RFC 9325
+§3.8). A `ServerName::IpAddress` is matched against the certificate's IP addresses, which is not
+one of RFC 8310's authentication mechanisms. `examples/dot.rs` uses ring and the webpki roots:
 
 ```sh
 cargo run --example dot --features tls -- example.com 1.1.1.1:853 cloudflare-dns.com
@@ -140,10 +151,11 @@ authority-section rule in `rfc1035.rs`'s §4.1.1 module, which also has the exte
 RFC 6891 §6.1.3 and RFC 7873 §5.3; RFC 2308 §2.2's NODATA is in `rfc1123.rs`'s §6.1.4.3
 module, and RFC 6895, 8482 and 9824 in its §6.1.3.2 module; RFC 2308 §7.2's cap is in
 `rfc9520.rs`'s §3.2 module; RFC 6762 and 7686 are tested in `rfc6761.rs`'s §6.4 module;
-`rfc7858.rs` holds the RFC 7858, 8310 and 8467 tests as plain functions, without section
-modules; and `rfc7766.rs` also has a `stream_timeout` module for queries that time out on a
-connection.
-`tests/main.rs` builds them all as one crate.
+`rfc7858.rs` holds the RFC 7858, 8310, 8467, 7830, 7871 and 8446 tests as plain functions,
+without section modules; and `rfc7766.rs` also has a `stream_timeout` module for queries that
+time out on a connection. `tests/main.rs` builds them all as one crate. The Tokio driver's
+`sansio-dns-tokio/tests/tls.rs` checks that its DNS over TLS connections end with close_notify (RFC 8446
+§6.1), when the server closes first and when the resolver is dropped.
 
 | RFC | Section | Behavior |
 |---|---|---|
@@ -181,9 +193,16 @@ connection.
 | 6762 | §3 | `local.` names are sent to the name servers like any other, as glibc does without nss-mdns; mDNS is up to the caller |
 | 7686 | §2 | `onion.` → NXDOMAIN; nothing sent |
 | 7858 | §3 | With `tls`: every query over TLS on a stream, never UDP; TLS errors fail the attempt |
-| 7858 | §3.4 | The TLS session is reused for later queries; queries wait out a handshake in progress |
-| 8310 | §5 | Strict profile: the certificate must match the configured name |
-| 8467 | §4.1 | Queries padded to a multiple of 128 octets |
+| 7858 | §3.1 | Servers on port 53 are refused |
+| 7858 | §3.3 | Queries written during the handshake wait for it in the resolver, any number of them, and go out whole after it; replies of any size come through the session in any chunking |
+| 7858 | §3.4 | The TLS session is reused for later queries, and resumed on a new connection; the server's close_notify closes the connection and its queries go to a new one, as after any close, and so does a query that an answer arriving with the close_notify moves on to the same server |
+| 8446 | §6.1 | Every connection the resolver closes gets close_notify first, written by the driver before it closes, unless an error alert already ended the session (§6.2); `shutdown` closes them all this way when the driver stops, and the server's close_notify is answered with the resolver's own |
+| 8446 | §6.2 | On a TLS error, the alert rustls queued is sent before the connection closes |
+| 8310 | §5, §8.1 | Strict profile: the certificate must chain to a trusted root and match the configured name (with the default WebPKI verifier) |
+| 8310 | §7.1 | One authentication name per server (`with_tls_names`) |
+| 8310 | §11.1 | Queries over TLS carry an EDNS Client Subnet option with SOURCE PREFIX-LENGTH 0, FAMILY that of the transport (RFC 7871 §7.1.2) |
+| 8467 | §4.1 | Queries padded to a multiple of 128 octets, the padding option last (§3) |
+| 7830 | §3, §6 | One padding option per query, and none on UDP or TCP without TLS |
 | 9520 | §3.1 | A search candidate is sent at most three times to each server over each transport (UDP, and TCP or TLS), free resends and cancel hand-overs included; a send that would be the fourth goes to the next server as a new attempt, and the query fails when no server is left, unless it took over from a cancelled query after joining late: then it starts over. `resolv.conf` attempts are capped at 3 per server |
 | 9520 | §3.2 | A server that failed to answer goes after the others for at most 5 minutes (`failure_memory`, 60 s by default), kept per server address (RFC 2308 §7.2 caps it too) |
 
@@ -199,7 +218,10 @@ and port.
 
 Stream connections are named by a `ConnectionId`: `TcpConnect(id)` means open a connection
 to the destination and write the payload, `TcpWrite(id)` write to it, `TcpClose(id)` close
-it. Payloads are already length-prefixed or TLS-encrypted: write each in one call (RFC 7766
+it once the writes before it are done. With TLS the last of them carries the close_notify alert,
+which must reach the server before the close (RFC 8446 §6.1), or the alert for a TLS error
+(§6.2). A connection still connecting when its `TcpClose` comes can be dropped at once, since
+nothing written to it has gone out. Payloads are already length-prefixed or TLS-encrypted: write each in one call (RFC 7766
 §8), and disable Nagle's algorithm (`TCP_NODELAY`) so pipelined queries go out at once
 (§6.2.1.1). Pass everything read to `handle_stream_data(id, …)`. Call
 `handle_stream_closed(id, …)` if the server closes the connection, and
@@ -207,10 +229,16 @@ it. Payloads are already length-prefixed or TLS-encrypted: write each in one cal
 attempts fails with that error. The resolver keeps one connection per server and pipelines
 queries over it; it closes the connection after `Config::idle_timeout` (10 s) without
 queries, when a query on it times out with no response since it was written, when 256
-requests on it went unanswered, or, with `tls`, when TLS rejects bytes received on it.
+requests on it went unanswered, or, with `tls`, when TLS rejects bytes received on it or a
+write to it, or the server sent close_notify.
 
 A `TcpWrite` can follow its `TcpConnect` before connecting has finished, so queue it. After
-reporting a connection closed or failed, forget it: no `TcpClose` follows. When binding,
+reporting a connection closed or failed, no transmit for it follows, `TcpClose` included, but
+still carry out the ones queued before the report and then close it: over TLS they can hold
+the resolver's reply to the server's close_notify, which a driver that reads the end of the
+stream first must not drop. A report for a connection the resolver already closed is
+ignored. A driver that stops calls `shutdown` and carries out its transmits before dropping
+its connections, so every TLS session ends with close_notify. When binding,
 connecting or sending on a query's socket fails, or receiving on it reports an error such as
 an ICMP port unreachable (RFC 1122 §4.1.3.3), call `handle_udp_error(query, to, kind, …)`,
 so the query moves on at once instead of waiting out its deadline. An error doesn't end the
@@ -222,6 +250,8 @@ read datagrams into a buffer of at least 1232 bytes.
 ### Not implemented
 
 - Opportunistic (unauthenticated) TLS.
+- SPKI pin sets (RFC 7858 §4.2) and raw public keys (RFC 8310 §9), and DANE authentication
+  (RFC 8310 §8.2), which needs DNSSEC validation.
 - EDNS TCP keepalive (RFC 7828) to negotiate the idle timeout with the server.
 - DoH/DoQ, caching.
 - DNS cookies (RFC 7873): queries carry no COOKIE option.
@@ -250,9 +280,11 @@ queries and open connections, and a timer exactly while something is pending; `d
 `stream` and `driver_ops` also bound the sends per query. `system_files` checks the local
 answers for hosts and special-use names, the order of the search candidates and the answer
 the search ends on, and
-`tls_stream` checks that every query the server decrypts keeps EDNS, is padded to a multiple
-of 128 octets and is sent at most `attempts + 3` times, and at most three times to one
-server. They need nightly:
+`tls_stream` checks that every query the server decrypts keeps EDNS, carries the Client
+Subnet privacy option for the server's address family and then one padding option to a
+multiple of 128 octets, and is sent at most `attempts + 3` times, and at most three times to
+one server, and that every connection the resolver closes ends its session with close_notify
+or an alert first. They need nightly:
 
 ```sh
 cd fuzz && cargo fuzz run driver_ops -- -max_total_time=60 -timeout=5

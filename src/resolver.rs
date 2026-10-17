@@ -13,12 +13,12 @@ use hickory_proto::rr::{Name, RecordType};
 use crate::config::MAX_SENDS_PER_SERVER;
 #[cfg(feature = "tls")]
 use crate::tls;
-#[cfg(feature = "tls")]
-use crate::wire::pad;
 use crate::wire::{
     EDNS_PAYLOAD, Reply, clamp_ttls, frame, has_data, is_meta_type, is_referral, is_special_use,
     special_use,
 };
+#[cfg(feature = "tls")]
+use crate::wire::{is_protected_for, protect};
 use crate::{Config, ConnectionId, Error, Event, QueryId, Transmit, Transport};
 
 /// How many requests that left a connection unanswered (`Orphan`s) it may
@@ -172,9 +172,13 @@ struct Connection {
     responses: u64,
     /// Queries written to it that left it before their answer came.
     orphans: Vec<Orphan>,
+    /// Whether the server ended it (its close_notify arrived) while the
+    /// answers that came before are still being acted on: nothing more is
+    /// sent on it, and it is closed once they are done.
+    closing: bool,
     /// The TLS session, when using DNS over TLS.
     #[cfg(feature = "tls")]
-    tls: Option<Box<rustls::ClientConnection>>,
+    tls: Option<Box<tls::Session>>,
 }
 
 /// A query that left a connection before its answer came: it was
@@ -222,7 +226,11 @@ fn channel(
     pending: &Pending,
     server: SocketAddr,
 ) -> Channel {
-    if pending.stream_only || connections.values().any(|c| c.server == server) {
+    if pending.stream_only
+        || connections
+            .values()
+            .any(|c| c.server == server && !c.closing)
+    {
         Channel::Stream
     } else {
         Channel::Udp
@@ -405,12 +413,12 @@ impl Resolver {
         let mut edns = Edns::new();
         edns.set_max_payload(EDNS_PAYLOAD);
         request.set_edns(edns);
+        let first = self.first_server(now);
         #[cfg(feature = "tls")]
         if self.config.uses_tls() {
-            pad(&mut request)?;
+            protect(&mut request, self.config.server(first))?;
         }
         let payload = request.to_vec()?;
-        let first = self.first_server(now);
         Ok(Pending {
             request,
             payload,
@@ -526,9 +534,18 @@ impl Resolver {
     /// Only a complete response counts as activity for the idle timeout
     /// and shows the connection works (RFC 7766 §6.2.3): a server that
     /// trickles bytes can't keep it open. Over TLS, the bytes go through
-    /// the session first, which may queue a [`Transport::TcpWrite`]; a TLS
-    /// error closes the connection and moves its queries on to their next
-    /// attempt.
+    /// the session first, which may queue a [`Transport::TcpWrite`]: the
+    /// rest of the handshake, and then the queries that waited for it. A
+    /// TLS error closes the connection, after the alert rustls queued for
+    /// it (RFC 8446 §6.2), and moves its queries on to their next attempt.
+    /// When the server's close_notify arrives, the answers before it count
+    /// and anything after it is ignored (RFC 8446 §6.1): the resolver
+    /// sends its own close_notify, closes the connection and moves its
+    /// queries on as [`Resolver::handle_stream_closed`] does. A query that
+    /// one of those answers moves on to the same server (the next search
+    /// candidate, say) goes to a new connection. A later
+    /// `handle_stream_closed` or `handle_stream_error` for the connection
+    /// is ignored.
     pub fn handle_stream_data(&mut self, connection: ConnectionId, data: &[u8], now: Instant) {
         let Some(conn) = self.connections.get_mut(&connection) else {
             return;
@@ -536,18 +553,23 @@ impl Resolver {
         #[cfg(feature = "tls")]
         let decrypted;
         #[cfg(feature = "tls")]
+        let mut closed = false;
+        #[cfg(feature = "tls")]
         let data = match &mut conn.tls {
             None => data,
-            Some(session) => match tls::receive(session, data) {
-                Ok((reply, plaintext)) => {
-                    if !reply.is_empty() {
+            Some(session) => match session.receive(data) {
+                Ok(received) => {
+                    if !received.reply.is_empty() {
                         self.transmits.push_back(Transmit {
                             transport: Transport::TcpWrite(connection),
                             destination: conn.server,
-                            payload: reply,
+                            payload: received.reply,
                         });
                     }
-                    decrypted = plaintext;
+                    closed = received.closed;
+                    // Answers that move a query on must not send it here.
+                    conn.closing = closed;
+                    decrypted = received.plaintext;
                     &decrypted[..]
                 }
                 Err(error) => {
@@ -585,6 +607,10 @@ impl Resolver {
                 }
                 None => {}
             }
+        }
+        #[cfg(feature = "tls")]
+        if closed && let Some(conn) = self.shut(connection) {
+            self.move_off(connection, conn.responses, now, &Error::ConnectionClosed);
         }
     }
 
@@ -695,15 +721,20 @@ impl Resolver {
     /// [`Resolver::handle_stream_closed`]. Emits no `TcpClose`: the driver
     /// reported the connection gone.
     fn lost(&mut self, connection: ConnectionId, now: Instant, error: &Error) {
-        let Some(conn) = self.connections.remove(&connection) else {
-            return;
-        };
+        if let Some(conn) = self.connections.remove(&connection) {
+            self.move_off(connection, conn.responses, now, error);
+        }
+    }
+
+    /// Move the queries on `connection`, which the server closed after
+    /// `responses` responses, as [`Resolver::handle_stream_closed`] says.
+    fn move_off(&mut self, connection: ConnectionId, responses: u64, now: Instant, error: &Error) {
         for id in self.queries_on(connection) {
             let progress = self
                 .pending
                 .get(&id)
-                .is_some_and(|p| conn.responses > p.written_after);
-            if self.may_resend(id) && (progress || (conn.responses > 0 && self.forgive(id))) {
+                .is_some_and(|p| responses > p.written_after);
+            if self.may_resend(id) && (progress || (responses > 0 && self.forgive(id))) {
                 if let Some(pending) = self.pending.get_mut(&id) {
                     pending.deadline = pending.deadline(&self.config, now);
                 }
@@ -866,13 +897,7 @@ impl Resolver {
             .copied()
             .collect();
         for connection in idle {
-            if let Some(conn) = self.connections.remove(&connection) {
-                self.transmits.push_back(Transmit {
-                    transport: Transport::TcpClose(connection),
-                    destination: conn.server,
-                    payload: Vec::new(),
-                });
-            }
+            self.shut(connection);
         }
     }
 
@@ -979,6 +1004,21 @@ impl Resolver {
         }
     }
 
+    /// Stop: forget every query in flight, as [`Resolver::cancel`] does but
+    /// without handing any over, and close every open connection, over TLS
+    /// after its close_notify alert (RFC 8446 §6.1). For a driver that is
+    /// about to drop its connections: carry out the transmits this queues
+    /// first. Events already queued still come out of
+    /// [`Resolver::poll_event`], and the resolver takes new queries
+    /// afterwards.
+    pub fn shutdown(&mut self) {
+        self.pending.clear();
+        let connections: Vec<ConnectionId> = self.connections.keys().copied().collect();
+        for connection in connections {
+            self.shut(connection);
+        }
+    }
+
     // How a query moves on, row by row of the crate docs' table, and the
     // state that keeps each free step bounded per search candidate:
     //
@@ -995,14 +1035,16 @@ impl Resolver {
     //   keeps every later send off UDP
     // - FORMERR without OPT: `drop_edns`, once because `request.edns` is
     //   taken
-    // - connection lost after it answered: `lost`, then `emit` again, for
-    //   free every time if it answered after the query was written
-    //   (`written_after`), else once by way of `forgive`
+    // - connection lost after it answered, or closed by the server's
+    //   close_notify (`handle_stream_data`): `move_off`, by way of `lost`
+    //   or `shut`, then `emit` again, for free every time if it answered
+    //   after the query was written (`written_after`), else once by way of
+    //   `forgive`
     // - neighbour timed out on the connection, or it was closed for holding
     //   too many orphans: `time_out_stream`, then `forgive` and `emit` (the
     //   same `forgiven` flag), else `retry`
-    // - connection that never answered lost, TLS error on received bytes:
-    //   `lost` or `close`, then `retry`
+    // - connection that never answered lost, TLS error on received bytes,
+    //   TLS write refused (`emit`): `move_off` or `close`, then `retry`
     // - NXDOMAIN or NODATA, with candidates left: `search_on`, then
     //   `next_candidate`, which resets all of the above with a new
     //   `Pending`
@@ -1018,10 +1060,10 @@ impl Resolver {
     // connection to the server if there is one, RFC 7766 §5) and counts it
     // in `Pending::sends`, and no search candidate goes to a server over a
     // channel more than three times (RFC 9520 §3.1): `advance` skips
-    // servers without room, and `drop_edns`, `lost`, `time_out_stream` and
-    // `cancel` check `may_resend` before a free send, and so does
+    // servers without room, and `drop_edns`, `move_off`, `time_out_stream`
+    // and `cancel` check `may_resend` before a free send, and so does
     // `switch_to_tcp`, since earlier attempts may have gone to an open
-    // connection. They move on as `retry` (`lost`, `time_out_stream`) or
+    // connection. They move on as `retry` (`move_off`, `time_out_stream`) or
     // `advance` (`drop_edns`, `cancel`, `switch_to_tcp`) instead. That
     // check is all that bounds the resends after a lost connection that
     // answered since.
@@ -1101,14 +1143,9 @@ impl Resolver {
     /// it can hold them. Only once per query, so a server that stops
     /// answering costs each query a bounded number of sends.
     fn time_out_stream(&mut self, connection: ConnectionId, now: Instant) {
-        let Some(conn) = self.connections.remove(&connection) else {
+        if self.shut(connection).is_none() {
             return;
-        };
-        self.transmits.push_back(Transmit {
-            transport: Transport::TcpClose(connection),
-            destination: conn.server,
-            payload: Vec::new(),
-        });
+        }
         for id in self.queries_on(connection) {
             let expired = self.pending.get(&id).is_some_and(|p| p.deadline <= now);
             if !expired && self.may_resend(id) && self.forgive(id) {
@@ -1135,21 +1172,44 @@ impl Resolver {
             .is_some_and(|p| !std::mem::replace(&mut p.forgiven, true))
     }
 
-    /// Ask the driver to close `connection`, and move its queries on to
-    /// their next attempt.
-    #[cfg(feature = "tls")]
+    /// Ask the driver to close `connection`, after a TLS error, and move
+    /// its queries on to their next attempt.
     fn close(&mut self, connection: ConnectionId, now: Instant, error: &Error) {
-        let Some(conn) = self.connections.remove(&connection) else {
+        if self.shut(connection).is_none() {
             return;
-        };
+        }
+        for id in self.queries_on(connection) {
+            self.retry(id, now, error.clone());
+        }
+    }
+
+    /// Forget `connection` and ask the driver to close it. A TLS session
+    /// first sends its close_notify alert (RFC 8446 §6.1), or after a TLS
+    /// error the alert for that error, which ends the session instead
+    /// (§6.2), as a [`Transport::TcpWrite`] the driver writes before
+    /// closing.
+    fn shut(&mut self, connection: ConnectionId) -> Option<Connection> {
+        #[cfg_attr(
+            not(feature = "tls"),
+            expect(unused_mut, reason = "only TLS changes it")
+        )]
+        let mut conn = self.connections.remove(&connection)?;
+        #[cfg(feature = "tls")]
+        if let Some(last) = conn.tls.as_mut().map(|session| session.close())
+            && !last.is_empty()
+        {
+            self.transmits.push_back(Transmit {
+                transport: Transport::TcpWrite(connection),
+                destination: conn.server,
+                payload: last,
+            });
+        }
         self.transmits.push_back(Transmit {
             transport: Transport::TcpClose(connection),
             destination: conn.server,
             payload: Vec::new(),
         });
-        for id in self.queries_on(connection) {
-            self.retry(id, now, error.clone());
-        }
+        Some(conn)
     }
 
     /// Re-send `id` to the same server over TCP, as RFC 1123 §6.1.3.2 asks
@@ -1214,17 +1274,31 @@ impl Resolver {
     /// waits for that answer, since writing the message ID again would put
     /// it on the connection twice (RFC 7766 §6.2.1). Only responses from
     /// then on show the connection works: the ones before already kept it
-    /// open at the last timeout. Fails the query if the bytes can't be
-    /// produced.
+    /// open at the last timeout. Over TLS, the query is first prepared for
+    /// the server's address family (`protect`). Fails the query if a TLS
+    /// session can't be started. If a TLS session refuses the write, the
+    /// connection is closed as after a TLS error, and the query moves on
+    /// with the others on it.
     fn emit(&mut self, id: QueryId, now: Instant) {
         let Some(pending) = self.pending.get_mut(&id) else {
             return;
         };
         let server = pending.server(&self.config);
+        // The Client Subnet option names the transport's address family.
+        // Encoding can't fail for a message that was encoded once; if it
+        // did, the bytes from before go out.
+        #[cfg(feature = "tls")]
+        if self.config.uses_tls()
+            && !is_protected_for(&pending.request, server)
+            && let Ok(payload) =
+                protect(&mut pending.request, server).and_then(|()| pending.request.to_vec())
+        {
+            pending.payload = payload;
+        }
         let open = self
             .connections
             .iter_mut()
-            .find(|(_, c)| c.server == server);
+            .find(|(_, c)| c.server == server && !c.closing);
         let Some((&connection, conn)) = open else {
             if pending.stream_only {
                 pending.count_send(server, Channel::Stream);
@@ -1252,9 +1326,10 @@ impl Resolver {
         }
         pending.count_send(server, Channel::Stream);
         let message = frame(&pending.payload);
-        match self.write(connection, &message, now) {
-            Ok(()) => self.written(id, connection),
-            Err(error) => self.fail(id, error),
+        let written = self.write(connection, &message, now);
+        self.written(id, connection);
+        if let Err(error) = written {
+            self.close(connection, now, &error);
         }
     }
 
@@ -1286,7 +1361,9 @@ impl Resolver {
         #[cfg(feature = "tls")]
         let (tls, payload) = match &self.config.tls {
             Some(settings) => {
-                let (session, hello) = settings.connect(message).map_err(Error::Tls)?;
+                let (mut session, hello) = settings.connect(server).map_err(Error::Tls)?;
+                // Waits for the handshake: nothing comes of it yet.
+                session.send(message).map_err(Error::Tls)?;
                 (Some(Box::new(session)), hello)
             }
             None => (None, message.to_vec()),
@@ -1299,6 +1376,7 @@ impl Resolver {
             last_active: now,
             responses: 0,
             orphans: Vec::new(),
+            closing: false,
             #[cfg(feature = "tls")]
             tls,
         };
@@ -1311,8 +1389,9 @@ impl Resolver {
         Ok(connection)
     }
 
-    /// Write `message` to an open connection. Over TLS it may wait inside
-    /// the session until the handshake is done.
+    /// Write `message` to an open connection. Over TLS it waits in the
+    /// session until the handshake is done. On an error, the session may
+    /// have taken part of it, so the connection can't be used any more.
     #[cfg_attr(
         not(feature = "tls"),
         expect(
@@ -1332,7 +1411,7 @@ impl Resolver {
         conn.last_active = now;
         #[cfg(feature = "tls")]
         let payload = match &mut conn.tls {
-            Some(session) => tls::send(session, message).map_err(Error::Tls)?,
+            Some(session) => session.send(message).map_err(Error::Tls)?,
             None => message.to_vec(),
         };
         #[cfg(not(feature = "tls"))]

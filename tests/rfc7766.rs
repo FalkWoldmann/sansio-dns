@@ -499,6 +499,35 @@ mod section_6_2_3 {
         ");
     }
 
+    /// A driver that stops closes its connections through `shutdown`, which
+    /// forgets the queries still waiting on them.
+    #[rstest]
+    fn shutdown_closes_every_connection(mut trace: Trace) {
+        let tcp = truncate(&mut trace, "example.com.");
+        trace.answer(&tcp, &reply(&tcp));
+        trace.query("example.org.", RecordType::A);
+
+        trace.shutdown();
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 example.com. A
+          -> S1 udp q0: example.com. A
+          next t=2s
+        t=0s <- S1 udp q0: example.com. A: NoError, 1 answer, TC
+          -> S1 connect c0: example.com. A
+          next t=2s
+        t=0s <- S1 c0: example.com. A: NoError, 1 answer
+          => q0 Response example.com. A: NoError, 1 answer
+          next t=10s
+        t=0s query q1 example.org. A
+          -> S1 write c0: example.org. A
+          next t=2s
+        t=0s shutdown
+          -> S1 close c0
+          next none
+        ");
+    }
+
     /// A server that trickles bytes can't keep an idle connection open.
     #[rstest]
     fn partial_message_does_not_keep_the_connection_open(mut trace: Trace) {

@@ -21,10 +21,14 @@ reqwest = { workspace = true, optional = true }
 [features]
 # Implements reqwest::dns::Resolve for Resolver.
 reqwest = ["dep:reqwest"]
+# DNS over TLS: sansio-dns's `tls` feature, for `Config::with_tls`.
+tls = ["sansio-dns/tls"]
 
 [dev-dependencies]
+rcgen = "0.14"
 reqwest = { workspace = true, features = ["rustls"] }
 rstest.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [lints]

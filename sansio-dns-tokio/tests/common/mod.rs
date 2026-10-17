@@ -85,7 +85,9 @@ pub async fn name_server_on(
     (address, connections)
 }
 
-fn answer(host: &Name, query: &[u8], truncate: bool) -> Vec<u8> {
+/// The answer to `query` from a name server for `host`, empty with TC set
+/// if `truncate`.
+pub fn answer(host: &Name, query: &[u8], truncate: bool) -> Vec<u8> {
     let query = Message::from_vec(query).unwrap();
     let question = query.queries[0].clone();
     let mut response = Message::response(query.metadata.id, OpCode::Query);

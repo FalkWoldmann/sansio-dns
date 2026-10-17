@@ -1,6 +1,8 @@
 //! Message helpers: framing, padding, matching replies, and the local
 //! answers for special-use names.
 
+#[cfg(feature = "tls")]
+use std::net::{IpAddr, SocketAddr};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 #[cfg(feature = "tls")]
@@ -8,7 +10,7 @@ use hickory_proto::ProtoError;
 use hickory_proto::op::{Header, Message, MessageType, Metadata, OpCode, Query, ResponseCode};
 use hickory_proto::rr::domain::usage::{INVALID, LOCALHOST, ONION};
 #[cfg(feature = "tls")]
-use hickory_proto::rr::rdata::opt::EdnsOption;
+use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
 use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
@@ -23,15 +25,55 @@ pub(crate) fn frame(message: &[u8]) -> Vec<u8> {
     [&len.to_be_bytes()[..], message].concat()
 }
 
+/// Prepare `request` for DNS over TLS to `server`: an EDNS Client Subnet
+/// option with SOURCE PREFIX-LENGTH 0, the privacy election of RFC 8310
+/// §11.1, then the padding, which must be the last option applied (RFC
+/// 8467 §3). With no address bits, FAMILY is that of the transport to the
+/// server (RFC 7871 §7.1.2). Replaces both options if they are there
+/// already, so it can run again for a server of the other family.
+#[cfg(feature = "tls")]
+pub(crate) fn protect(request: &mut Message, server: SocketAddr) -> Result<(), ProtoError> {
+    if let Some(edns) = &mut request.edns {
+        let unspecified = if server.ip().to_canonical().is_ipv6() {
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        };
+        let options = edns.options_mut();
+        options.remove(EdnsCode::Subnet);
+        options.insert(EdnsOption::Subnet(ClientSubnet::new(unspecified, 0, 0)));
+    }
+    pad(request)
+}
+
+/// Whether `request` was prepared by [`protect`] for `server`'s address
+/// family.
+#[cfg(feature = "tls")]
+pub(crate) fn is_protected_for(request: &Message, server: SocketAddr) -> bool {
+    request
+        .edns
+        .as_ref()
+        .and_then(|edns| edns.options().get(EdnsCode::Subnet))
+        .is_some_and(|option| {
+            matches!(option, EdnsOption::Subnet(subnet)
+                if subnet.addr().is_ipv6() == server.ip().to_canonical().is_ipv6())
+        })
+}
+
 /// Pad `request` with an EDNS padding option so it encodes to a multiple of
-/// 128 octets (RFC 8467 §4.1, RFC 7830). The option adds 4 octets of header.
+/// 128 octets (RFC 8467 §4.1, RFC 7830), after the other options. The
+/// option adds 4 octets of header. A padding option already there is
+/// replaced, so there is never more than one (RFC 7830 §3).
 #[cfg(feature = "tls")]
 pub(crate) fn pad(request: &mut Message) -> Result<(), ProtoError> {
+    if let Some(edns) = &mut request.edns {
+        edns.options_mut().remove(EdnsCode::Padding);
+    }
     let unpadded = request.to_vec()?.len();
     let fill = (128 - (unpadded + 4) % 128) % 128;
     if let Some(edns) = &mut request.edns {
         edns.options_mut()
-            .insert(EdnsOption::Unknown(12, vec![0; fill]));
+            .insert(EdnsOption::Unknown(EdnsCode::Padding.into(), vec![0; fill]));
     }
     Ok(())
 }

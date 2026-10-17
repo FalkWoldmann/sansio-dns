@@ -2,7 +2,7 @@
 //! `cargo run --example dot --features tls -- example.com [1.1.1.1:853 cloudflare-dns.com]`
 //!
 //! The crate picks no crypto provider or root store; this example uses ring
-//! and the webpki root certificates.
+//! and the webpki root certificates, and offers the "dot" ALPN identifier.
 
 #![expect(
     clippy::disallowed_methods,
@@ -13,7 +13,7 @@
 )]
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -37,44 +37,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let roots = RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.into(),
     };
-    let client = ClientConfig::builder_with_provider(provider)
+    let mut client = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
         .with_root_certificates(roots)
         .with_no_client_auth();
+    client.alpn_protocols = vec![b"dot".to_vec()];
     let mut resolver = Resolver::new(Config::new(server, []).with_tls(Arc::new(client), tls_name)?);
     resolver.query(name, RecordType::A, Instant::now())?;
 
     let mut tcp: Option<(ConnectionId, TcpStream)> = None;
     let mut buf = [0; 4096];
     loop {
-        while let Some(t) = resolver.poll_transmit() {
-            let (connection, written) = match t.transport {
-                Transport::TcpConnect(c) => (
-                    c,
-                    TcpStream::connect_timeout(&t.destination, Duration::from_secs(2)).and_then(
-                        |mut stream| {
-                            stream.set_nodelay(true)?;
-                            stream.write_all(&t.payload)?;
-                            tcp = Some((c, stream));
-                            Ok(())
-                        },
-                    ),
-                ),
-                Transport::TcpWrite(c) => match tcp.as_mut().filter(|(open, _)| *open == c) {
-                    Some((_, stream)) => (c, stream.write_all(&t.payload)),
-                    None => (c, Ok(())),
-                },
-                Transport::TcpClose(c) => {
-                    tcp.take_if(|(open, _)| *open == c);
-                    continue;
-                }
-                Transport::Udp(_) => return Err("DNS over TLS never uses UDP".into()),
-            };
-            if let Err(e) = written {
-                resolver.handle_stream_error(connection, e.kind(), Instant::now());
-            }
-        }
+        carry_out(&mut resolver, &mut tcp)?;
         if let Some(event) = resolver.poll_event() {
+            // Close the connection, after its close_notify (RFC 8446 §6.1).
+            resolver.shutdown();
+            carry_out(&mut resolver, &mut tcp)?;
             return match event {
                 Event::Response { response, .. } => {
                     response.answers.iter().for_each(|r| println!("{r}"));
@@ -95,6 +73,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .max(Duration::from_millis(1));
         stream.set_read_timeout(Some(wait))?;
         match stream.read(&mut buf) {
+            // What the last read queued, such as the reply to the server's
+            // close_notify, is already written.
             Ok(0) => resolver.handle_stream_closed(connection, Instant::now()),
             Ok(n) => {
                 resolver.handle_stream_data(connection, &buf[..n], Instant::now());
@@ -107,4 +87,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => resolver.handle_stream_error(connection, e.kind(), Instant::now()),
         }
     }
+}
+
+/// Carry out the resolver's transmits on the one connection it uses.
+fn carry_out(
+    resolver: &mut Resolver,
+    tcp: &mut Option<(ConnectionId, TcpStream)>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    while let Some(t) = resolver.poll_transmit() {
+        let (connection, written) = match t.transport {
+            Transport::TcpConnect(c) => (
+                c,
+                TcpStream::connect_timeout(&t.destination, Duration::from_secs(2)).and_then(
+                    |mut stream| {
+                        stream.set_nodelay(true)?;
+                        stream.write_all(&t.payload)?;
+                        *tcp = Some((c, stream));
+                        Ok(())
+                    },
+                ),
+            ),
+            Transport::TcpWrite(c) => match tcp.as_mut().filter(|(open, _)| *open == c) {
+                Some((_, stream)) => (c, stream.write_all(&t.payload)),
+                None => (c, Ok(())),
+            },
+            // The writes before it, with the close_notify alert last, are
+            // already out: shut the writing side down and close.
+            Transport::TcpClose(c) => {
+                if let Some((_, stream)) = tcp.take_if(|(open, _)| *open == c) {
+                    stream.shutdown(Shutdown::Write).ok();
+                }
+                continue;
+            }
+            Transport::Udp(_) => return Err("DNS over TLS never uses UDP".into()),
+        };
+        if let Err(e) = written {
+            resolver.handle_stream_error(connection, e.kind(), Instant::now());
+        }
+    }
+    Ok(())
 }

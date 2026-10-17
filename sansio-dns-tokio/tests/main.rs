@@ -10,3 +10,5 @@ mod common;
 mod lookup;
 #[cfg(feature = "reqwest")]
 mod reqwest;
+#[cfg(feature = "tls")]
+mod tls;

@@ -2,8 +2,8 @@
 //!
 //! The resolver only ever sees `query`, `handle_datagram`,
 //! `handle_udp_error`, `handle_stream_data`, `handle_stream_closed`,
-//! `handle_stream_error`, `handle_timeout` and `cancel`, so any sequence of
-//! those is a valid input. Replies and send errors go to recent transmits
+//! `handle_stream_error`, `handle_timeout`, `cancel` and `shutdown`, so any
+//! sequence of those is a valid input. Replies and send errors go to recent transmits
 //! over their transport, replies often tampered with or cut short and, over
 //! TCP, split into two chunks; there is raw garbage too.
 //!
@@ -119,6 +119,7 @@ enum Op {
         query: Index,
         bytes: Vec<u8>,
     },
+    Shutdown,
 }
 
 fn reply_strategy() -> impl Strategy<Value = Reply> {
@@ -225,6 +226,7 @@ impl ReferenceStateMachine for Model {
                     .boxed(),
             ),
             (1, Just(Op::Timeout).boxed()),
+            (1, Just(Op::Shutdown).boxed()),
         ];
         if model.queries > 0 {
             ops.push((
@@ -261,7 +263,7 @@ impl ReferenceStateMachine for Model {
     fn preconditions(model: &Self, op: &Op) -> bool {
         match op {
             Op::Query { name } => *name < NAMES,
-            Op::Elapse { .. } | Op::Timeout => true,
+            Op::Elapse { .. } | Op::Timeout | Op::Shutdown => true,
             Op::Reply { .. } | Op::UdpError { .. } | Op::Cancel { .. } | Op::Garbage { .. } => {
                 model.queries > 0
             }
@@ -282,7 +284,8 @@ impl ReferenceStateMachine for Model {
             | Op::Timeout
             | Op::Cancel { .. }
             | Op::StreamClosed { .. }
-            | Op::Garbage { .. } => {}
+            | Op::Garbage { .. }
+            | Op::Shutdown => {}
         }
         model
     }
@@ -461,6 +464,14 @@ impl Harness {
             Op::Garbage { query, bytes } => {
                 let id = self.pick(query);
                 self.resolver.handle_datagram(id, S1, &bytes, self.now);
+            }
+            // Every query is over without an event, and every connection
+            // closes.
+            Op::Shutdown => {
+                self.resolver.shutdown();
+                self.done.append(&mut self.live);
+                self.groups.clear();
+                self.switched.clear();
             }
         }
     }

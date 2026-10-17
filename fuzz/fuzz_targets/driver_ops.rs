@@ -67,6 +67,7 @@ enum Op {
     StreamBytes { connection: u8, bytes: Vec<u8> },
     Garbage { to: u8, bytes: Vec<u8> },
     UdpError(u8),
+    Shutdown,
 }
 
 #[derive(Arbitrary, Debug)]
@@ -209,6 +210,7 @@ fuzz_target!(|input: Input| {
                     harness.resolver.handle_udp_error(q, to, unreachable, now);
                 }
             }
+            Op::Shutdown => harness.shutdown(),
         }
         harness.check();
     }

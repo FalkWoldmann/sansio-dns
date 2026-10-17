@@ -24,8 +24,9 @@ cargo nextest run --workspace --profile ci            # also with --all-features
 cargo test --workspace --doc --all-features
 ```
 
-Always check both feature sets: `tls` gates DoT in the core and the `rfc7858` test module, and
-`reqwest` gates the Tokio driver's `Resolve` impl and its test module.
+Always check both feature sets: `tls` gates DoT in the core and the `rfc7858` test module (and
+the Tokio driver's `tls` test module, through its own `tls` feature), and `reqwest` gates the
+Tokio driver's `Resolve` impl and its test module.
 
 Each package builds its integration tests as one crate, `integration` (`tests/main.rs` with the
 other files as modules, `autotests = false`). A single test or module:
@@ -64,8 +65,8 @@ reply matching, special-use answers), `src/resolver.rs` (the state machine), `sr
 The `Resolver` is a state machine over two maps: pending queries
 (`QueryId` -> `Pending`) and stream connections (`ConnectionId` -> `Connection`). Inputs are
 `query`, `handle_datagram(query, from, ..)`, `handle_udp_error`,
-`handle_stream_data/closed/error`, `handle_timeout` and `cancel`; outputs are drained with
-`poll_transmit`, `poll_event` and `poll_timeout`.
+`handle_stream_data/closed/error`, `handle_timeout`, `cancel` and `shutdown`; outputs are
+drained with `poll_transmit`, `poll_event` and `poll_timeout`.
 
 - A query's current server is `Config::server(position)` (the list, rotated). `position`
   starts at `first`, the first server not in `Resolver::failed` (no answer within
@@ -88,8 +89,18 @@ The `Resolver` is a state machine over two maps: pending queries
   an orphan back, so a timeout closes the connection only if no response arrived since, and
   a lost connection gives a free resend whenever it answered since. Only writes and
   complete responses reset the idle timer. DoT
-  sessions live inside `Connection` and are driven in memory through `src/tls.rs`; the driver
-  only moves bytes.
+  sessions (`tls::Session`) live inside `Connection` and are driven in memory through
+  `src/tls.rs`; the driver only moves bytes. Queries written during the handshake wait in the
+  session's own queue, not rustls' 64 KiB buffer, and `Session::receive` drains the plaintext
+  after every record batch (rustls holds 16 KiB). Every close the resolver starts goes through
+  `shut`, which sends the session's close_notify, or the alert of a TLS error, as a `TcpWrite`
+  before the `TcpClose` (RFC 8446 §6); the server's close_notify retires the connection like
+  `handle_stream_closed` (`shut`, then `move_off`), after the answers decrypted with it, which
+  can't send on it (`Connection::closing`, skipped by `emit` and `channel`). `shutdown` drops
+  every query and shuts every connection, for a driver that stops. Over TLS, `wire::protect` adds the EDNS
+  Client Subnet privacy option (prefix 0, FAMILY of the server's address, RFC 8310 §11.1) and
+  then the padding, last; `emit` runs it again when a query moves to a server of the other
+  family. `Config::with_tls_names` holds an authentication name per server.
 - Replies go through `handle_reply`: one whose header and question match but whose records
   don't decode (`wire::Reply::Broken`) switches to TCP if TC is set over UDP and is a server
   error otherwise. `NOERROR` with data finishes a query; `NXDOMAIN` and NODATA go to
@@ -100,7 +111,7 @@ The `Resolver` is a state machine over two maps: pending queries
   (no answer: next server, uses an attempt, marks the server failed for new queries),
   `reject` (error answer: excludes the server for this search candidate, then the same),
   both through `advance`, which gives up once out of attempts or servers; `switch_to_tcp`
-  and `drop_edns` (same server, free), the resends in `lost` (same server, free every time
+  and `drop_edns` (same server, free), the resends in `move_off` (same server, free every time
   if the connection answered after the query was written, else once per query via
   `forgive`) and `time_out_stream` (once, via the same `forgive`), `next_candidate` (next
   search name, fresh attempts, no exclusions), `give_up` and `fail`. `emit` counts every
@@ -132,14 +143,25 @@ The `Resolver` is a state machine over two maps: pending queries
   each datagram; report a failed bind, connect, send or receive (ICMP errors) with
   `handle_udp_error`, a stream that the server closed with `handle_stream_closed` and an I/O
   failure with `handle_stream_error`; write each stream payload in one call, with
-  `TCP_NODELAY` set (RFC 7766 §8, §6.2.1.1).
+  `TCP_NODELAY` set (RFC 7766 §8, §6.2.1.1), and carry out a `TcpClose` only after the
+  writes before it, which over TLS end with the close_notify alert (a connection still
+  connecting may be dropped at once). After reporting a stream closed, still write what was
+  queued for it before the report (the reply to the server's close_notify), and call
+  `shutdown` and carry out its transmits before stopping.
 
 `sansio-dns-tokio` runs one background task per `Resolver` (shared by its clones), spawned on
 the runtime of the first lookup. It owns the core resolver and all I/O: a UDP socket per query
 and server, connected to it, with a task forwarding datagrams and receive errors, and a task
-per stream connection. Lookups send a request over a
-channel with a `oneshot` reply; `CancelOnDrop` cancels a lookup whose future is dropped. If the
-task's runtime shuts down, the next lookup (or a waiting one) restarts it on its own runtime.
+per stream connection. A `TcpClose` drops the connection's write queue, so its task writes
+what is queued (the close_notify over TLS), shuts the stream down and reads until the server
+closes, aborted after `CLOSE_GRACE` (5 s) at the latest; a connection still connecting is
+aborted at once. A task whose server closed the connection reports it and keeps writing
+until its queue is dropped, which `Io::drop_ended` does only after the transmits queued
+before the report are carried out. When the last clone is dropped, the task calls
+`shutdown`, carries out its transmits and gives the connections `CLOSE_GRACE` to finish.
+Lookups send a request over a channel with a `oneshot` reply; `CancelOnDrop` cancels a lookup
+whose future is dropped. If the task's runtime shuts down, the next lookup (or a waiting one)
+restarts it on its own runtime.
 A resolver shared with an idle current-thread runtime can hang lookups from other runtimes;
 that limitation is documented, not handled.
 
@@ -161,7 +183,8 @@ insta inline snapshot (`assert_snapshot!(trace, @"...")`): after a deliberate be
 run `cargo insta test --review` (or `--accept`) and read every changed snapshot against the
 crate docs' lifecycle table before accepting it. `Trace` decodes plaintext DNS only, so the
 DoT lifecycle tests in `tests/rfc7858.rs` (`tls` feature) use their in-process rustls server
-and plain assertions. `tests/state_machine.rs` is a proptest-state-machine test: random
+and plain assertions; `sansio-dns-tokio/tests/tls.rs` runs a rustls server on localhost to
+check how the driver's DoT connections end. `tests/state_machine.rs` is a proptest-state-machine test: random
 driver-call sequences against a reference model, with invariants checked after every step and
 failures shrunk to short call sequences. Of the deadlines it only checks that there is one
 exactly when queries are pending or connections are open, and that it is in the future; the

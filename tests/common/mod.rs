@@ -307,6 +307,11 @@ impl Trace {
         self.record(&line);
     }
 
+    pub fn shutdown(&mut self) {
+        self.resolver.shutdown();
+        self.record("shutdown");
+    }
+
     /// Move the clock to the next deadline and handle it.
     pub fn timeout(&mut self) {
         let deadline = self.resolver.poll_timeout().unwrap();

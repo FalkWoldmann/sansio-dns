@@ -3,7 +3,9 @@
 //!
 //! - each query gets at most one event, and none after it was cancelled;
 //! - datagrams and stream writes belong to live queries, stream writes and
-//!   closes to open connections, and connection ids are never reused;
+//!   closes to open connections, and connection ids are never reused; with
+//!   TLS, a write with no query live is the session's last before the
+//!   connection closes (RFC 8446 §6.1);
 //! - no datagram goes to a server with an open connection (RFC 7766 §5),
 //!   and no server has two connections open (RFC 7766 §6.2.2);
 //! - a query causes a bounded number of sends, not counting the resends
@@ -186,6 +188,15 @@ impl Harness {
         }
     }
 
+    /// The driver stops: every query is over without an event.
+    pub fn shutdown(&mut self) {
+        self.resolver.shutdown();
+        for id in std::mem::take(&mut self.live) {
+            self.finished.insert(id);
+            self.leave(id);
+        }
+    }
+
     /// An open connection, if there is one.
     pub fn open(&self, which: u8) -> Option<ConnectionId> {
         self.open
@@ -243,7 +254,15 @@ impl Harness {
     pub fn check(&mut self) -> Vec<Transmit> {
         let mut out = Vec::new();
         let mut started_over = Vec::new();
-        while let Some(t) = self.resolver.poll_transmit() {
+        let transmits: Vec<Transmit> =
+            std::iter::from_fn(|| self.resolver.poll_transmit()).collect();
+        let following: Vec<Option<Transport>> = transmits
+            .iter()
+            .skip(1)
+            .map(|t| Some(t.transport))
+            .chain([None])
+            .collect();
+        for (t, followed_by) in transmits.into_iter().zip(following) {
             assert!(
                 self.servers.is_empty() || self.servers.contains(&t.destination),
                 "transmit to an unknown server: {t:?}"
@@ -301,7 +320,11 @@ impl Harness {
                         self.open.insert(c, t.destination);
                     }
                     assert!(self.open.contains_key(&c), "write on closed {c:?}");
-                    assert!(!self.live.is_empty(), "stream write with no query pending");
+                    assert!(
+                        !self.live.is_empty()
+                            || (self.tls && followed_by == Some(Transport::TcpClose(c))),
+                        "stream write with no query pending"
+                    );
                     if !self.tls {
                         self.stream_write(&t, free);
                     }

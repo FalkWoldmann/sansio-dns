@@ -33,7 +33,12 @@
 //! own, not shared with the clones, which ends with that lookup. The shared
 //! task ends when the last clone is dropped: a lookup borrows its resolver
 //! (and reqwest's holds a clone), so no lookup can outlive every clone and
-//! keep it going.
+//! keep it going. Before it ends, it closes its connections, over TLS
+//! after the close_notify alert (RFC 8446 §6.1), and gives them up to five
+//! seconds to finish.
+//!
+//! The `tls` feature turns on `sansio_dns`'s, for DNS over TLS through
+//! `Config::with_tls`.
 //!
 //! With the `reqwest` feature, [`Resolver`] also implements
 //! `reqwest::dns::Resolve`:
@@ -51,9 +56,9 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use sansio_dns::hickory_proto::ProtoError;
 use sansio_dns::hickory_proto::rr::Name;
@@ -264,14 +269,17 @@ async fn run(config: Config, mut requests: mpsc::UnboundedReceiver<Request>) {
     let (input, mut received) = mpsc::unbounded_channel();
     let mut io = Io {
         tasks: JoinSet::new(),
+        grace: JoinSet::new(),
         sockets: HashMap::new(),
         streams: HashMap::new(),
+        ended: Vec::new(),
         input,
     };
     let mut lookups: HashMap<u64, Running> = HashMap::new();
     let mut owners: HashMap<QueryId, u64> = HashMap::new();
     loop {
         while io.tasks.try_join_next().is_some() {}
+        while io.grace.try_join_next().is_some() {}
         // Sending can queue events, and handling an event can queue
         // transmits: a lookup moving on to its next search candidate.
         let mut busy = true;
@@ -308,6 +316,7 @@ async fn run(config: Config, mut requests: mpsc::UnboundedReceiver<Request>) {
                 }
             }
         }
+        io.drop_ended();
         let deadline = resolver.poll_timeout();
         tokio::select! {
             request = requests.recv() => match request {
@@ -336,7 +345,14 @@ async fn run(config: Config, mut requests: mpsc::UnboundedReceiver<Request>) {
                         }
                     }
                 }
-                None => return,
+                None => {
+                    resolver.shutdown();
+                    while let Some(transmit) = resolver.poll_transmit() {
+                        io.send(transmit).await.ok();
+                    }
+                    io.close().await;
+                    return;
+                }
             },
             Some(input) = received.recv() => take_in(&mut resolver, &mut io, input),
             () = sleep_until(deadline) => resolver.handle_timeout(Instant::now()),
@@ -357,7 +373,7 @@ fn take_in(resolver: &mut sansio_dns::Resolver, io: &mut Io, input: Input) {
             resolver.handle_stream_data(connection, &data, Instant::now());
         }
         Input::Closed(connection, ended) => {
-            io.streams.remove(&connection);
+            io.ended.push(connection);
             match ended {
                 Ok(()) => resolver.handle_stream_closed(connection, Instant::now()),
                 Err(error) => resolver.handle_stream_error(connection, error, Instant::now()),
@@ -383,6 +399,10 @@ async fn sleep_until(deadline: Option<Instant>) {
     }
 }
 
+/// How long a connection that has ended gets to write what is queued on it
+/// and shut down before its task is aborted.
+const CLOSE_GRACE: Duration = Duration::from_secs(5);
+
 /// What the socket and connection tasks report back to the background task.
 enum Input {
     Datagram(QueryId, SocketAddr, Vec<u8>),
@@ -391,6 +411,8 @@ enum Input {
     UdpError(QueryId, SocketAddr, io::ErrorKind),
     Stream(ConnectionId, Vec<u8>),
     /// The connection ended: closed by the server, or with an I/O error.
+    /// Its task still writes what the resolver queues for it until its
+    /// write queue is dropped.
     Closed(ConnectionId, Result<(), io::ErrorKind>),
 }
 
@@ -398,11 +420,28 @@ enum Input {
 /// their tasks.
 struct Io {
     tasks: JoinSet<()>,
+    /// Timers that abort the tasks of connections that take longer than
+    /// `CLOSE_GRACE` to close.
+    grace: JoinSet<()>,
     /// Each query's socket, the server it is connected to, and the task
     /// forwarding what it receives.
     sockets: HashMap<QueryId, (Arc<UdpSocket>, SocketAddr, AbortHandle)>,
-    streams: HashMap<ConnectionId, (mpsc::UnboundedSender<Vec<u8>>, AbortHandle)>,
+    streams: HashMap<ConnectionId, Stream>,
+    /// Connections whose task reported their end. Their write queues are
+    /// dropped once the transmits queued before the report are carried
+    /// out: over TLS, those can hold the resolver's reply to the server's
+    /// close_notify.
+    ended: Vec<ConnectionId>,
     input: mpsc::UnboundedSender<Input>,
+}
+
+/// A connection's write queue and task.
+struct Stream {
+    writes: mpsc::UnboundedSender<Vec<u8>>,
+    task: AbortHandle,
+    /// Whether connecting has finished: until then nothing written to it
+    /// has gone out, so closing it may abort the task at once.
+    connected: Arc<AtomicBool>,
 }
 
 impl Io {
@@ -419,30 +458,92 @@ impl Io {
             }
             Transport::TcpConnect(connection) => {
                 let (writes, queued) = mpsc::unbounded_channel();
+                let connected = Arc::new(AtomicBool::new(false));
                 let task = stream(
                     connection,
                     transmit.destination,
                     transmit.payload,
                     queued,
+                    Arc::clone(&connected),
                     self.input.clone(),
                 );
-                let handle = self.tasks.spawn(task);
-                self.streams.insert(connection, (writes, handle));
+                let task = self.tasks.spawn(task);
+                let stream = Stream {
+                    writes,
+                    task,
+                    connected,
+                };
+                self.streams.insert(connection, stream);
             }
             // If the connection's task has ended, it reports how; the
             // payload is lost with it.
             Transport::TcpWrite(connection) => {
-                if let Some((writes, _)) = self.streams.get(&connection) {
-                    writes.send(transmit.payload).ok();
+                if let Some(stream) = self.streams.get(&connection) {
+                    stream.writes.send(transmit.payload).ok();
                 }
             }
             Transport::TcpClose(connection) => {
-                if let Some((_, task)) = self.streams.remove(&connection) {
-                    task.abort();
+                if let Some(stream) = self.streams.remove(&connection) {
+                    self.close_stream(stream);
                 }
             }
         }
         Ok(())
+    }
+
+    /// Close a connection the resolver is done with. Dropping the write
+    /// queue lets the task write what is queued, with TLS the close_notify
+    /// alert last (RFC 8446 §6.1), and then shut the stream down. A server
+    /// that stops reading can't keep it open past `CLOSE_GRACE`. A
+    /// connection still connecting has sent nothing yet: its task is
+    /// aborted at once.
+    fn close_stream(&mut self, stream: Stream) {
+        let Stream {
+            writes,
+            task,
+            connected,
+        } = stream;
+        drop(writes);
+        if connected.load(Ordering::Acquire) {
+            self.grace.spawn(async move {
+                tokio::time::sleep(CLOSE_GRACE).await;
+                task.abort();
+            });
+        } else {
+            task.abort();
+        }
+    }
+
+    /// Drop the write queues of the connections that reported their end,
+    /// now that the transmits queued for them before the report are
+    /// carried out, so their tasks finish.
+    fn drop_ended(&mut self) {
+        for connection in std::mem::take(&mut self.ended) {
+            if let Some(stream) = self.streams.remove(&connection) {
+                self.close_stream(stream);
+            }
+        }
+    }
+
+    /// Stop: close every socket and connection, giving the connections up
+    /// to `CLOSE_GRACE` to write what is queued on them, then abort what is
+    /// left. Called once the resolver's last transmits, which close its
+    /// connections, are carried out.
+    async fn close(mut self) {
+        for (_, (_, _, task)) in self.sockets.drain() {
+            task.abort();
+        }
+        self.ended.clear();
+        let streams: Vec<Stream> = self.streams.drain().map(|(_, stream)| stream).collect();
+        for stream in streams {
+            self.close_stream(stream);
+        }
+        let tasks = &mut self.tasks;
+        tokio::time::timeout(CLOSE_GRACE, async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await
+        .ok();
     }
 
     async fn send_datagram(
@@ -520,43 +621,98 @@ async fn datagrams(
 }
 
 /// Open a connection, send `first` on it, then forward what it reads and
-/// write what is queued, until either side closes.
+/// write what is queued, until either side closes. Once the resolver has
+/// closed it and everything queued is written, shut the writing side down
+/// and read until the server closes too. Once the server has closed it or
+/// it failed, report that, and still write what the resolver queues for
+/// it until the queue is dropped: over TLS, the resolver answers the
+/// server's close_notify with its own (RFC 8446 §6.1).
 async fn stream(
     connection: ConnectionId,
     to: SocketAddr,
     first: Vec<u8>,
-    queued: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut queued: mpsc::UnboundedReceiver<Vec<u8>>,
+    connected: Arc<AtomicBool>,
     input: mpsc::UnboundedSender<Input>,
 ) {
-    let ended = carry(connection, to, first, queued, &input).await;
-    input
-        .send(Input::Closed(connection, ended.map_err(|e| e.kind())))
-        .ok();
+    let report = |ended: io::Result<()>| {
+        input
+            .send(Input::Closed(connection, ended.map_err(|e| e.kind())))
+            .ok();
+    };
+    let mut tcp = match TcpStream::connect(to).await {
+        Ok(tcp) => tcp,
+        Err(error) => return report(Err(error)),
+    };
+    connected.store(true, Ordering::Release);
+    let mut buf = [0; 4096];
+    match carry(connection, &mut tcp, first, &mut queued, &input, &mut buf).await {
+        Ended::ByResolver => {
+            if tcp.shutdown().await.is_ok() {
+                while tcp.read(&mut buf).await.is_ok_and(|n| n > 0) {}
+            }
+        }
+        Ended::ByServer(ended) => {
+            report(ended);
+            while let Some(payload) = queued.recv().await {
+                if tcp.write_all(&payload).await.is_err() {
+                    return;
+                }
+            }
+            tcp.shutdown().await.ok();
+        }
+        Ended::Stopped => {}
+    }
+}
+
+/// How [`carry`] ended.
+enum Ended {
+    /// The resolver closed the connection, and everything it queued is
+    /// written.
+    ByResolver,
+    /// The server closed the connection, or reading or writing failed.
+    ByServer(io::Result<()>),
+    /// The background task is gone.
+    Stopped,
 }
 
 async fn carry(
     connection: ConnectionId,
-    to: SocketAddr,
+    tcp: &mut TcpStream,
     first: Vec<u8>,
-    mut queued: mpsc::UnboundedReceiver<Vec<u8>>,
+    queued: &mut mpsc::UnboundedReceiver<Vec<u8>>,
     input: &mpsc::UnboundedSender<Input>,
-) -> io::Result<()> {
-    let mut stream = TcpStream::connect(to).await?;
+    buf: &mut [u8],
+) -> Ended {
     // Each payload is one whole message, written in one call (RFC 7766
     // §8); without Nagle a pipelined one goes out before the answers to the
     // earlier ones are in (§6.2.1.1).
-    stream.set_nodelay(true)?;
-    stream.write_all(&first).await?;
-    let mut buf = [0; 4096];
+    if let Err(error) = tcp.set_nodelay(true) {
+        return Ended::ByServer(Err(error));
+    }
+    if let Err(error) = tcp.write_all(&first).await {
+        return Ended::ByServer(Err(error));
+    }
     loop {
         tokio::select! {
-            read = stream.read(&mut buf) => {
-                let data = buf.get(..read?).map(<[u8]>::to_vec).unwrap_or_default();
-                if data.is_empty() || input.send(Input::Stream(connection, data)).is_err() {
-                    return Ok(());
+            read = tcp.read(buf) => match read {
+                Ok(0) => return Ended::ByServer(Ok(())),
+                Ok(n) => {
+                    let data = buf.get(..n).map(<[u8]>::to_vec).unwrap_or_default();
+                    if input.send(Input::Stream(connection, data)).is_err() {
+                        return Ended::Stopped;
+                    }
                 }
-            }
-            Some(payload) = queued.recv() => stream.write_all(&payload).await?,
+                Err(error) => return Ended::ByServer(Err(error)),
+            },
+            payload = queued.recv() => match payload {
+                Some(payload) => {
+                    if let Err(error) = tcp.write_all(&payload).await {
+                        return Ended::ByServer(Err(error));
+                    }
+                }
+                None => return Ended::ByResolver,
+            },
         }
     }
 }

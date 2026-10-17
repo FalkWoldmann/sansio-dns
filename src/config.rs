@@ -11,7 +11,7 @@ use hickory_proto::rr::{Name, RecordType};
 
 use crate::Hosts;
 #[cfg(feature = "tls")]
-use crate::tls;
+use crate::tls::{self, TlsConfigError};
 use crate::wire::is_special_use;
 
 /// Which address families an [`IpLookup`](crate::IpLookup) asks for, and the
@@ -150,24 +150,73 @@ impl Config {
         }
     }
 
-    /// Send every query over DNS over TLS (RFC 7858), authenticating the
-    /// servers as `server_name` with `client` (RFC 8310 strict profile).
-    /// Give the servers' TLS addresses, usually port 853. Queries are padded
-    /// to a multiple of 128 octets (RFC 8467 §4.1).
+    /// Send every query over DNS over TLS (RFC 7858), authenticating every
+    /// server as `server_name` with `client` (RFC 8310 strict profile).
+    /// [`Config::with_tls_names`] gives each server a name of its own.
     ///
-    /// `client` brings its own crypto provider and root certificates. Fails
-    /// if rustls can't start a session with it.
+    /// Give the servers' TLS addresses: port 853, or another port agreed
+    /// with the server's operator, but never 53 (RFC 7858 §3.1). Queries
+    /// are padded to a multiple of 128 octets (RFC 8467 §4.1) and carry an
+    /// EDNS Client Subnet option with SOURCE PREFIX-LENGTH 0, which asks
+    /// the server not to pass any part of the client's address on to
+    /// other servers (RFC 8310 §11.1, RFC 7871 §7.1.2).
+    ///
+    /// `client` brings its own crypto provider and root certificates, and
+    /// decides how strict the authentication is. For RFC 8310's strict
+    /// profile, keep rustls' default WebPKI certificate verifier, or one
+    /// that checks the certificate path and the name just as well (§8.1):
+    /// a custom verifier that accepts more gives the profile up. Keep TLS
+    /// 1.3 enabled (RFC 9325 §3.1.1), session resumption on, as it is by
+    /// default (RFC 7858 §3.4, RFC 8310 §9), and SNI on, which servers that
+    /// host several names need (RFC 9325 §3.7). Setting
+    /// `client.alpn_protocols` to `[b"dot"]`, the identifier IANA
+    /// registered for DNS over TLS, guards against cross-protocol attacks
+    /// (RFC 9325 §3.8). rustls only speaks TLS 1.2 and 1.3 and never
+    /// compresses (RFC 8310 §9), and this crate never sends early data
+    /// (RFC 9325 §3.10).
+    ///
+    /// A `ServerName::IpAddress` makes rustls match the certificate's IP
+    /// address entries and send no SNI. That is not one of RFC 8310's
+    /// authentication mechanisms, which name the server by a domain name
+    /// (§8.1) or pin its key (RFC 7858 §4.2).
+    ///
+    /// # Errors
+    ///
+    /// If a server uses port 53, or rustls can't start a session with
+    /// `client` and `server_name`.
     #[cfg(feature = "tls")]
     pub fn with_tls(
-        mut self,
+        self,
         client: Arc<rustls::ClientConfig>,
         server_name: rustls::pki_types::ServerName<'static>,
-    ) -> Result<Self, rustls::Error> {
-        rustls::ClientConnection::new(Arc::clone(&client), server_name.clone())?;
-        self.tls = Some(tls::Settings {
-            client,
-            server_name,
-        });
+    ) -> Result<Self, TlsConfigError> {
+        let names: Vec<_> = self
+            .servers
+            .iter()
+            .copied()
+            .zip(std::iter::repeat_n(server_name, self.servers.len()))
+            .collect();
+        self.with_tls_names(client, names)
+    }
+
+    /// [`Config::with_tls`], with an authentication name for each server
+    /// (RFC 8310 §7.1), so servers of different operators can be mixed:
+    /// `names` pairs each server's address with the name its certificate
+    /// must match. If an address appears more than once, its last name
+    /// counts.
+    ///
+    /// # Errors
+    ///
+    /// If a server uses port 53, a server has no name, a name is given for
+    /// an address that isn't one of the servers, or rustls can't start a
+    /// session with `client` and one of the names.
+    #[cfg(feature = "tls")]
+    pub fn with_tls_names(
+        mut self,
+        client: Arc<rustls::ClientConfig>,
+        names: impl IntoIterator<Item = (SocketAddr, rustls::pki_types::ServerName<'static>)>,
+    ) -> Result<Self, TlsConfigError> {
+        self.tls = Some(tls::Settings::new(client, &self.servers, names)?);
         Ok(self)
     }
 

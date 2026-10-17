@@ -10,6 +10,8 @@
 //! 4. Call [`Resolver::handle_timeout`] once the instant from
 //!    [`Resolver::poll_timeout`] has passed.
 //! 5. Collect results from [`Resolver::poll_event`].
+//! 6. Before stopping, call [`Resolver::shutdown`] and send its transmits,
+//!    which close the open connections.
 //!
 //! Queries go over UDP, or over the connection to their server if one is
 //! open (RFC 7766 §5). A truncated response switches that query to TCP (RFC
@@ -20,8 +22,8 @@
 //! addresses, following CNAMEs; [`Config::ip_strategy`] picks the families
 //! and their order.
 //!
-//! With the `tls` feature, `Config::with_tls` sends every query over DNS
-//! over TLS (RFC 7858) instead.
+//! With the `tls` feature, `Config::with_tls` and `Config::with_tls_names`
+//! send every query over DNS over TLS (RFC 7858) instead.
 //!
 //! # How a query moves on
 //!
@@ -78,11 +80,11 @@
 //! | A server error, an empty answer without AA or RA, `FORMERR` with OPT, or a second `FORMERR` without it | skips this server for the rest of the search candidate, and sends its next attempt | next not skipped | yes | fresh |
 //! | Truncated answer over UDP, even one that doesn't decode (RFC 2181 §9) | switches to TCP; later attempts stay on TCP | same | no | fresh |
 //! | `FORMERR` without OPT to a query that still has EDNS (not over TLS) | drops EDNS, once; later attempts stay without it | same | no | fresh |
-//! | The server closes, or I/O fails on, a connection that answered something after the query was written to it | is sent again | same | no | fresh |
+//! | The server closes, or I/O fails on, a connection that answered something after the query was written to it, or the server sends close_notify on it over TLS | is sent again | same | no | fresh |
 //! | The same, for a connection that had only answered before | is sent again, once per query | same | no | fresh |
 //! | Its connection is closed because another query on it timed out with no response on it since being written, or because it holds too many unanswered requests (see below) | is sent again, once per query, shared with the row above | same | no | kept |
 //! | Either of the two rows above, a second time | sends its next attempt | next | yes | fresh |
-//! | A connection that never answered is lost, or TLS rejects bytes received on any connection | sends its next attempt | next | yes | fresh |
+//! | A connection that never answered is lost, or TLS rejects bytes received on any connection or refuses a write to it | sends its next attempt | next | yes | fresh |
 //! | `NXDOMAIN`, or NODATA (`NOERROR` without records of the type asked for), with search candidates left | starts over with the next candidate: new message ID, with EDNS, over UDP unless a connection is open or over TLS, no server skipped, a new free resend | first that hasn't failed | fresh attempts | fresh |
 //! | It was the first to join a query that is cancelled (see below) | takes the query over; over UDP the current attempt is sent again, from its own socket | same | no | fresh over UDP, kept on a stream |
 //! | Out of attempts, or every server skipped | fails with the last error, or [`Error::Timeout`] when a query has no server left after it took over a cancelled one or got a truncated answer; a query that joined after the search candidate started starts over instead (see below) | | | |
@@ -106,8 +108,8 @@
 //! 7766 §6.2.4 lets either end do under unusual conditions, which frees
 //! their message IDs; its other queries move as when one times out.
 //!
-//! If a TLS session can't be started or written to, the query fails at once
-//! with [`Error::Tls`]. A `NOERROR` answer with records of the type asked
+//! If a TLS session can't be started, the query fails at once with
+//! [`Error::Tls`]. A `NOERROR` answer with records of the type asked
 //! for ends the query. So does `NXDOMAIN` or NODATA with no candidate left:
 //! the outcome is then the first NODATA answer if a candidate gave one,
 //! else the last `NXDOMAIN` (see [`Resolver::query`]). A query that fails
@@ -159,8 +161,13 @@
 //! [`ConnectionId`]. For [`Transport::TcpConnect`], open a TCP connection to
 //! the destination under that id and write the payload; for
 //! [`Transport::TcpWrite`], write the payload to that connection; for
-//! [`Transport::TcpClose`], close it. Pass everything read from a connection
-//! to [`Resolver::handle_stream_data`]. Call
+//! [`Transport::TcpClose`], close it once the payloads before it are
+//! written. With TLS the last of them carries the close_notify alert, which
+//! must go out before the connection closes (RFC 8446 §6.1), or the alert
+//! that ends a session that failed (§6.2). A connection still connecting
+//! when its `TcpClose` comes can be dropped at once: nothing written to it
+//! has gone out. Pass everything read from a
+//! connection to [`Resolver::handle_stream_data`]. Call
 //! [`Resolver::handle_stream_closed`] when the server closes it, and
 //! [`Resolver::handle_stream_error`] when connecting, reading or writing
 //! fails. Payloads are already length-prefixed (RFC 7766 §8) or
@@ -181,11 +188,20 @@
 //! [`Config::idle_timeout`] (§6.2.3), when a query on it times out with no
 //! response on it since being written, when it holds 256 requests that
 //! left it unanswered and another would join them, or, with `tls`, when
-//! TLS rejects bytes received on it.
+//! TLS rejects bytes received on it or a write to it, or the server sent
+//! close_notify (RFC 7858 §3.4).
 //!
 //! A [`Transport::TcpWrite`] can follow its [`Transport::TcpConnect`]
 //! before connecting has finished: queue it. After reporting a connection
-//! closed or failed, forget it; no [`Transport::TcpClose`] follows.
+//! closed or failed, no transmit for it follows, [`Transport::TcpClose`]
+//! included, but still carry out the ones queued before the report and
+//! then close it. Over TLS they can hold the resolver's reply to the
+//! server's close_notify (RFC 8446 §6.1), which a driver that reads the end
+//! of the stream before carrying them out must not drop. A report for a
+//! connection the resolver already closed is ignored. A driver that stops
+//! calls [`Resolver::shutdown`] and carries out the transmits it queues
+//! before dropping its connections, so that every TLS session ends with
+//! close_notify.
 //!
 //! For UDP, [RFC 5452 §9.2] requires an unpredictable source port, and a
 //! different one for each outstanding query, and §9.1 requires a reply's
@@ -234,6 +250,8 @@ pub use lookup::{IpLookup, Progress, addresses};
 pub use resolver::Resolver;
 #[cfg(feature = "tls")]
 pub use rustls;
+#[cfg(feature = "tls")]
+pub use tls::TlsConfigError;
 
 /// Handle for an in-flight query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -253,7 +271,11 @@ pub enum Transport {
     TcpConnect(ConnectionId),
     /// Write the payload to this open connection.
     TcpWrite(ConnectionId),
-    /// Close this connection. The payload is empty.
+    /// Close this connection, once the payloads of the transmits before it
+    /// are written: over TLS, the last one carries the close_notify alert,
+    /// or after a TLS error the alert for that error (RFC 8446 §6.1, §6.2).
+    /// A connection still connecting can be dropped at once. The payload is
+    /// empty.
     TcpClose(ConnectionId),
 }
 
