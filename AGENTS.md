@@ -67,28 +67,43 @@ The `Resolver` is a state machine over two maps: pending queries
 `handle_stream_data/closed/error`, `handle_timeout` and `cancel`; outputs are drained with
 `poll_transmit`, `poll_event` and `poll_timeout`.
 
-- A query's `first + attempt` picks its server (`Config::server` rotates through the list);
-  `first` skips servers in `Resolver::failed` (no answer within `Config::failure_memory`), and
-  `attempt` is bounded by `Config::attempts`. Its `Route` is `Udp` or `Stream(Option<ConnectionId>)`.
+- A query's current server is `Config::server(position)` (the list, rotated). `position`
+  starts at `first`, the first server not in `Resolver::failed` (no answer within
+  `Config::failure_memory`), and moves on by one per attempt, past the servers in
+  `Pending::excluded`; how often it has wrapped around sets the backoff round. `attempt`
+  counts the attempts used, bounded by `Config::attempts`. Its `Route` is `Udp` or
+  `Stream(Option<ConnectionId>)`.
 - Streams: one connection per server, shared and pipelined by all queries to it (RFC 7766), with
   answers matched by ID and question. DoT sessions live inside `Connection` and are driven
   in memory through `src/tls.rs`; the driver only moves bytes.
+- Replies go through `handle_reply`: one whose header and question match but whose records
+  don't decode (`wire::Reply::Broken`) switches to TCP if TC is set over UDP and is a server
+  error otherwise. `NOERROR` with data finishes a query; `NXDOMAIN` and NODATA go to
+  `search_on`, which tries the next candidate and finishes the query once none is left;
+  every other code, an empty `NOERROR` without AA and RA (`wire::is_referral`) and a
+  broken reply go to `reject`.
 - How a query moves on is spread over several functions with different accounting: `retry`
-  (next server, uses an attempt), `switch_to_tcp` and `drop_edns` (same server, free), `resend`
-  (same server, free once per query via `forgive`, used by `lost` and `time_out_stream`),
-  `next_candidate` (next search name, fresh attempts), `give_up` and `fail`. The crate docs'
-  "How a query moves on" table states the rules (at most `attempts + 3` sends per search
-  candidate, not counting a cancel hand-over's resend or a late joiner's fresh start), and a
-  comment above `retry` maps each row to its function: change these functions together and keep
-  the table in sync.
-- A query for the same name (as given) and type as a pending one joins it as a follower
-  (`Pending::followers`) and gets its outcome. When the leader runs out of attempts, followers
-  that joined after its current search candidate started start over (`give_up`);
-  `cancel(id, now)` hands a query with
-  followers to the first of them, re-sending a UDP attempt from the follower's own socket.
+  (no answer: next server, uses an attempt, marks the server failed for new queries),
+  `reject` (error answer: excludes the server for this search candidate, then the same),
+  both through `advance`, which gives up once out of attempts or servers; `switch_to_tcp`
+  and `drop_edns` (same server, free), `resend` (same server, free once per query via
+  `forgive`, used by `lost` and `time_out_stream`), `next_candidate` (next search name,
+  fresh attempts, no exclusions), `give_up` and `fail`. The crate docs' "How a query moves
+  on" table states the rules (at most `attempts + 3` sends per search candidate, not
+  counting a cancel hand-over's resend or a late joiner's fresh start), and a comment above
+  `retry` maps each row to its function: change these functions together and keep the table
+  in sync.
+- A query for the same name (as given) and type as a pending one joins it as a
+  follower (`Pending::followers`) and gets its outcome. When the leader runs out of attempts
+  or servers, followers that joined after its current search candidate started start over
+  (`give_up`); `cancel(id, now)` hands a query with followers to the first of them,
+  re-sending a UDP attempt from the follower's own socket.
 - Special-use names (`localhost.`, `invalid.`, `onion.`) and `Config::hosts` entries are answered
-  without a transmit. `IpLookup` (`src/lookup.rs`) runs the A and AAAA queries on a `Resolver`
-  and merges the addresses from the events it is fed.
+  without a transmit. `IpLookup` (`src/lookup.rs`) walks the search candidates itself: per
+  candidate it starts an A and an AAAA query for the absolute name
+  (`Resolver::query_candidate`, which skips `Config::hosts`; the lookup checks the name as
+  given with `Resolver::is_local` first), merges the addresses from the events it is fed, and
+  moves on when neither has one, so `handle_event` takes the resolver.
 - Driver obligations (also in the README): bind a fresh UDP socket per query (RFC 5452 §9.2)
   and pass that query with each datagram; report a failed bind or send with
   `handle_udp_error`, a stream that the server closed with `handle_stream_closed` and an I/O
@@ -109,8 +124,12 @@ exceptions), and the README's spec coverage table lists the behaviour each secti
 the table in sync when behaviour changes.
 `tests/common/mod.rs` has the fixtures (a resolver with servers `S1`, `S2`, and helpers to
 start a query, build replies, frame and encode them; `start_distinct` for queries that must
-not coalesce) and `Trace`, which drives a resolver and renders each input, its events, its
-transmits and the next deadline as text. Tests of a query's lifecycle assert that text as an
+not coalesce; `reply` answers as a recursive server does, with RA set, so an empty answer is
+NODATA rather than a referral; `no_data`, `referral`, `with_soa` and `cut` make NODATA,
+referrals, negative answers and undecodable replies) and
+`Trace`, which drives a resolver and renders each input, its events, its transmits and the
+next deadline as text (`answer_bytes` sends raw bytes; a response shows `AA` and `no RA`
+when they differ from a recursive server's). Tests of a query's lifecycle assert that text as an
 insta inline snapshot (`assert_snapshot!(trace, @"...")`): after a deliberate behaviour change,
 run `cargo insta test --review` (or `--accept`) and read every changed snapshot against the
 crate docs' lifecycle table before accepting it. `Trace` decodes plaintext DNS only, so the

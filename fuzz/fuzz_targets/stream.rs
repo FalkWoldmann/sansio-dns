@@ -8,7 +8,7 @@ use libfuzzer_sys::fuzz_target;
 use sansio_dns::hickory_proto::op::ResponseCode;
 use sansio_dns::hickory_proto::rr::RecordType;
 use sansio_dns::{Config, Transport};
-use sansio_dns_fuzz::{Code, Harness, S1, S2, flip, frame, name, reply, set_id};
+use sansio_dns_fuzz::{Code, Harness, S1, S2, cut, flip, frame, name, reply, set_id};
 
 #[derive(Arbitrary, Debug)]
 enum Step {
@@ -24,12 +24,13 @@ enum Step {
         body: Vec<u8>,
         split: u16,
     },
-    /// A well-formed reply to a query on a connection, tampered with, in
-    /// two chunks.
+    /// A well-formed reply to a query on a connection, tampered with (cut
+    /// short, bits flipped), in two chunks.
     Reply {
         to: u8,
         code: Code,
         truncated: bool,
+        cut: u8,
         flips: Vec<(u16, u8)>,
         split: u16,
     },
@@ -99,6 +100,7 @@ fuzz_target!(|steps: Vec<Step>| {
                 to,
                 code,
                 truncated,
+                cut: n,
                 flips,
                 split,
             } => {
@@ -113,6 +115,7 @@ fuzz_target!(|steps: Vec<Step>| {
                 let Ok(mut message) = response.to_vec() else {
                     continue;
                 };
+                cut(&mut message, *n);
                 flip(&mut message, flips);
                 let bytes = frame(&message);
                 let (a, b) = bytes.split_at(usize::from(*split) % (bytes.len() + 1));

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use arbitrary::Arbitrary;
 use sansio_dns::hickory_proto::op::{Message, ResponseCode};
-use sansio_dns::hickory_proto::rr::rdata::{A, AAAA};
+use sansio_dns::hickory_proto::rr::rdata::{A, AAAA, NS};
 use sansio_dns::hickory_proto::rr::{Name, RData, Record, RecordType};
 use sansio_dns::{Config, ConnectionId, Event, QueryId, Resolver, Transmit, Transport};
 
@@ -361,10 +361,11 @@ impl From<Code> for ResponseCode {
     }
 }
 
-/// The answer a well-behaved server would give to `request`, with `code`.
-/// Only `NOERROR` carries an address.
+/// The answer a well-behaved recursive server would give to `request`, with
+/// `code`. Only `NOERROR` carries an address.
 pub fn reply(request: &Message, code: ResponseCode) -> Message {
     let mut response = Message::response(request.metadata.id, request.metadata.op_code);
+    response.metadata.recursion_available = true;
     response.add_queries(request.queries.clone());
     response.metadata.response_code = code;
     if let Some(question) = request.queries.first()
@@ -382,6 +383,14 @@ pub fn reply(request: &Message, code: ResponseCode) -> Message {
     response
 }
 
+/// Add an NS record to `response`'s authority section, as in a referral
+/// (RFC 1034 §4.3.1).
+pub fn add_ns(response: &mut Message) {
+    let zone = Name::root();
+    let server = Name::from_ascii("a.root-servers.net.").unwrap_or_else(|_| Name::root());
+    response.add_authority(Record::from_rdata(zone, 300, RData::NS(NS(server))));
+}
+
 /// `message` with the two-byte TCP length prefix.
 pub fn frame(message: &[u8]) -> Vec<u8> {
     let len = u16::try_from(message.len()).unwrap_or(u16::MAX);
@@ -396,6 +405,12 @@ pub fn flip(bytes: &mut [u8], flips: &[(u16, u8)]) {
             *byte ^= mask;
         }
     }
+}
+
+/// Drop the last `n % 16` bytes of `bytes`, so its last records may no
+/// longer decode while its header and question still do.
+pub fn cut(bytes: &mut Vec<u8>, n: u8) {
+    bytes.truncate(bytes.len().saturating_sub(usize::from(n % 16)));
 }
 
 /// Overwrite the message ID at the start of `bytes` with `id`.

@@ -16,7 +16,7 @@ use libfuzzer_sys::fuzz_target;
 use sansio_dns::hickory_proto::op::ResponseCode;
 use sansio_dns::hickory_proto::rr::RecordType;
 use sansio_dns::{Config, Transport};
-use sansio_dns_fuzz::{Code, Harness, S1, S2, S3, Sent, flip, frame, name, reply};
+use sansio_dns_fuzz::{Code, Harness, S1, S2, S3, Sent, add_ns, cut, flip, frame, name, reply};
 
 const NAMES: [&str; 5] = [
     "example.com.",
@@ -37,11 +37,23 @@ enum Reply {
     Answer,
     Code(Code),
     FormErrWithoutOpt,
+    /// `NOERROR` without an answer.
+    NoData,
+    /// `NOERROR` without an answer, AA or RA, with an NS record in authority.
+    Referral,
     Truncated,
+    /// Cut short by up to 15 bytes, with or without TC.
+    Cut {
+        bytes: u8,
+        truncated: bool,
+    },
     WrongId,
     WrongQuestion,
     WrongSource,
-    BitFlip { byte: u16, bit: u8 },
+    BitFlip {
+        byte: u16,
+        bit: u8,
+    },
 }
 
 #[derive(Arbitrary, Debug)]
@@ -81,7 +93,18 @@ fn answer(sent: &Sent, kind: &Reply) -> Option<(SocketAddr, Vec<u8>)> {
     let mut response = reply(&sent.request, code);
     match kind {
         Reply::FormErrWithoutOpt => response.edns = None,
-        Reply::Truncated => response.metadata.truncation = true,
+        Reply::NoData => response.answers.clear(),
+        Reply::Referral => {
+            response.answers.clear();
+            response.metadata.recursion_available = false;
+            add_ns(&mut response);
+        }
+        Reply::Truncated
+        | Reply::Cut {
+            truncated: true, ..
+        } => {
+            response.metadata.truncation = true;
+        }
         Reply::WrongId => response.metadata.id = response.metadata.id.wrapping_add(1),
         Reply::WrongQuestion => {
             if let Some(question) = response.queries.first_mut() {
@@ -91,8 +114,10 @@ fn answer(sent: &Sent, kind: &Reply) -> Option<(SocketAddr, Vec<u8>)> {
         _ => {}
     }
     let mut bytes = response.to_vec().ok()?;
-    if let Reply::BitFlip { byte, bit } = kind {
-        flip(&mut bytes, &[(*byte, 1 << (bit % 8))]);
+    match kind {
+        Reply::BitFlip { byte, bit } => flip(&mut bytes, &[(*byte, 1 << (bit % 8))]),
+        Reply::Cut { bytes: n, .. } => cut(&mut bytes, *n),
+        _ => {}
     }
     let from = match kind {
         Reply::WrongSource => SocketAddr::new(sent.destination.ip(), 5353),

@@ -9,37 +9,53 @@ use std::time::Instant;
 use hickory_proto::ProtoError;
 use hickory_proto::op::{Edns, Message, Query, ResponseCode};
 use hickory_proto::rr::{Name, RecordType};
-use hickory_proto::serialize::binary::DecodeError;
 
 #[cfg(feature = "tls")]
 use crate::tls;
 #[cfg(feature = "tls")]
 use crate::wire::pad;
-use crate::wire::{EDNS_PAYLOAD, frame, is_reply, special_use};
+use crate::wire::{
+    EDNS_PAYLOAD, Reply, clamp_ttls, frame, has_data, is_meta_type, is_referral, is_special_use,
+    special_use,
+};
 use crate::{Config, ConnectionId, Error, Event, QueryId, Transmit, Transport};
 
 #[derive(Debug)]
 struct Pending {
     request: Message,
     payload: Vec<u8>,
-    /// Where in the server list its attempts start: attempt `n` goes to
-    /// server `first + n`, so it skips servers that failed recently.
+    /// Where in the server list its attempts start, so it skips servers
+    /// that failed recently.
     first: usize,
+    /// Where in the rotation its current attempt is: it goes to
+    /// `Config::server(position)`. Starts at `first` and moves on by one
+    /// per attempt, past the servers in `excluded`, so how often it has
+    /// wrapped around is the number of rounds made.
+    position: usize,
+    /// How many attempts it has used up before the current one.
     attempt: usize,
+    /// Servers that answered this search candidate with an error, a reply
+    /// that couldn't be decoded, or a referral: later attempts skip them
+    /// (RFC 1035 §7.2, RFC 1034 §5.3.3 step 4d).
+    excluded: Vec<SocketAddr>,
     /// `None` if `now + timeout` overflows: the query then waits forever.
     deadline: Option<Instant>,
     route: Route,
-    /// Search candidates still to try if this name doesn't exist.
+    /// Search candidates still to try if this name has no data of the type
+    /// asked for.
     rest: VecDeque<Name>,
+    /// The first NODATA answer of an earlier search candidate: the outcome
+    /// if no later one has data.
+    nodata: Option<Message>,
     /// Whether its attempt was already sent again for free, after losing a
     /// working connection or being moved off a timed-out one. The two
     /// share it: after one free resend, from either, the next one from
     /// either uses up an attempt. Reset for each search candidate; see `Resolver::forgive`.
     forgiven: bool,
     /// The name and type as asked, before search domains. A later query
-    /// for the same pair joins this one instead of being sent. hickory's
+    /// for the same two joins this one instead of being sent. hickory's
     /// `Name` equality ignores case but not the trailing dot.
-    asked: (Name, RecordType),
+    asked: Asked,
     /// When this query's current search candidate started; joiners from
     /// after this instant don't share its failure (`Resolver::give_up`).
     started: Instant,
@@ -52,7 +68,7 @@ struct Pending {
 impl Pending {
     /// The server of the current attempt.
     fn server(&self, config: &Config) -> SocketAddr {
-        config.server(self.first + self.attempt)
+        config.server(self.position)
     }
 
     /// The deadline of the current attempt sent at `now`: `Config::timeout`,
@@ -60,7 +76,7 @@ impl Pending {
     /// (exponential backoff, RFC 1123 §6.1.3.3). `None` if it doesn't fit
     /// in an `Instant`.
     fn deadline(&self, config: &Config, now: Instant) -> Option<Instant> {
-        let round = self.attempt / config.servers().len();
+        let round = self.position.saturating_sub(self.first) / config.servers().len();
         let factor = u32::try_from(round)
             .ok()
             .and_then(|round| 1u32.checked_shl(round))
@@ -68,6 +84,10 @@ impl Pending {
         now.checked_add(config.timeout.saturating_mul(factor))
     }
 }
+
+/// What a query asks for: the name as given, before search domains, and
+/// the type.
+type Asked = (Name, RecordType);
 
 /// How a query's current attempt travels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,10 +153,16 @@ impl Resolver {
     /// Start a recursive lookup of `name`/`record_type`.
     ///
     /// A name ending in a dot is used as given. Other names are tried with
-    /// the [`Config::search`] domains, ordered by [`Config::ndots`]; the next
-    /// candidate is tried while the answer is NXDOMAIN, and the event carries
-    /// the last answer. Any other answer, or a server error on the last
-    /// attempt, ends the search. Without search domains, `example.com` and
+    /// the [`Config::search`] domains, ordered by [`Config::ndots`], until
+    /// one has data of `record_type` (RFC 1123 §6.1.4.3): the next candidate
+    /// is tried after NXDOMAIN and after NODATA, a `NOERROR` answer without
+    /// records of that type at the end of the CNAME chain (RFC 2308 §2.2).
+    /// glibc's `res_search` moves on after NODATA only when the answer
+    /// section is empty, and stops at a CNAME whose target has no data.
+    /// When the candidates run out, the event carries the first NODATA
+    /// answer if there was one, else the last NXDOMAIN. A query that fails
+    /// on a candidate, out of attempts or servers, ends the search with
+    /// that error. Without search domains, `example.com` and
     /// `example.com.` send the same question, but only a query for the same
     /// name as given (trailing dot included, case ignored) joins one in
     /// flight.
@@ -157,21 +183,70 @@ impl Resolver {
     /// A query for the same name and type as one still in flight (compared
     /// as given, before search domains) joins it: nothing is sent for it,
     /// and it gets the same response or error as its own event. If the
-    /// first one runs out of attempts, a query that joined it later starts
-    /// over with attempts of its own instead of sharing the failure.
+    /// first one runs out of attempts or servers, a query that joined it
+    /// after its current search candidate started starts over with
+    /// attempts of its own instead of sharing the failure.
+    ///
+    /// # Errors
+    ///
+    /// If `record_type` is a zone transfer or a meta type (AXFR, IXFR, OPT,
+    /// TSIG, TKEY, MAILA, MAILB, NXNAME or TYPE 0; RFC 1123 §6.1.3.2, RFC
+    /// 6895 §3.1, RFC 9824 §3.5), which a stub resolver doesn't ask for;
+    /// ANY is allowed (RFC 8482). Or if the query can't be encoded.
     pub fn query(
         &mut self,
         name: Name,
         record_type: RecordType,
         now: Instant,
     ) -> Result<QueryId, ProtoError> {
+        self.start(name, record_type, true, now)
+    }
+
+    /// Start `record_type` for one search candidate of an
+    /// [`IpLookup`](crate::IpLookup): `name` is absolute and sent as it is,
+    /// without [`Config::hosts`], which the lookup checked for the name as
+    /// given. It joins, and is joined by, a query for the same name.
+    pub(crate) fn query_candidate(
+        &mut self,
+        name: Name,
+        record_type: RecordType,
+        now: Instant,
+    ) -> Result<QueryId, ProtoError> {
+        self.start(name, record_type, false, now)
+    }
+
+    /// Whether `name`, as given, is answered without the network: a
+    /// special-use name, or one listed in [`Config::hosts`].
+    pub(crate) fn is_local(&self, name: &Name) -> bool {
+        let mut absolute = name.clone();
+        absolute.set_fqdn(true);
+        is_special_use(&absolute) || self.config.hosts.lookup(&absolute).is_some()
+    }
+
+    /// [`Resolver::query`], with `hosts` deciding whether
+    /// [`Config::hosts`] is consulted.
+    fn start(
+        &mut self,
+        name: Name,
+        record_type: RecordType,
+        hosts: bool,
+        now: Instant,
+    ) -> Result<QueryId, ProtoError> {
+        if is_meta_type(record_type) {
+            return Err(ProtoError::Message(
+                "zone transfer and meta query types aren't supported",
+            ));
+        }
         let asked = (name.clone(), record_type);
         let mut absolute = name;
         absolute.set_fqdn(true);
         let id = QueryId(self.next_query);
         self.next_query += 1;
-        let local = special_use(&absolute, record_type)
-            .or_else(|| self.config.hosts.answer(&absolute, record_type));
+        let local = special_use(&absolute, record_type).or_else(|| {
+            hosts
+                .then(|| self.config.hosts.answer(&absolute, record_type))
+                .flatten()
+        });
         if let Some(response) = local {
             self.events.push_back(Event::Response {
                 query: id,
@@ -190,7 +265,7 @@ impl Resolver {
     }
 
     /// A new query for `asked`, at its first search candidate.
-    fn begin(&self, asked: (Name, RecordType), now: Instant) -> Result<Pending, ProtoError> {
+    fn begin(&self, asked: Asked, now: Instant) -> Result<Pending, ProtoError> {
         let (name, record_type) = &asked;
         let mut candidates = self.config.candidates(name);
         let first = candidates.pop_front().unwrap_or_else(|| {
@@ -207,7 +282,7 @@ impl Resolver {
         name: Name,
         record_type: RecordType,
         rest: VecDeque<Name>,
-        asked: (Name, RecordType),
+        asked: Asked,
         now: Instant,
     ) -> Result<Pending, ProtoError> {
         let mut request = self.new_message();
@@ -221,11 +296,14 @@ impl Resolver {
             pad(&mut request)?;
         }
         let payload = request.to_vec()?;
+        let first = self.first_server(now);
         Ok(Pending {
             request,
             payload,
-            first: self.first_server(now),
+            first,
+            position: first,
             attempt: 0,
+            excluded: Vec::new(),
             deadline: now.checked_add(self.config.timeout),
             route: if self.config.uses_tls() {
                 Route::Stream(None)
@@ -233,6 +311,7 @@ impl Resolver {
                 Route::Udp
             },
             rest,
+            nodata: None,
             forgiven: false,
             asked,
             started: now,
@@ -251,8 +330,9 @@ impl Resolver {
             .unwrap_or(0)
     }
 
-    /// Replace `id`'s attempt with one for its next search candidate.
-    /// Returns `false` if there is none, so the current answer stands.
+    /// Replace `id`'s attempt with one for its next search candidate, with
+    /// fresh attempts and no servers excluded. Returns `false` if there is
+    /// none, so the current answer stands.
     fn next_candidate(&mut self, id: QueryId, now: Instant) -> bool {
         let Some((name, rest, record_type, asked)) = self.pending.get_mut(&id).and_then(|p| {
             let record_type = p.request.queries.first()?.query_type();
@@ -271,6 +351,7 @@ impl Resolver {
         };
         if let Some(previous) = self.pending.get_mut(&id) {
             next.followers = std::mem::take(&mut previous.followers);
+            next.nodata = previous.nodata.take();
         }
         self.pending.insert(id, next);
         self.emit(id, now);
@@ -286,10 +367,16 @@ impl Resolver {
     /// compared case-insensitively. Spoofed answers and answers from servers
     /// tried before can't complete it, but a late answer from the current
     /// server to an earlier attempt can, since attempts keep their message
-    /// ID. For the same reason a duplicated answer is acted on again: with
-    /// one server, a repeated `SERVFAIL` uses up another attempt. Naming the
-    /// socket keeps each query's source port its own (§9.2). Once the query
-    /// has switched to TCP, UDP replies to it are ignored.
+    /// ID. For the same reason a duplicated answer is acted on again: a
+    /// repeated `FORMERR` without OPT, after the first one made the query
+    /// drop EDNS, counts as the server's answer to the query without it.
+    /// Naming the socket keeps each query's source port its own (§9.2).
+    /// Once the query has switched to TCP, UDP replies to it are ignored.
+    ///
+    /// A reply whose header and question match but whose records don't
+    /// decode isn't dropped (RFC 1035 §7.2's "bizarre response"): with TC
+    /// set, the query switches to TCP as for any truncated answer (RFC 2181
+    /// §9); otherwise it moves on to the next server at once.
     pub fn handle_datagram(&mut self, query: QueryId, from: SocketAddr, data: &[u8], now: Instant) {
         // The cheap checks first, so stray datagrams cost no parsing.
         let Some(pending) = self.pending.get(&query) else {
@@ -298,11 +385,11 @@ impl Resolver {
         if pending.route != Route::Udp || pending.server(&self.config) != from {
             return;
         }
-        let Ok(response) = Message::from_vec(data) else {
+        let Some(reply) = Reply::decode(data) else {
             return;
         };
-        if is_reply(&pending.request, &response) {
-            self.handle_response(query, response, now);
+        if reply.answers(&pending.request) {
+            self.handle_reply(query, reply, now);
         }
     }
 
@@ -310,7 +397,9 @@ impl Resolver {
     ///
     /// Bytes may arrive in any chunking, and answers in any order: each
     /// complete message goes to the query on this connection it answers,
-    /// and is ignored if there is none (RFC 7766 §6.2.1.1). Over TLS, the
+    /// and is ignored if there is none (RFC 7766 §6.2.1.1). One whose
+    /// records don't decode moves that query on to the next server, as in
+    /// [`Resolver::handle_datagram`]. Over TLS, the
     /// bytes go through the session first, which may queue a
     /// [`Transport::TcpWrite`]; a TLS error closes the connection and moves
     /// its queries on to their next attempt.
@@ -345,35 +434,35 @@ impl Resolver {
         conn.received.extend_from_slice(data);
         // One message at a time: acting on an answer may change this
         // connection too.
-        while let Some(decoded) = self.next_message(connection) {
-            let Ok(response) = decoded else {
+        while let Some(message) = self.next_message(connection) {
+            let Some(reply) = Reply::decode(&message) else {
                 continue;
             };
             let id = self
                 .pending
                 .iter()
                 .find(|(_, p)| {
-                    p.route == Route::Stream(Some(connection)) && is_reply(&p.request, &response)
+                    p.route == Route::Stream(Some(connection)) && reply.answers(&p.request)
                 })
                 .map(|(id, _)| *id);
             if let Some(id) = id {
                 if let Some(conn) = self.connections.get_mut(&connection) {
                     conn.answered = true;
                 }
-                self.handle_response(id, response, now);
+                self.handle_reply(id, reply, now);
             }
         }
     }
 
     /// Take the first complete length-prefixed message off `connection`'s
-    /// buffer and decode it, or `None` if there is none yet.
-    fn next_message(&mut self, connection: ConnectionId) -> Option<Result<Message, DecodeError>> {
+    /// buffer, or `None` if there is none yet.
+    fn next_message(&mut self, connection: ConnectionId) -> Option<Vec<u8>> {
         let conn = self.connections.get_mut(&connection)?;
         let (len, rest) = conn.received.split_first_chunk::<2>()?;
         let len = usize::from(u16::from_be_bytes(*len));
-        let decoded = Message::from_vec(rest.get(..len)?);
+        let message = rest.get(..len)?.to_vec();
         conn.received.drain(..2 + len);
-        Some(decoded)
+        Some(message)
     }
 
     /// The server closed `connection`, or reading from it ended.
@@ -447,12 +536,30 @@ impl Resolver {
         }
     }
 
-    /// Act on a response already matched to `id`.
-    fn handle_response(&mut self, id: QueryId, response: Message, now: Instant) {
+    /// Act on a reply already matched to `id`.
+    fn handle_reply(&mut self, id: QueryId, reply: Reply, now: Instant) {
         // Any answer, even an error code, shows the server is reachable.
         if let Some(pending) = self.pending.get(&id) {
             self.failed.remove(&pending.server(&self.config));
         }
+        match reply {
+            Reply::Whole(response) => self.handle_response(id, response, now),
+            Reply::Broken {
+                metadata, error, ..
+            } => {
+                if !(metadata.truncation && self.switch_to_tcp(id, now)) {
+                    self.reject(id, now, Error::Malformed(error));
+                }
+            }
+        }
+    }
+
+    /// Act on a decoded response already matched to `id`. Only `NOERROR`
+    /// and `NXDOMAIN` say something about the name; any other code means
+    /// this server couldn't answer (RFC 1035 §4.1.1 and §7.2), including
+    /// codes 6 to 15, BADVERS (RFC 6891 §6.1.3) and BADCOOKIE, which can't
+    /// be about a cookie since none is sent (RFC 7873 §5.3).
+    fn handle_response(&mut self, id: QueryId, response: Message, now: Instant) {
         if response.metadata.truncation && self.switch_to_tcp(id, now) {
             return;
         }
@@ -463,28 +570,55 @@ impl Resolver {
             ResponseCode::FormErr if response.edns.is_none() && !self.config.uses_tls() => {
                 self.drop_edns(id, now);
             }
-            ResponseCode::NXDomain if self.next_candidate(id, now) => {}
-            code @ (ResponseCode::ServFail
-            | ResponseCode::Refused
-            | ResponseCode::NotImp
-            | ResponseCode::FormErr) => self.retry(id, now, Error::Server(code)),
-            _ => {
-                let followers = self.pending.remove(&id).map(|p| p.followers);
-                let copies: Vec<Event> = followers
-                    .into_iter()
-                    .flatten()
-                    .map(|(query, _)| Event::Response {
-                        query,
-                        response: response.clone(),
-                    })
-                    .collect();
-                self.events.push_back(Event::Response {
-                    query: id,
-                    response,
-                });
-                self.events.extend(copies);
+            ResponseCode::NoError if is_referral(&response) => {
+                self.reject(id, now, Error::NoRecursion);
             }
+            ResponseCode::NoError if has_data(&response) => self.finish(id, response),
+            ResponseCode::NoError | ResponseCode::NXDomain => self.search_on(id, response, now),
+            code => self.reject(id, now, Error::Server(code)),
         }
+    }
+
+    /// The current search candidate has no data of the type asked for: it
+    /// doesn't exist (`NXDOMAIN`), or `response` is NODATA. Try the next
+    /// candidate; when there is none, the first NODATA answer is the
+    /// outcome, as glibc reports NO_DATA over HOST_NOT_FOUND, and otherwise
+    /// `response`.
+    fn search_on(&mut self, id: QueryId, response: Message, now: Instant) {
+        let Some(pending) = self.pending.get_mut(&id) else {
+            return;
+        };
+        let nodata = response.metadata.response_code == ResponseCode::NoError;
+        let mut current = Some(response);
+        if nodata && pending.nodata.is_none() {
+            pending.nodata = current.take();
+        }
+        if self.next_candidate(id, now) {
+            return;
+        }
+        let first_nodata = self.pending.get_mut(&id).and_then(|p| p.nodata.take());
+        if let Some(outcome) = first_nodata.or(current) {
+            self.finish(id, outcome);
+        }
+    }
+
+    /// End `id`, and the queries that joined it, with `response`.
+    fn finish(&mut self, id: QueryId, mut response: Message) {
+        clamp_ttls(&mut response);
+        let followers = self.pending.remove(&id).map(|p| p.followers);
+        let copies: Vec<Event> = followers
+            .into_iter()
+            .flatten()
+            .map(|(query, _)| Event::Response {
+                query,
+                response: response.clone(),
+            })
+            .collect();
+        self.events.push_back(Event::Response {
+            query: id,
+            response,
+        });
+        self.events.extend(copies);
     }
 
     /// Retry or fail every query whose deadline is at or before `now`, and
@@ -618,8 +752,10 @@ impl Resolver {
     // How a query moves on, row by row of the crate docs' table, and the
     // state that keeps each free step to once per search candidate:
     //
-    // - no answer by its deadline, datagram not sent (`handle_udp_error`),
-    //   server error: `retry`
+    // - no answer by its deadline, datagram not sent (`handle_udp_error`):
+    //   `retry`
+    // - error code, FORMERR with OPT or a second one without, undecodable
+    //   reply, referral: `reject`, which adds the server to `excluded`
     // - truncated over UDP: `switch_to_tcp`, once because `route` never goes
     //   back to `Route::Udp`
     // - FORMERR without OPT: `drop_edns`, once because `request.edns` is
@@ -629,32 +765,59 @@ impl Resolver {
     //   `forgive` and `resend` (the same `forgiven` flag), else `retry`
     // - connection that never answered lost, TLS error on received bytes:
     //   `lost` or `close`, then `retry`
-    // - NXDOMAIN with candidates left: `next_candidate`, which resets all of
-    //   the above with a new `Pending`
+    // - NXDOMAIN or NODATA, with candidates left: `search_on`, then
+    //   `next_candidate`, which resets all of the above with a new
+    //   `Pending`
     // - joined query cancelled: `cancel`, not limited (each hand-over over
     //   UDP sends again; the crate docs' send bound leaves it out)
-    // - out of attempts: `give_up`, then `fail`
+    // - out of attempts, or every server excluded: `advance` calls
+    //   `give_up`, then `fail`
 
-    /// Send `id` to the next server, or fail it with `error` if it is out of
-    /// attempts. The route stays, so after a truncated answer later attempts
-    /// also go over TCP, and with TLS every attempt stays off UDP (RFC 7858
-    /// §3): `emit` opens or reuses a connection to the new server.
+    /// The server of `id`'s current attempt gave no answer: new queries
+    /// start after it for a while (`Config::failure_memory`). It stays in
+    /// this query's rotation, since a later round waits longer and may
+    /// reach it. Moves on as `advance` does.
     fn retry(&mut self, id: QueryId, now: Instant, error: Error) {
+        let Some(pending) = self.pending.get(&id) else {
+            return;
+        };
+        if let Some(until) = now.checked_add(self.config.failure_memory) {
+            self.failed.insert(pending.server(&self.config), until);
+        }
+        self.advance(id, now, error);
+    }
+
+    /// The server of `id`'s current attempt answered, but with an error
+    /// (`error`), so it is up but can't answer this question: skip it for
+    /// the rest of this search candidate, as RFC 1035 §7.2 removes it from
+    /// SLIST. Moves on as `advance` does.
+    fn reject(&mut self, id: QueryId, now: Instant, error: Error) {
         let Some(pending) = self.pending.get_mut(&id) else {
             return;
         };
-        // An error code is an answer; anything else means the server didn't
-        // give one, so new queries start after it for a while.
-        if !matches!(error, Error::Server(_))
-            && let Some(until) = now.checked_add(self.config.failure_memory)
-        {
-            self.failed.insert(pending.server(&self.config), until);
-        }
+        let server = pending.server(&self.config);
+        pending.excluded.push(server);
+        self.advance(id, now, error);
+    }
+
+    /// Send `id`'s next attempt to the next server it hasn't excluded, or
+    /// fail it with `error` if it is out of attempts or every server is
+    /// excluded. The route stays, so after a truncated answer later
+    /// attempts also go over TCP, and with TLS every attempt stays off UDP
+    /// (RFC 7858 §3): `emit` opens or reuses a connection to the new server.
+    fn advance(&mut self, id: QueryId, now: Instant, error: Error) {
+        let Some(pending) = self.pending.get_mut(&id) else {
+            return;
+        };
         pending.attempt += 1;
-        if pending.attempt >= self.config.attempts.get() {
+        let servers = self.config.servers().len();
+        let next = (pending.position + 1..=pending.position + servers)
+            .find(|&p| !pending.excluded.contains(&self.config.server(p)));
+        let Some(position) = next.filter(|_| pending.attempt < self.config.attempts.get()) else {
             self.give_up(id, error, now);
             return;
-        }
+        };
+        pending.position = position;
         pending.deadline = pending.deadline(&self.config, now);
         self.emit(id, now);
     }
@@ -755,7 +918,7 @@ impl Resolver {
             return;
         };
         if pending.request.edns.take().is_none() {
-            self.retry(id, now, Error::Server(ResponseCode::FormErr));
+            self.reject(id, now, Error::Server(ResponseCode::FormErr));
             return;
         }
         let Ok(payload) = pending.request.to_vec() else {
@@ -879,12 +1042,13 @@ impl Resolver {
         Ok(())
     }
 
-    /// `id` is out of attempts. Queries that joined it after its current
-    /// search candidate started haven't had attempts of their own yet:
-    /// instead of sharing the failure they start over, the first as a new
-    /// query that the others join. The comparison is strict on purpose: a
-    /// query that joined at the very instant the candidate started, such as
-    /// a duplicate issued in the same tick, shares its failure.
+    /// `id` is out of attempts, or every server is excluded. Queries that
+    /// joined it after its current search candidate started haven't had
+    /// attempts of their own yet: instead of sharing the failure they start
+    /// over, the first as a new query that the others join. The comparison
+    /// is strict on purpose: a query that joined at the very instant the
+    /// candidate started, such as a duplicate issued in the same tick,
+    /// shares its failure.
     fn give_up(&mut self, id: QueryId, error: Error, now: Instant) {
         let Some(pending) = self.pending.get_mut(&id) else {
             return;

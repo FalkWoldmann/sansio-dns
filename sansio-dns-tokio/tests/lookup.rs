@@ -60,6 +60,25 @@ async fn unknown_name_is_not_found() {
     assert!(matches!(result, Err(Error::NotFound)), "{result:?}");
 }
 
+/// The lookup starts the queries for the next search candidate itself
+/// after the first one doesn't exist, and the driver sends them at once and
+/// routes their events.
+#[tokio::test]
+async fn search_moves_on_to_the_next_candidate() {
+    let server = name_server("app.corp.example.", false).await;
+    let mut config = Config::new(server, []);
+    config.search = ["other.example.", "corp.example."]
+        .map(|domain| sansio_dns::hickory_proto::rr::Name::from_ascii(domain).unwrap())
+        .to_vec();
+    let resolver = Resolver::new(config);
+
+    let lookup = resolver.lookup_ip("app");
+    let addresses = tokio::time::timeout(Duration::from_secs(1), lookup).await;
+
+    let addresses = addresses.expect("no deadline waited out").unwrap();
+    assert_eq!(addresses, [IpAddr::V6(V6), IpAddr::V4(V4)]);
+}
+
 /// Sending to the broadcast address without `SO_BROADCAST` fails at once,
 /// so the lookup moves to the next server without waiting out the
 /// timeout, and fails with the send error when no server is left.

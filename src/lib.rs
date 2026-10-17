@@ -27,48 +27,67 @@
 //! Each query has [`Config::attempts`] attempts. Its first goes to the first
 //! server in the list that hasn't failed to answer within
 //! [`Config::failure_memory`], and each next attempt to the server after
-//! that, wrapping around, so with one server every attempt goes to it.
-//! Answers are matched by message ID and question, which are the same for
-//! every attempt, so an answer to an earlier attempt still counts if it
-//! comes from the server of the current one.
+//! that, wrapping around, so with one server every attempt goes to it. A
+//! server that answered with an error is skipped for the rest of the
+//! search candidate, as RFC 1035 §7.2 removes it from the list of servers
+//! to ask; one that didn't answer isn't, since a later, longer wait may
+//! reach it. Answers are matched by message ID and question, which are the
+//! same for every attempt, so an answer to an earlier attempt still counts
+//! if it comes from the server of the current one.
 //!
 //! A fresh deadline is [`Config::timeout`] from now, doubled for each round
-//! the attempts have made through the servers (exponential backoff, RFC
-//! 1123 §6.1.3.3): with two servers and the defaults, the four attempts
-//! wait 5, 5, 10 and 10 seconds.
+//! the attempts have made through the servers not skipped (exponential
+//! backoff, RFC 1123 §6.1.3.3): with two servers and the defaults, the four
+//! attempts wait 5, 5, 10 and 10 seconds.
+//!
+//! Only `NOERROR` and `NXDOMAIN` answer the question (RFC 1035 §4.1.1).
+//! Every other code is a server error: `SERVFAIL`, `REFUSED`, `NOTIMP`, the
+//! codes 6 to 15 and extended codes such as BADVERS (RFC 6891 §6.1.3) and
+//! BADCOOKIE (RFC 7873 §5.3; no cookie is sent). So are a reply whose
+//! header and question match but whose records don't decode, and
+//! `NOERROR` with no answer and neither AA nor RA set: the server neither
+//! recursed nor is authoritative, so the answer is typically a referral,
+//! which a stub resolver can't follow (RFC 1034 §4.3.1, §5.3.1).
 //!
 //! | What happens | What the query does next | Server | Uses an attempt | Deadline |
 //! |---|---|---|---|---|
 //! | No answer by its deadline, or its datagram couldn't be sent | sends its next attempt | next | yes | fresh |
-//! | `SERVFAIL`, `REFUSED`, `NOTIMP`, or any other `FORMERR` | sends its next attempt | next | yes | fresh |
-//! | Truncated answer over UDP | switches to TCP; later attempts stay on TCP | same | no | fresh |
+//! | A server error, an empty answer without AA or RA, `FORMERR` with OPT, or a second `FORMERR` without it | skips this server for the rest of the search candidate, and sends its next attempt | next not skipped | yes | fresh |
+//! | Truncated answer over UDP, even one that doesn't decode (RFC 2181 §9) | switches to TCP; later attempts stay on TCP | same | no | fresh |
 //! | `FORMERR` without OPT to a query that still has EDNS (not over TLS) | drops EDNS, once; later attempts stay without it | same | no | fresh |
 //! | The server closes, or I/O fails on, a connection that had answered | is sent again over another connection to that server, once per query | same | no | fresh |
 //! | Another query on its connection times out | is sent again over another connection, once per query, shared with the row above | same | no | kept |
 //! | The same, a second time | sends its next attempt | next | yes | fresh |
 //! | A connection that never answered is lost, or TLS rejects bytes received on any connection | sends its next attempt | next | yes | fresh |
-//! | `NXDOMAIN` with search candidates left | starts over with the next candidate: new message ID, with EDNS, back on UDP unless over TLS, a new free resend | first that hasn't failed | fresh attempts | fresh |
+//! | `NXDOMAIN`, or NODATA (`NOERROR` without records of the type asked for), with search candidates left | starts over with the next candidate: new message ID, with EDNS, back on UDP unless over TLS, no server skipped, a new free resend | first that hasn't failed | fresh attempts | fresh |
 //! | It was the first to join a query that is cancelled (see below) | takes the query over; over UDP the current attempt is sent again from its own socket | same | no | fresh over UDP, kept on a stream |
-//! | Out of attempts | fails with the last error | | | |
+//! | Out of attempts, or every server skipped | fails with the last error | | | |
 //!
 //! If a TLS session can't be started or written to, the query fails at once
-//! with [`Error::Tls`]. Any answer other than those above (`NOERROR`, or
-//! `NXDOMAIN` with no candidate left) ends the query, and so does a server
-//! error on the last attempt: the search moves on only on `NXDOMAIN`.
+//! with [`Error::Tls`]. A `NOERROR` answer with records of the type asked
+//! for ends the query. So does `NXDOMAIN` or NODATA with no candidate left:
+//! the outcome is then the first NODATA answer if a candidate gave one,
+//! else the last `NXDOMAIN` (see [`Resolver::query`]). A query that fails
+//! on a candidate ends the search with that error. [`IpLookup`] walks the
+//! candidates itself, with an A and an AAAA query per candidate, and moves
+//! on when neither has an address.
 //!
 //! Each search candidate is sent at most `attempts + 3` times: once per
 //! attempt, plus at most one switch to TCP, one EDNS drop and one free
-//! resend. With k candidates that is k × (`attempts` + 3). Not counted are
-//! the datagram a query sends again when it takes over a cancelled one, and
-//! a late joiner starting over with attempts of its own.
+//! resend. Skipping servers only lowers that: with one server, a server
+//! error ends the query. With k candidates that is k × (`attempts` + 3).
+//! Not counted are the datagram a query sends again when it takes over a
+//! cancelled one, and a late joiner starting over with attempts of its own.
 //!
 //! A query for the same name (as given, trailing dot included, case ignored)
 //! and type as one in flight joins it instead of being sent, and gets its
-//! outcome. If the first one runs out of attempts, the queries that joined
-//! after its current search candidate started don't share the failure: the
-//! first of them starts over as a new query, and the others join it.
-//! [`Resolver::cancel`] hands a query that others joined to the first of
-//! them.
+//! outcome. An [`IpLookup`] asks for each candidate by its absolute name,
+//! so its queries join, and are joined by, queries for that name. If the
+//! first one runs out of attempts or servers, the queries that joined
+//! after its current search candidate started don't share the failure:
+//! the first of them starts over as a new query, with every server to
+//! ask, and the others join it. [`Resolver::cancel`] hands a query that
+//! others joined to the first of them.
 //!
 //! # Driver obligations
 //!
@@ -166,8 +185,10 @@ pub struct Transmit {
 /// Outcome of a query.
 #[derive(Debug)]
 pub enum Event {
-    /// A server answered. `NXDOMAIN` and empty answers arrive here too;
-    /// inspect `response.metadata.response_code`.
+    /// A server answered with `NOERROR` or `NXDOMAIN`, or the name was
+    /// answered locally. Empty answers arrive here too; inspect
+    /// `response.metadata.response_code`. TTLs received with the most
+    /// significant bit set are zero here (RFC 2181 §8).
     Response {
         /// The query that completed.
         query: QueryId,
@@ -203,7 +224,19 @@ pub enum Error {
     /// Only with the `tls` feature.
     #[error("TLS failed: {0}")]
     Tls(String),
-    /// The last server answered with this error code (e.g. `SERVFAIL`).
+    /// The last server answered with this error code: any code other than
+    /// `NOERROR` and `NXDOMAIN`, such as `SERVFAIL` or `REFUSED`.
     #[error("name server returned {0}")]
     Server(ResponseCode),
+    /// The last server sent a reply to the query whose header and question
+    /// matched but whose records couldn't be decoded. Carries the decoding
+    /// error.
+    #[error("name server sent a reply that couldn't be decoded: {0}")]
+    Malformed(String),
+    /// The last server answered `NOERROR` with no answer records and
+    /// neither the AA nor the RA flag: it doesn't recurse and isn't
+    /// authoritative for the name, so the answer is typically a referral,
+    /// which a stub resolver can't follow (RFC 1034 §4.3.1, §5.3.1).
+    #[error("name server doesn't offer recursion")]
+    NoRecursion,
 }

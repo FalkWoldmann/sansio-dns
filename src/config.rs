@@ -56,11 +56,15 @@ pub struct Config {
     /// long as the one before (RFC 1123 §6.1.3.3). A value too large to add
     /// to an `Instant`, such as `Duration::MAX`, means wait forever.
     pub timeout: Duration,
-    /// Total number of attempts per query, across all servers: attempt `n`
-    /// goes to server `first + n` modulo their number, where `first` is the
-    /// first one that hasn't failed recently (see `failure_memory`). Switching to TCP, dropping
-    /// EDNS and resending after a lost connection don't count as one; see
-    /// the crate docs on how a query moves on.
+    /// Total number of attempts per query, across all servers: the first
+    /// goes to the first server that hasn't failed recently (see
+    /// `failure_memory`), and each next one to the server after, wrapping
+    /// around and skipping servers that answered the current search
+    /// candidate with an error. A query whose servers all did fails before
+    /// using up its attempts.
+    /// Switching to TCP, dropping EDNS and resending after a lost
+    /// connection don't count as one; see the crate docs on how a query
+    /// moves on.
     pub attempts: NonZeroUsize,
     /// Domains to try appending to names without a trailing dot, in order.
     /// Empty means every name is used as given.
@@ -221,9 +225,10 @@ impl Config {
         &self.servers
     }
 
-    /// The server for the given attempt, rotating through the list.
+    /// The server at `position` in the rotation: the list repeated
+    /// without end.
     #[expect(clippy::indexing_slicing, reason = "servers is never empty")]
-    pub(crate) fn server(&self, attempt: usize) -> SocketAddr {
-        self.servers[attempt % self.servers.len()]
+    pub(crate) fn server(&self, position: usize) -> SocketAddr {
+        self.servers[position % self.servers.len()]
     }
 }

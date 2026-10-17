@@ -8,7 +8,9 @@ use hickory_proto::op::{Message, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::{A, CNAME};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use rstest::rstest;
-use sansio_dns::{Config, Error, Event, IpLookup, IpStrategy, Progress, Resolver, addresses};
+use sansio_dns::{
+    Config, Error, Event, IpLookup, IpStrategy, Progress, Resolver, Transmit, addresses,
+};
 
 fn name(s: &str) -> Name {
     Name::from_ascii(s).unwrap()
@@ -75,16 +77,21 @@ fn finish(lookup: IpLookup, resolver: &mut Resolver, codes: [ResponseCode; 2]) -
         resolver.handle_datagram(udp(t), S1, &encode(&with_code(reply(t), code)), now);
     }
     // Feed the events in reverse, to show the result doesn't depend on order.
-    let events: Vec<Event> = std::iter::from_fn(|| resolver.poll_event()).collect();
-    feed(lookup, events.into_iter().rev())
+    let mut events = events(resolver);
+    events.reverse();
+    feed(lookup, resolver, events)
+}
+
+fn events(resolver: &mut Resolver) -> Vec<Event> {
+    std::iter::from_fn(|| resolver.poll_event()).collect()
 }
 
 /// Pass `events` to `lookup` in order; it must not finish before the last.
-fn feed(lookup: IpLookup, events: impl IntoIterator<Item = Event>) -> Progress {
+fn feed(lookup: IpLookup, resolver: &mut Resolver, events: Vec<Event>) -> Progress {
     events
         .into_iter()
         .fold(Progress::Waiting(lookup), |progress, e| match progress {
-            Progress::Waiting(lookup) => lookup.handle_event(&e),
+            Progress::Waiting(lookup) => lookup.handle_event(resolver, &e, Instant::now()),
             Progress::Done(_) => panic!("done before its last event"),
         })
 }
@@ -151,7 +158,8 @@ mod ip_lookup {
             resolver.handle_datagram(udp(t), S1, &encode(&reply(t)), Instant::now());
         }
 
-        let progress = feed(lookup, std::iter::from_fn(|| resolver.poll_event()));
+        let events = events(&mut resolver);
+        let progress = feed(lookup, &mut resolver, events);
 
         assert_eq!(progress, Progress::Done(Ok(expected.to_vec())));
     }
@@ -166,6 +174,161 @@ mod ip_lookup {
         assert_eq!(progress, Progress::Done(Err(Error::Server(FAIL))));
     }
 
+    /// RFC 1123 §6.1.4.3: the lookup tries `printer` with the search
+    /// domains `corp.example` and `home.example`, then as given, asking each
+    /// candidate for both families.
+    mod search {
+        use super::*;
+
+        const CANDIDATES: [&str; 3] =
+            ["printer.corp.example.", "printer.home.example.", "printer."];
+
+        /// A resolver searching `corp.example` and `home.example`.
+        fn searching() -> Resolver {
+            let mut config = Config::new(S1, []);
+            config.search = vec![name("corp.example."), name("home.example.")];
+            Resolver::new(config)
+        }
+
+        /// Answer each transmit with what `answer` makes of it, by type,
+        /// check they ask for `candidate`, and hand the events to `lookup`.
+        fn step(
+            lookup: IpLookup,
+            resolver: &mut Resolver,
+            candidate: &str,
+            answer: impl Fn(RecordType, Message) -> Message,
+        ) -> Progress {
+            let sent: Vec<Transmit> = std::iter::from_fn(|| resolver.poll_transmit()).collect();
+            let mut queries: Vec<_> = sent.iter().map(udp).collect();
+            let mut running: Vec<_> = lookup.queries().collect();
+            queries.sort();
+            running.sort();
+            assert_eq!(queries, running, "the lookup's queries are the ones sent");
+            for t in &sent {
+                let question = decode(t).queries[0].clone();
+                assert_eq!(question.name(), &name(candidate));
+                let response = answer(question.query_type(), reply(t));
+                resolver.handle_datagram(udp(t), S1, &encode(&response), Instant::now());
+            }
+            let events = events(resolver);
+            feed(lookup, resolver, events)
+        }
+
+        fn waiting(progress: Progress) -> IpLookup {
+            match progress {
+                Progress::Waiting(lookup) => lookup,
+                Progress::Done(outcome) => panic!("done early: {outcome:?}"),
+            }
+        }
+
+        fn start(resolver: &mut Resolver) -> IpLookup {
+            IpLookup::start(resolver, name("printer"), Instant::now()).unwrap()
+        }
+
+        /// RFC 1123 §6.1.4.3 (b): an address of one family ends the search
+        /// for both, so the AAAA query doesn't go on to
+        /// `printer.home.example.` and pick up another host's addresses.
+        #[rstest]
+        #[case::nodata(|r| no_data(r))]
+        #[case::nxdomain(|r| with_code(r, NX))]
+        fn an_address_of_one_family_ends_the_search(#[case] other: fn(Message) -> Message) {
+            let mut resolver = searching();
+            let lookup = start(&mut resolver);
+
+            let progress = step(lookup, &mut resolver, CANDIDATES[0], |t, r| {
+                if t == RecordType::A { r } else { other(r) }
+            });
+
+            assert!(resolver.poll_transmit().is_none());
+            assert_eq!(progress, Progress::Done(Ok(vec![V4])));
+        }
+
+        /// No address of either family, whether the name doesn't exist or
+        /// has no such records (RFC 2308 §2.2), moves both queries on
+        /// together.
+        #[rstest]
+        #[case::nodata(|_, r| no_data(r))]
+        #[case::nxdomain(|_, r| with_code(r, NX))]
+        #[case::mixed(|t, r| if t == RecordType::A { no_data(r) } else { with_code(r, NX) })]
+        fn no_address_moves_the_search_on(#[case] none: fn(RecordType, Message) -> Message) {
+            let mut resolver = searching();
+            let lookup = start(&mut resolver);
+
+            let lookup = waiting(step(lookup, &mut resolver, CANDIDATES[0], none));
+            let progress = step(lookup, &mut resolver, CANDIDATES[1], |_, r| r);
+
+            assert_eq!(progress, Progress::Done(Ok(vec![V6, V4])));
+        }
+
+        #[test]
+        fn no_address_anywhere_is_an_empty_list() {
+            let mut resolver = searching();
+            let mut progress = Progress::Waiting(start(&mut resolver));
+
+            for candidate in CANDIDATES {
+                progress = step(waiting(progress), &mut resolver, candidate, |_, r| {
+                    no_data(r)
+                });
+            }
+
+            assert!(resolver.poll_transmit().is_none());
+            assert_eq!(progress, Progress::Done(Ok(vec![])));
+        }
+
+        /// A failure ends the search, as in `Resolver::query`.
+        #[test]
+        fn failure_ends_the_search() {
+            let mut resolver = searching();
+            let lookup = start(&mut resolver);
+
+            let progress = step(lookup, &mut resolver, CANDIDATES[0], |t, r| {
+                if t == RecordType::A {
+                    with_code(r, FAIL)
+                } else {
+                    no_data(r)
+                }
+            });
+
+            assert!(resolver.poll_transmit().is_none());
+            assert_eq!(progress, Progress::Done(Err(Error::Server(FAIL))));
+        }
+
+        /// The lookup asks for each candidate by its absolute name, so a
+        /// plain query for that name joins it.
+        #[test]
+        fn plain_query_for_the_candidate_joins_the_lookup() {
+            let mut resolver = searching();
+            let _lookup = start(&mut resolver);
+            while resolver.poll_transmit().is_some() {}
+
+            resolver
+                .query(name(CANDIDATES[0]), RecordType::A, Instant::now())
+                .unwrap();
+
+            assert!(resolver.poll_transmit().is_none());
+        }
+
+        /// `Config::hosts` is checked for the name as given, before any
+        /// search domain, as `Resolver::query` does.
+        #[test]
+        fn hosts_answer_the_name_as_given() {
+            let mut config = Config::new(S1, []);
+            config.search = vec![name("corp.example.")];
+            config.hosts = sansio_dns::Hosts::parse(b"192.0.2.9 printer\n");
+            let mut resolver = Resolver::new(config);
+            let lookup = start(&mut resolver);
+
+            let events = events(&mut resolver);
+            let progress = feed(lookup, &mut resolver, events);
+
+            assert!(resolver.poll_transmit().is_none());
+            assert_eq!(
+                progress,
+                Progress::Done(Ok(vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9))]))
+            );
+        }
+    }
+
     #[rstest]
     fn ignores_events_of_other_queries(mut resolver: Resolver) {
         let lookup = IpLookup::start(&mut resolver, name("example.com."), Instant::now()).unwrap();
@@ -176,7 +339,8 @@ mod ip_lookup {
             resolver.handle_datagram(udp(t), S1, &encode(&reply(t)), Instant::now());
         }
 
-        let progress = feed(lookup, std::iter::from_fn(|| resolver.poll_event()));
+        let events = events(&mut resolver);
+        let progress = feed(lookup, &mut resolver, events);
 
         assert!(matches!(progress, Progress::Waiting(_)), "{progress:?}");
     }
@@ -184,7 +348,8 @@ mod ip_lookup {
     #[rstest]
     fn localhost_resolves_without_network(mut resolver: Resolver) {
         let lookup = IpLookup::start(&mut resolver, name("localhost."), Instant::now()).unwrap();
-        let progress = feed(lookup, std::iter::from_fn(|| resolver.poll_event()));
+        let events = events(&mut resolver);
+        let progress = feed(lookup, &mut resolver, events);
 
         assert!(resolver.poll_transmit().is_none());
         assert_eq!(

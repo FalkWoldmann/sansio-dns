@@ -3,7 +3,9 @@
 //! bytes, then lookups of listed names, short names and special-use names.
 //! Hosts and special-use names must be answered locally with the right
 //! addresses; other names walk the search candidates in glibc's order,
-//! each answered NXDOMAIN until the one chosen to exist.
+//! each answered NXDOMAIN, or NODATA for one of them, until the one chosen
+//! to have data. When none has, the walk ends on the NODATA answer if there
+//! was one.
 
 #![no_main]
 
@@ -90,8 +92,11 @@ enum Lookup<'a> {
 struct Step<'a> {
     lookup: Lookup<'a>,
     aaaa: bool,
-    /// The search candidate that exists; the others are NXDOMAIN.
+    /// The search candidate that has data.
     found: Option<u8>,
+    /// A search candidate that exists without data (NODATA); the others
+    /// are NXDOMAIN.
+    nodata: Option<u8>,
 }
 
 #[derive(Arbitrary, Debug)]
@@ -230,6 +235,7 @@ fuzz_target!(|input: Input<'_>| {
         let local = local_answer(&absolute, record_type, &hosts);
         let expected = candidates(&name, &search, ndots);
         let found = step.found.map(usize::from);
+        let nodata = step.nodata.map(usize::from).filter(|n| found != Some(*n));
         let Some(query) = harness.query(name, record_type) else {
             continue;
         };
@@ -255,13 +261,17 @@ fuzz_target!(|input: Input<'_>| {
                     expected.get(asked.len()),
                     "asked {asked:?} then {name:?}, expected {expected:?}"
                 );
-                let code = if found == Some(asked.len()) {
+                let code = if found == Some(asked.len()) || nodata == Some(asked.len()) {
                     ResponseCode::NoError
                 } else {
                     ResponseCode::NXDomain
                 };
+                let mut response = reply(&request, code);
+                if nodata == Some(asked.len()) {
+                    response.answers.clear();
+                }
                 asked.extend(name);
-                if let Ok(bytes) = reply(&request, code).to_vec() {
+                if let Ok(bytes) = response.to_vec() {
                     let now = harness.now;
                     harness
                         .resolver
@@ -286,11 +296,23 @@ fuzz_target!(|input: Input<'_>| {
             None => {
                 let last = found.filter(|f| *f < expected.len());
                 assert_eq!(asked.len(), last.map_or(expected.len(), |f| f + 1));
-                let want = match last {
-                    Some(_) => ResponseCode::NoError,
-                    None => ResponseCode::NXDomain,
+                let empty = nodata.filter(|n| *n < asked.len());
+                let (want, question) = match (last, empty) {
+                    (Some(f), _) => (ResponseCode::NoError, expected.get(f)),
+                    (None, Some(n)) => (ResponseCode::NoError, expected.get(n)),
+                    (None, None) => (ResponseCode::NXDomain, expected.last()),
                 };
                 assert_eq!(code, want, "search walk ended with the wrong code");
+                assert_eq!(
+                    response.queries.first().map(|q| q.name()),
+                    question,
+                    "search walk ended on the wrong candidate"
+                );
+                assert_eq!(
+                    addresses(response).is_empty(),
+                    last.is_none(),
+                    "addresses only from the candidate with data"
+                );
             }
         }
     }

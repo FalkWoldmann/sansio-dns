@@ -56,6 +56,28 @@ mod section_9_1 {
         );
     }
 
+    /// A reply whose records don't decode must match just the same before
+    /// it moves the query on.
+    #[rstest]
+    #[case::id(wrong_id)]
+    #[case::name(wrong_name)]
+    #[case::record_type(wrong_type)]
+    #[case::class(wrong_class)]
+    fn mismatched_undecodable_reply_is_ignored(
+        mut resolver: Resolver,
+        #[case] tamper: fn(&mut Message),
+    ) {
+        let now = Instant::now();
+        let sent = start_distinct(&mut resolver, now);
+        let mut forged = reply(&sent);
+        tamper(&mut forged);
+
+        resolver.handle_datagram(udp(&sent), S1, &cut(&encode(&forged)), now);
+
+        assert!(resolver.poll_event().is_none());
+        assert!(resolver.poll_transmit().is_none());
+    }
+
     #[rstest]
     #[case::other_server(S2)]
     #[case::other_port(SocketAddr::new(S1.ip(), 5353))]

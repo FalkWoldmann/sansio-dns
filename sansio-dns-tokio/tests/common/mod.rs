@@ -89,6 +89,7 @@ fn answer(host: &Name, query: &[u8], truncate: bool) -> Vec<u8> {
     let query = Message::from_vec(query).unwrap();
     let question = query.queries[0].clone();
     let mut response = Message::response(query.metadata.id, OpCode::Query);
+    response.metadata.recursion_available = true;
     response.add_query(question.clone());
     if question.name() != host {
         response.metadata.response_code = ResponseCode::NXDomain;

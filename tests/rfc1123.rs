@@ -2,11 +2,60 @@
 //! <https://rfc-annotations.research.icann.org/rfc1123.html>
 
 use std::num::NonZeroUsize;
+use std::time::Instant;
 
 use crate::common::*;
-use hickory_proto::rr::RecordType;
+use hickory_proto::ProtoError;
+use hickory_proto::op::ResponseCode;
+use hickory_proto::rr::rdata::CNAME;
+use hickory_proto::rr::{Name, RData, Record, RecordType};
 use insta::assert_snapshot;
-use sansio_dns::{Config, Resolver};
+use rstest::rstest;
+use sansio_dns::{Config, Event, Resolver};
+use std::assert_matches;
+
+/// §6.1.3.2: zone transfers must use TCP, and take more than one message;
+/// a stub resolver doesn't ask for them, nor for meta types that only
+/// describe a message (RFC 6895 §3.1) or that a resolver must not forward
+/// (NXNAME, RFC 9824 §3.5). ANY is an ordinary query (RFC 8482).
+mod section_6_1_3_2 {
+    use super::*;
+
+    #[rstest]
+    #[case::axfr(RecordType::AXFR)]
+    #[case::ixfr(RecordType::IXFR)]
+    #[case::opt(RecordType::OPT)]
+    #[case::tsig(RecordType::TSIG)]
+    #[case::tkey(RecordType::from(249))]
+    #[case::mailb(RecordType::from(253))]
+    #[case::maila(RecordType::from(254))]
+    #[case::nxname(RecordType::from(128))]
+    #[case::zero(RecordType::ZERO)]
+    fn transfer_and_meta_types_are_rejected(
+        mut resolver: Resolver,
+        #[case] record_type: RecordType,
+    ) {
+        let name = Name::from_ascii("example.com.").unwrap();
+
+        let result = resolver.query(name, record_type, Instant::now());
+
+        assert_matches!(result, Err(ProtoError::Message(_)));
+        assert!(resolver.poll_transmit().is_none());
+        assert!(resolver.poll_event().is_none());
+    }
+
+    #[rstest]
+    #[case::any(RecordType::ANY)]
+    #[case::unassigned_qtype(RecordType::from(129))]
+    fn other_types_are_sent(mut resolver: Resolver, #[case] record_type: RecordType) {
+        let name = Name::from_ascii("example.com.").unwrap();
+
+        resolver.query(name, record_type, Instant::now()).unwrap();
+
+        let sent = decode(&resolver.poll_transmit().unwrap());
+        assert_eq!(sent.queries[0].query_type(), record_type);
+    }
+}
 
 /// §6.1.3.3 (5): retries back off exponentially, and without measured round
 /// trip times the first wait is no less than five seconds.
@@ -63,6 +112,131 @@ mod section_6_1_3_3 {
           next t=35s
         t=35s timeout
           => q0 Failed Timeout
+          next none
+        ");
+    }
+}
+
+/// §6.1.4.3: the search list is tried "until a domain name with the desired
+/// associated data is found". NODATA (RFC 2308 §2.2: `NOERROR`, but no
+/// record of the type asked for at the end of the CNAME chain) isn't that,
+/// so the search moves on. (glibc's moves on only when the answer section
+/// is empty.) When it runs out, the first NODATA is the outcome, ahead of a
+/// later NXDOMAIN. `IpLookup` moves on when neither A nor AAAA has an
+/// address; see `lookup::ip_lookup::search`.
+mod section_6_1_4_3 {
+    use super::*;
+
+    fn searching() -> Trace {
+        let mut config = config();
+        config.search = vec![
+            Name::from_ascii("corp.example.").unwrap(),
+            Name::from_ascii("lab.example.").unwrap(),
+        ];
+        Trace::new(Resolver::new(config))
+    }
+
+    #[test]
+    fn nodata_moves_the_search_on() {
+        let mut trace = searching();
+        trace.query("db", RecordType::A);
+        let sent = trace.last();
+        trace.answer(&sent, &no_data(reply(&sent)));
+        let sent = trace.last();
+        trace.answer(&sent, &reply(&sent));
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 db A
+          -> S1 udp q0: db.corp.example. A
+          next t=2s
+        t=0s <- S1 udp q0: db.corp.example. A: NoError, 0 answers
+          -> S1 udp q0: db.lab.example. A
+          next t=2s
+        t=0s <- S1 udp q0: db.lab.example. A: NoError, 1 answer
+          => q0 Response db.lab.example. A: NoError, 1 answer
+          next none
+        ");
+    }
+
+    #[test]
+    fn first_nodata_wins_over_a_later_nxdomain() {
+        let mut trace = searching();
+        trace.query("db", RecordType::AAAA);
+        let sent = trace.last();
+        trace.answer(&sent, &no_data(reply(&sent)));
+        let sent = trace.last();
+        trace.answer(&sent, &no_data(reply(&sent)));
+        let sent = trace.last();
+        trace.answer(&sent, &with_code(reply(&sent), ResponseCode::NXDomain));
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 db AAAA
+          -> S1 udp q0: db.corp.example. AAAA
+          next t=2s
+        t=0s <- S1 udp q0: db.corp.example. AAAA: NoError, 0 answers
+          -> S1 udp q0: db.lab.example. AAAA
+          next t=2s
+        t=0s <- S1 udp q0: db.lab.example. AAAA: NoError, 0 answers
+          -> S1 udp q0: db. AAAA
+          next t=2s
+        t=0s <- S1 udp q0: db. AAAA: NXDomain, 0 answers
+          => q0 Response db.corp.example. AAAA: NoError, 0 answers
+          next none
+        ");
+        let [Event::Response { response, .. }] = trace.events() else {
+            panic!("expected one response");
+        };
+        assert_eq!(response.queries[0].name().to_ascii(), "db.corp.example.");
+    }
+
+    /// A CNAME whose target has no record of the type asked for is NODATA
+    /// too.
+    #[test]
+    fn cname_without_data_at_its_end_is_nodata() {
+        let mut trace = searching();
+        trace.query("db", RecordType::A);
+        let sent = trace.last();
+        let mut response = no_data(reply(&sent));
+        let alias = response.queries[0].name().clone();
+        let target = Name::from_ascii("elsewhere.example.").unwrap();
+        response.answers = vec![Record::from_rdata(alias, 300, RData::CNAME(CNAME(target)))];
+        trace.answer(&sent, &response);
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 db A
+          -> S1 udp q0: db.corp.example. A
+          next t=2s
+        t=0s <- S1 udp q0: db.corp.example. A: NoError, 1 answer
+          -> S1 udp q0: db.lab.example. A
+          next t=2s
+        ");
+    }
+
+    /// A server failure ends the search: a later candidate might name a
+    /// different host than the one meant (RFC 1535).
+    #[test]
+    fn failure_ends_the_search() {
+        let mut trace = searching();
+        trace.query("db", RecordType::A);
+        let sent = trace.last();
+        trace.answer(&sent, &no_data(reply(&sent)));
+        for _ in 0..2 {
+            let sent = trace.last();
+            trace.answer(&sent, &with_code(reply(&sent), ResponseCode::ServFail));
+        }
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 db A
+          -> S1 udp q0: db.corp.example. A
+          next t=2s
+        t=0s <- S1 udp q0: db.corp.example. A: NoError, 0 answers
+          -> S1 udp q0: db.lab.example. A
+          next t=2s
+        t=0s <- S1 udp q0: db.lab.example. A: ServFail, 0 answers
+          -> S2 udp q0: db.lab.example. A
+          next t=2s
+        t=0s <- S2 udp q0: db.lab.example. A: ServFail, 0 answers
+          => q0 Failed Server(ServFail)
           next none
         ");
     }

@@ -267,28 +267,39 @@ async fn run(config: Config, mut requests: mpsc::UnboundedReceiver<Request>) {
     let mut owners: HashMap<QueryId, u64> = HashMap::new();
     loop {
         while io.tasks.try_join_next().is_some() {}
-        while let Some(transmit) = resolver.poll_transmit() {
-            let to = transmit.destination;
-            if let Err((query, error)) = io.send(transmit).await {
-                resolver.handle_udp_error(query, to, error, Instant::now());
-            }
-        }
-        while let Some(event) = resolver.poll_event() {
-            let (Event::Response { query, .. } | Event::Failed { query, .. }) = &event;
-            io.forget(*query);
-            let Some(running) = owners.remove(query).and_then(|id| {
-                let running = lookups.remove(&id)?;
-                Some((id, running))
-            }) else {
-                continue;
-            };
-            let (id, Running { lookup, reply }) = running;
-            match lookup.handle_event(&event) {
-                Progress::Waiting(lookup) => {
-                    lookups.insert(id, Running { lookup, reply });
+        // Sending can queue events, and handling an event can queue
+        // transmits: a lookup moving on to its next search candidate.
+        let mut busy = true;
+        while busy {
+            busy = false;
+            while let Some(transmit) = resolver.poll_transmit() {
+                busy = true;
+                let to = transmit.destination;
+                if let Err((query, error)) = io.send(transmit).await {
+                    resolver.handle_udp_error(query, to, error, Instant::now());
                 }
-                Progress::Done(result) => {
-                    reply.send(outcome(result)).ok();
+            }
+            while let Some(event) = resolver.poll_event() {
+                busy = true;
+                let (Event::Response { query, .. } | Event::Failed { query, .. }) = &event;
+                io.forget(*query);
+                let Some(running) = owners.remove(query).and_then(|id| {
+                    let running = lookups.remove(&id)?;
+                    Some((id, running))
+                }) else {
+                    continue;
+                };
+                let (id, Running { lookup, reply }) = running;
+                match lookup.handle_event(&mut resolver, &event, Instant::now()) {
+                    Progress::Waiting(lookup) => {
+                        // Moving on to the next search candidate starts new
+                        // queries.
+                        owners.extend(lookup.queries().map(|query| (query, id)));
+                        lookups.insert(id, Running { lookup, reply });
+                    }
+                    Progress::Done(result) => {
+                        reply.send(outcome(result)).ok();
+                    }
                 }
             }
         }

@@ -8,17 +8,22 @@ use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use sansio_dns::hickory_proto::rr::RecordType;
 use sansio_dns::{Config, Transport};
-use sansio_dns_fuzz::{Code, Harness, S1, S2, flip, name, reply, set_id};
+use sansio_dns_fuzz::{Code, Harness, S1, S2, add_ns, cut, flip, name, reply, set_id};
 
 #[derive(Arbitrary, Debug)]
 enum Body {
     /// Raw bytes, with the query's message ID written over the first two.
     Raw { bytes: Vec<u8>, keep_id: bool },
-    /// A well-formed reply, then tampered with.
+    /// A well-formed reply, then tampered with: without its answer or RA,
+    /// with an NS record in authority, cut short, and with bits flipped.
     Reply {
         code: Code,
         truncated: bool,
         edns: bool,
+        empty: bool,
+        recursion_available: bool,
+        ns: bool,
+        cut: u8,
         flips: Vec<(u16, u8)>,
     },
 }
@@ -76,16 +81,28 @@ fuzz_target!(|input: Input| {
                         code,
                         truncated,
                         edns,
+                        empty,
+                        recursion_available,
+                        ns,
+                        cut: n,
                         flips,
                     } => {
                         let mut response = reply(&sent.request, (*code).into());
                         response.metadata.truncation = *truncated;
+                        response.metadata.recursion_available = *recursion_available;
                         if !edns {
                             response.edns = None;
+                        }
+                        if *empty {
+                            response.answers.clear();
+                        }
+                        if *ns {
+                            add_ns(&mut response);
                         }
                         let Ok(mut bytes) = response.to_vec() else {
                             continue;
                         };
+                        cut(&mut bytes, *n);
                         flip(&mut bytes, flips);
                         bytes
                     }

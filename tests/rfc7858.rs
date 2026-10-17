@@ -207,7 +207,8 @@ fn wrong_certificate_moves_on_then_fails() {
 }
 
 /// A FORMERR without OPT doesn't make the query drop EDNS over TLS, since
-/// EDNS carries the padding: it moves on like any other server error.
+/// EDNS carries the padding: it moves on like any other server error, and
+/// the server isn't asked again (RFC 1035 §7.2).
 #[test]
 fn formerr_without_opt_over_tls_keeps_edns_and_moves_on() {
     let (client, server_config) = configs("dns.example");
@@ -224,7 +225,7 @@ fn formerr_without_opt_over_tls_keeps_edns_and_moves_on() {
         .map(|t| t.destination)
         .collect();
     assert_eq!(servers, [S1, S2]);
-    assert_eq!(server.queries.len(), 4, "one query per attempt");
+    assert_eq!(server.queries.len(), 2, "one query per server");
     assert!(server.queries.iter().all(|q| q.len() % 128 == 0));
     assert_matches!(
         resolver.poll_event(),

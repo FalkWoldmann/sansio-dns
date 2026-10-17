@@ -20,13 +20,15 @@ Complete drivers are in `examples/` (`std`, `tokio`, `compio`), about 100 lines 
 
 For hostnames, `IpLookup` runs the A and AAAA queries and merges the addresses, following
 CNAMEs. `Config::ip_strategy` picks the families and their order: IPv6 first by default, or
-IPv4 first, or only one family.
+IPv4 first, or only one family. With search domains, the lookup starts the queries for the
+next candidate itself: send the transmits it queues, and route events by `lookup.queries()`
+again after each one.
 
 ```rust
 let mut lookup = IpLookup::start(&mut resolver, Name::from_ascii("example.com")?, now)?;
 // in the event loop:
 while let Some(event) = resolver.poll_event() {
-    lookup = match lookup.handle_event(&event) {
+    lookup = match lookup.handle_event(&mut resolver, &event, now) {
         Progress::Waiting(lookup) => lookup,
         Progress::Done(result) => { /* Ok(addresses) or Err(error) */ }
     };
@@ -79,8 +81,14 @@ the [`resolv-conf`](https://crates.io/crates/resolv-conf) crate and applies glib
 the first three nameservers, `search`/`domain`, `ndots`, `timeout` and `attempts`, skipping
 lines it can't use instead of failing; `options no-aaaa` asks for IPv4 addresses only. With
 search domains, a name without a trailing dot is tried with each of them, before the name as
-given if it has fewer than `ndots` dots and after it otherwise; the search moves on only on
-NXDOMAIN.
+given if it has fewer than `ndots` dots and after it otherwise. For `Resolver::query` the
+search moves on after NXDOMAIN and after NODATA (the name exists without records of the type
+asked for at the end of its CNAME chain), until a candidate has data (RFC 1123 §6.1.4.3, RFC
+2308 §2.2); when it runs out the outcome is the first NODATA, else the last NXDOMAIN. glibc
+moves on after NODATA only when the answer section is empty, so it stops at a CNAME whose
+target has no data. `IpLookup` asks each candidate for both families and moves on when
+neither has an address, as glibc's `getaddrinfo` does, so its addresses are always those of
+one name.
 
 ## Compared with hickory-resolver
 
@@ -123,7 +131,10 @@ Where the two behave differently:
 Behavior follows the RFCs as listed and annotated at
 [rfc-annotations.research.icann.org](https://rfc-annotations.research.icann.org/).
 Tests mostly live in `tests/rfc<number>.rs`, with one module per section. The exceptions:
-RFC 1034 is in `tests/lookup.rs`; RFC 6762 and 7686 are tested in `rfc6761.rs`'s §6.4 module;
+RFC 1034 is in `tests/lookup.rs`, except §4.3.1, tested with the RA bit and RFC 2308 §2.2's
+authority-section rule in `rfc1035.rs`'s §4.1.1 module, which also has the extended RCODEs of
+RFC 6891 §6.1.3 and RFC 7873 §5.3; RFC 2308 §2.2's NODATA is in `rfc1123.rs`'s §6.1.4.3
+module, and RFC 6895, 8482 and 9824 in its §6.1.3.2 module; RFC 6762 and 7686 are tested in `rfc6761.rs`'s §6.4 module;
 `rfc7858.rs` holds the RFC 7858, 8310 and 8467 tests as plain functions, without section
 modules; and `rfc7766.rs` also has `stream_timeout` and `lost_connection` modules.
 `tests/main.rs` builds them all as one crate.
@@ -132,16 +143,25 @@ modules; and `rfc7766.rs` also has `stream_timeout` and `lost_connection` module
 |---|---|---|
 | 1035 | §2.3.3 | Question names are compared case-insensitively |
 | 1035 | §3.1 | Names are absolute: without search domains, `example.com` and `example.com.` ask the same question |
-| 1035 | §4.1.1 | `RD` set; `NOERROR` ends the query, and `NXDOMAIN` does once no search candidate is left; `SERVFAIL`/`NOTIMP`/`REFUSED` fail over |
+| 1035 | §4.1.1 | `RD` set; only `NOERROR` and `NXDOMAIN` answer the question; every other code fails over, the codes 6 to 15 and extended ones included |
 | 1035 | §4.2.1 | `TC` set → retry over TCP (RFC 7766) |
 | 1035 | §7.2 | Retransmit on timeout, or at once when the datagram can't be sent, rotating through servers; new queries start after a server that recently failed to answer |
-| 1035 | §7.3 | Non-responses (`QR=0`) and wrong opcodes are discarded |
+| 1035 | §7.2 | A server that answers with an error code, a reply that doesn't decode or an empty answer without AA or RA is removed from the query's list until the next search candidate; once every server is removed, the query fails with the last error |
+| 1035 | §7.3 | Non-responses (`QR=0`) and wrong opcodes are discarded; a matching reply whose records don't decode moves on to the next server at once |
+| 1034 | §4.3.1 | An empty `NOERROR` answer with neither AA nor RA, from a server that doesn't recurse and isn't authoritative (such as a referral), fails over (`Error::NoRecursion` on the last), as glibc does; with AA or RA it is NODATA |
+| 1123 | §6.1.3.2 | Zone transfer and meta query types (AXFR, IXFR, OPT, TSIG, TKEY, MAILA, MAILB, NXNAME, TYPE 0; RFC 6895 §3.1, RFC 9824 §3.5) are rejected by `query`; ANY is allowed (RFC 8482) |
 | 1123 | §6.1.3.3 | Retries back off exponentially: each round through the servers waits twice as long, starting at 5 s by default |
-| 5452 | §9.1 | Responses must match source address, port, ID, QNAME, QTYPE and QCLASS |
-| 5452 | §4.6 | Only the first matching response is accepted |
+| 1123 | §6.1.4.3 | Search candidates are tried until one has data of the type asked for: NXDOMAIN and NODATA (RFC 2308 §2.2) move on; then the first NODATA is the outcome, else the last NXDOMAIN; a failure ends the search. `IpLookup` asks each candidate for A and AAAA and moves on when neither has an address, so both families come from the same name (§6.1.4.3 (b)) |
+| 2181 | §8 | TTLs with the most significant bit set are passed on as zero |
+| 2181 | §9 | A truncated UDP reply switches to TCP even when it is cut off mid-record and doesn't decode; over TCP a truncated reply is used as it is |
+| 3597 | §3 | Records of unknown type are kept as opaque data. hickory rejects a message with an empty-RDATA record outside UPDATE, although `\# 0` is valid; such a reply moves on to the next server at once |
+| 5452 | §9.1 | Responses must match source address, port, ID, QNAME, QTYPE and QCLASS, also when their records don't decode |
+| 5452 | §4.6 | The first answer that ends the query wins, and later copies are ignored. A copy of an error answer counts again while the query is still on that server: after a `FORMERR` without OPT made it drop EDNS, a second copy counts as the answer to the query without EDNS |
 | 5452 | §9.2 | IDs from a CSPRNG, avoiding those of outstanding queries (up to 16 picks); per-query source ports are the driver's job (see below) |
+| 6891 | §6.1.3 | BADVERS fails over like any server error: version 0 is the lowest there is |
 | 6891 | §6.2.3 | One OPT record, 1232-byte payload (DNS Flag Day 2020) |
 | 6891 | §7, §6.2.2 | `FORMERR` without OPT → same server once more without EDNS (over TLS: fail over, since EDNS carries the padding); with OPT → fail over |
+| 7873 | §5.3 | No cookie is sent, so BADCOOKIE is a server error and fails over |
 | 7766 | §5 | Truncated UDP response → same server over TCP; later attempts stay on TCP; UDP replies then ignored |
 | 7766 | §6.2.1 | One connection per server, reused and pipelined; answers matched in any order |
 | 7766 | §6.2.3 | Idle connections closed after `idle_timeout`; a timeout closes the connection |
@@ -183,11 +203,11 @@ destination's address family, pass the source address as received (an IPv4 serve
 
 - Opportunistic (unauthenticated) TLS.
 - EDNS TCP keepalive (RFC 7828) to negotiate the idle timeout with the server.
-- DoH/DoQ, caching, DNS cookies (RFC 7873).
+- DoH/DoQ, caching.
+- DNS cookies (RFC 7873): queries carry no COOKIE option.
 - `resolv.conf` options other than the ones above (`rotate`, `use-vc`, `sortlist`, …).
 - Sorting addresses by the host's own ones (RFC 6724 §6); `IpLookup` lists them by family,
   in the server's order within each.
-- `IpLookup` searches A and AAAA independently, so the two could end on different candidates.
 - Once EDNS is dropped for a query, it stays off for that query's remaining attempts,
   including other servers, until the search moves to the next candidate.
 
@@ -208,7 +228,8 @@ records (`tls_stream`), hosts and resolv.conf files (`system_files`) and call se
 (`driver_ops`). After every step they check one event per query, transmits only for live
 queries and open connections, and a timer exactly while something is pending; `datagram`,
 `stream` and `driver_ops` also bound the sends per query. `system_files` checks the local
-answers for hosts and special-use names and the order of the search candidates, and
+answers for hosts and special-use names, the order of the search candidates and the answer
+the search ends on, and
 `tls_stream` checks that every query the server decrypts keeps EDNS, is padded to a multiple
 of 128 octets and is sent at most `attempts + 3` times. They need nightly:
 

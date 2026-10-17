@@ -4,8 +4,8 @@
 //! `handle_udp_error`, `handle_stream_data`, `handle_stream_closed`,
 //! `handle_stream_error`, `handle_timeout` and `cancel`, so any sequence of
 //! those is a valid input. Replies and send errors go to recent transmits
-//! over their transport, replies often tampered with and, over TCP, split
-//! into two chunks; there is raw garbage too.
+//! over their transport, replies often tampered with or cut short and, over
+//! TCP, split into two chunks; there is raw garbage too.
 //!
 //! [`Model`] generates the calls from what a driver knows without asking the
 //! resolver: how many queries it started, and whether it sent a reply that
@@ -56,10 +56,21 @@ enum Reply {
     Answer,
     Code(ResponseCode),
     FormErrWithoutOpt,
+    /// `NOERROR` without an answer.
+    NoData,
+    /// `NOERROR` without an answer, AA or RA, with NS records in authority.
+    Referral,
     Truncated,
+    /// An answer whose last record is cut short, with or without TC.
+    Cut {
+        truncated: bool,
+    },
     WrongId,
     WrongSource,
-    BitFlip { byte: usize, bit: u8 },
+    BitFlip {
+        byte: usize,
+        bit: u8,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -104,10 +115,15 @@ fn reply_strategy() -> impl Strategy<Value = Reply> {
             ResponseCode::Refused,
             ResponseCode::NotImp,
             ResponseCode::FormErr,
+            ResponseCode::NotAuth,
+            ResponseCode::Unknown(11),
+            ResponseCode::BADCOOKIE,
         ])
         .prop_map(Reply::Code),
         1 => Just(Reply::FormErrWithoutOpt),
+        1 => prop_oneof![Just(Reply::NoData), Just(Reply::Referral)],
         1 => Just(Reply::Truncated),
+        1 => any::<bool>().prop_map(|truncated| Reply::Cut { truncated }),
         1 => Just(Reply::WrongId),
         1 => Just(Reply::WrongSource),
         1 => (any::<usize>(), 0u8..8).prop_map(|(byte, bit)| Reply::BitFlip { byte, bit }),
@@ -124,6 +140,13 @@ fn datagram(sent: &Transmit, kind: &Reply) -> (SocketAddr, Vec<u8>) {
             let mut m = with_code(answer, ResponseCode::FormErr);
             m.edns = None;
             encode(&m)
+        }
+        Reply::NoData => encode(&no_data(answer)),
+        Reply::Referral => encode(&referral(answer)),
+        Reply::Cut { truncated } => {
+            let mut m = answer;
+            m.metadata.truncation = *truncated;
+            cut(&encode(&m))
         }
         Reply::Truncated => {
             let mut m = answer;
@@ -158,7 +181,8 @@ struct Model {
     /// How many queries were started.
     queries: usize,
     /// Whether a reply was sent that can switch a query to TCP, so that a
-    /// connection may be open. A flipped bit can set the TC flag too.
+    /// connection may be open: one with TC set, decodable or not. A flipped
+    /// bit can set the TC flag too.
     streams: bool,
 }
 
@@ -228,7 +252,7 @@ impl ReferenceStateMachine for Model {
         match op {
             Op::Query { .. } => model.queries += 1,
             Op::Reply {
-                reply: Reply::Truncated | Reply::BitFlip { .. },
+                reply: Reply::Truncated | Reply::Cut { truncated: true } | Reply::BitFlip { .. },
                 ..
             } => model.streams = true,
             Op::Reply { .. }

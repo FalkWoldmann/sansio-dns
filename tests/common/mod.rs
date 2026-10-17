@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use hickory_proto::op::{Message, MessageType, ResponseCode};
-use hickory_proto::rr::rdata::{A, AAAA};
+use hickory_proto::rr::rdata::{A, AAAA, NS, SOA};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use rstest::fixture;
 use sansio_dns::{Config, ConnectionId, Event, QueryId, Resolver, Transmit, Transport};
@@ -92,10 +92,12 @@ pub fn reply(request: &Transmit) -> Message {
     reply_to(&decode(request))
 }
 
-/// The answer a well-behaved server would give to the query `request`.
+/// The answer a well-behaved recursive server would give to the query
+/// `request`.
 pub fn reply_to(request: &Message) -> Message {
     let request = request.clone();
     let mut response = Message::response(request.metadata.id, request.metadata.op_code);
+    response.metadata.recursion_available = true;
     response.add_queries(request.queries.clone());
     let question = &request.queries[0];
     let data = match question.query_type() {
@@ -106,6 +108,36 @@ pub fn reply_to(request: &Message) -> Message {
     if let Some(edns) = request.edns {
         response.set_edns(edns);
     }
+    response
+}
+
+/// `response` without its answers: NODATA, if its code is `NOERROR`.
+pub fn no_data(mut response: Message) -> Message {
+    response.answers.clear();
+    response
+}
+
+/// `response` as a referral from a server that doesn't recurse: no
+/// answers, neither AA nor RA, and the zone's NS record in the authority
+/// section (RFC 1034 §4.3.1).
+pub fn referral(response: Message) -> Message {
+    let mut response = no_data(response);
+    response.metadata.authoritative = false;
+    response.metadata.recursion_available = false;
+    let zone = Name::from_ascii("com.").unwrap();
+    let server = Name::from_ascii("a.gtld-servers.net.").unwrap();
+    response.add_authority(Record::from_rdata(zone, 172800, RData::NS(NS(server))));
+    response
+}
+
+/// `response` with the zone's SOA record added to its authority section,
+/// as in a negative answer (RFC 2308 §2.2).
+pub fn with_soa(mut response: Message) -> Message {
+    let zone = Name::from_ascii("example.com.").unwrap();
+    let mname = Name::from_ascii("ns1.example.com.").unwrap();
+    let rname = Name::from_ascii("hostmaster.example.com.").unwrap();
+    let soa = SOA::new(mname, rname, 1, 7200, 3600, 1_209_600, 300);
+    response.add_authority(Record::from_rdata(zone, 300, RData::SOA(soa)));
     response
 }
 
@@ -124,6 +156,12 @@ pub fn with_code(mut response: Message, code: ResponseCode) -> Message {
 
 pub fn encode(message: &Message) -> Vec<u8> {
     message.to_vec().unwrap()
+}
+
+/// `message` without its last two bytes, so its last record doesn't parse
+/// but its header and question still do.
+pub fn cut(message: &[u8]) -> Vec<u8> {
+    message[..message.len() - 2].to_vec()
 }
 
 pub fn is_response(event: Option<Event>) -> bool {
@@ -207,6 +245,22 @@ impl Trace {
             server(to.destination),
             describe(response)
         );
+        self.record(&line);
+    }
+
+    /// Answer `to` with `bytes`, described as `what`, as [`Trace::answer`]
+    /// does.
+    pub fn answer_bytes(&mut self, to: &Transmit, bytes: &[u8], what: &str) {
+        let via = if let Transport::Udp(query) = to.transport {
+            self.resolver
+                .handle_datagram(query, to.destination, bytes, self.now);
+            format!("udp {}", self.query_name(query))
+        } else {
+            self.resolver
+                .handle_stream_data(conn(to), &frame(bytes), self.now);
+            self.conn_name(conn(to))
+        };
+        let line = format!("<- {} {via}: {what}", server(to.destination));
         self.record(&line);
     }
 
@@ -366,6 +420,12 @@ fn describe(message: &Message) -> String {
         let n = message.answers.len();
         let code = message.metadata.response_code;
         text += &format!(": {code:?}, {n} answer{}", if n == 1 { "" } else { "s" });
+        if message.metadata.authoritative {
+            text += ", AA";
+        }
+        if !message.metadata.recursion_available {
+            text += ", no RA";
+        }
     }
     if message.metadata.truncation {
         text += ", TC";

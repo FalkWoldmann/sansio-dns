@@ -232,3 +232,61 @@ fn joined_query_follows_the_search() {
       next none
     ");
 }
+
+/// A query that joined after the first one started doesn't share the first
+/// one's error answers either: it starts over and may ask every server
+/// again.
+#[test]
+fn late_joiner_starts_over_when_every_server_refused() {
+    let mut config = Config::new(S1, []);
+    config.timeout = Duration::from_secs(2);
+    let mut trace = Trace::new(Resolver::new(config));
+    trace.query("example.com.", RecordType::A);
+    let sent = trace.last();
+    trace.at(Duration::from_secs(1));
+    trace.query("example.com.", RecordType::A);
+
+    trace.answer(&sent, &with_code(reply(&sent), ResponseCode::Refused));
+
+    assert_snapshot!(trace, @"
+    t=0s query q0 example.com. A
+      -> S1 udp q0: example.com. A
+      next t=2s
+    t=1s query q1 example.com. A
+      next t=2s
+    t=1s <- S1 udp q0: example.com. A: Refused, 0 answers
+      => q0 Failed Server(Refused)
+      -> S1 udp q1: example.com. A
+      next t=3s
+    ");
+}
+
+/// The heir takes over the servers the query had excluded.
+#[rstest]
+fn cancel_hand_over_keeps_the_excluded_servers(mut trace: Trace) {
+    let first = trace.query("example.com.", RecordType::A);
+    let sent = trace.last();
+    trace.answer(&sent, &with_code(reply(&sent), ResponseCode::ServFail));
+    trace.query("example.com.", RecordType::A);
+    trace.cancel(first);
+    let resent = trace.last();
+
+    trace.answer(&resent, &with_code(reply(&resent), ResponseCode::ServFail));
+
+    assert_snapshot!(trace, @"
+    t=0s query q0 example.com. A
+      -> S1 udp q0: example.com. A
+      next t=2s
+    t=0s <- S1 udp q0: example.com. A: ServFail, 0 answers
+      -> S2 udp q0: example.com. A
+      next t=2s
+    t=0s query q1 example.com. A
+      next t=2s
+    t=0s cancel q0
+      -> S2 udp q1: example.com. A
+      next t=2s
+    t=0s <- S2 udp q1: example.com. A: ServFail, 0 answers
+      => q1 Failed Server(ServFail)
+      next none
+    ");
+}

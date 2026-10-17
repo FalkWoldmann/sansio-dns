@@ -2,6 +2,7 @@
 //! <https://rfc-annotations.research.icann.org/rfc1035.html>
 
 use std::io::ErrorKind;
+use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 use crate::common::*;
@@ -11,7 +12,7 @@ use hickory_proto::rr::{Name, RData, RecordType};
 use insta::assert_snapshot;
 use proptest::prelude::*;
 use rstest::rstest;
-use sansio_dns::{Error, Event, Resolver};
+use sansio_dns::{Config, Error, Event, Resolver};
 use std::assert_matches;
 
 /// §2.3.3: name comparisons are case-insensitive, so a server that changes
@@ -93,11 +94,24 @@ mod section_4_1_1 {
         assert!(resolver.poll_transmit().is_none());
     }
 
-    /// RCODEs that say this server can't answer move on to the next server.
+    /// Every other RCODE says this server can't answer: the query moves on
+    /// to the next server (§7.2). That includes the codes 6 to 15 that were
+    /// "reserved for future use" here, later assigned ones such as NOTAUTH,
+    /// and extended RCODEs carried in OPT, such as BADVERS (RFC 6891
+    /// §6.1.3; hickory names code 16 BADSIG) and BADCOOKIE (RFC 7873 §5.3:
+    /// no cookie was sent).
     #[rstest]
     #[case::server_failure(ResponseCode::ServFail)]
     #[case::not_implemented(ResponseCode::NotImp)]
     #[case::refused(ResponseCode::Refused)]
+    #[case::yx_domain(ResponseCode::YXDomain)]
+    #[case::yx_rrset(ResponseCode::YXRRSet)]
+    #[case::nx_rrset(ResponseCode::NXRRSet)]
+    #[case::not_auth(ResponseCode::NotAuth)]
+    #[case::not_zone(ResponseCode::NotZone)]
+    #[case::unassigned(ResponseCode::Unknown(11))]
+    #[case::bad_vers(ResponseCode::BADSIG)]
+    #[case::bad_cookie(ResponseCode::BADCOOKIE)]
     fn server_rcodes_fail_over(mut trace: Trace, #[case] code: ResponseCode) {
         trace.query("example.com.", RecordType::A);
         let sent = trace.last();
@@ -121,12 +135,78 @@ mod section_4_1_1 {
         }
     }
 
+    /// A referral from a server that doesn't recurse (RA clear, AA clear, no
+    /// answer, NS records in authority) isn't an answer for a stub
+    /// resolver, which relies on recursion only from servers that offer it
+    /// (RFC 1034 §4.3.1, §5.3.1).
+    #[rstest]
+    fn referral_fails_over(mut trace: Trace) {
+        trace.query("example.com.", RecordType::A);
+        let sent = trace.last();
+        trace.answer(&sent, &referral(reply(&sent)));
+        let sent = trace.last();
+        trace.answer(&sent, &referral(reply(&sent)));
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 example.com. A
+          -> S1 udp q0: example.com. A
+          next t=2s
+        t=0s <- S1 udp q0: example.com. A: NoError, 0 answers, no RA
+          -> S2 udp q0: example.com. A
+          next t=2s
+        t=0s <- S2 udp q0: example.com. A: NoError, 0 answers, no RA
+          => q0 Failed NoRecursion
+          next none
+        ");
+    }
+
+    /// Any empty `NOERROR` answer with neither AA nor RA set fails over,
+    /// with or without NS records and with an SOA, as glibc's `send_dg`
+    /// does: the server neither recursed nor is authoritative, so it can't
+    /// say the name has no data (RFC 1034 §4.3.1, §5.3.1).
+    #[rstest]
+    #[case::ns(|r| referral(r))]
+    #[case::soa(|r| { let mut r = with_soa(referral(r)); r.authorities.retain(|a| a.record_type() == RecordType::SOA); r })]
+    #[case::bare(|r| { let mut r = referral(r); r.authorities.clear(); r })]
+    fn empty_answer_without_aa_or_ra_fails_over(
+        mut resolver: Resolver,
+        #[case] make: fn(hickory_proto::op::Message) -> hickory_proto::op::Message,
+    ) {
+        let now = Instant::now();
+        let sent = start(&mut resolver, now);
+        let response = make(reply(&sent));
+
+        resolver.handle_datagram(udp(&sent), S1, &encode(&response), now);
+
+        assert!(resolver.poll_event().is_none());
+        assert_eq!(resolver.poll_transmit().map(|t| t.destination), Some(S2));
+    }
+
+    /// An empty answer with AA or RA set is NODATA, not a referral.
+    #[rstest]
+    #[case::authoritative(|r| { let mut r = referral(r); r.metadata.authoritative = true; r })]
+    #[case::recursive(|r| { let mut r = referral(r); r.metadata.recursion_available = true; r })]
+    #[case::recursive_with_soa(|r| { let mut r = with_soa(no_data(r)); r.metadata.recursion_available = true; r })]
+    fn nodata_is_not_a_referral(
+        mut resolver: Resolver,
+        #[case] make: fn(hickory_proto::op::Message) -> hickory_proto::op::Message,
+    ) {
+        let now = Instant::now();
+        let sent = start(&mut resolver, now);
+        let response = make(reply(&sent));
+
+        resolver.handle_datagram(udp(&sent), S1, &encode(&response), now);
+
+        assert!(is_response(resolver.poll_event()));
+        assert!(resolver.poll_transmit().is_none());
+    }
+
     #[rstest]
     fn last_server_rcode_is_reported(
         #[values(ResponseCode::ServFail, ResponseCode::Refused)] code: ResponseCode,
     ) {
-        let mut config = sansio_dns::Config::new(S1, []);
-        config.attempts = std::num::NonZeroUsize::MIN;
+        let mut config = Config::new(S1, []);
+        config.attempts = NonZeroUsize::MIN;
         let mut r = Resolver::new(config);
         let now = Instant::now();
         let sent = start(&mut r, now);
@@ -352,9 +432,144 @@ mod section_7_2 {
         ");
     }
 
+    /// A server that answered with an error is removed from the query's
+    /// list ("remove it from SLIST"): later attempts skip it, and the rounds
+    /// through the remaining servers still back off.
+    #[test]
+    fn server_error_removes_the_server_for_the_query() {
+        let mut config = config();
+        config.attempts = NonZeroUsize::new(4).unwrap();
+        let mut trace = Trace::new(Resolver::new(config));
+        trace.query("example.com.", RecordType::A);
+        let sent = trace.last();
+        trace.answer(&sent, &with_code(reply(&sent), ResponseCode::Refused));
+
+        trace.timeouts();
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 example.com. A
+          -> S1 udp q0: example.com. A
+          next t=2s
+        t=0s <- S1 udp q0: example.com. A: Refused, 0 answers
+          -> S2 udp q0: example.com. A
+          next t=2s
+        t=2s timeout
+          -> S2 udp q0: example.com. A
+          next t=6s
+        t=6s timeout
+          -> S2 udp q0: example.com. A
+          next t=14s
+        t=14s timeout
+          => q0 Failed Timeout
+          next none
+        ");
+    }
+
+    /// Once every server answered with an error, the query fails at once
+    /// with the last one, without asking any of them again.
+    #[rstest]
+    fn query_ends_when_every_server_answered_with_an_error(mut trace: Trace) {
+        trace.query("example.com.", RecordType::A);
+        let sent = trace.last();
+        trace.answer(&sent, &with_code(reply(&sent), ResponseCode::Refused));
+        let sent = trace.last();
+        trace.answer(&sent, &with_code(reply(&sent), ResponseCode::ServFail));
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 example.com. A
+          -> S1 udp q0: example.com. A
+          next t=2s
+        t=0s <- S1 udp q0: example.com. A: Refused, 0 answers
+          -> S2 udp q0: example.com. A
+          next t=2s
+        t=0s <- S2 udp q0: example.com. A: ServFail, 0 answers
+          => q0 Failed Server(ServFail)
+          next none
+        ");
+    }
+
+    /// With one server, an error code ends the query: there is no other
+    /// server to ask, and asking the same one again at once would only
+    /// repeat the error.
+    #[test]
+    fn one_server_error_ends_the_query() {
+        let mut trace = Trace::new(Resolver::new(Config::new(S1, [])));
+        trace.query("example.com.", RecordType::A);
+        let sent = trace.last();
+
+        trace.answer(&sent, &with_code(reply(&sent), ResponseCode::ServFail));
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 example.com. A
+          -> S1 udp q0: example.com. A
+          next t=5s
+        t=0s <- S1 udp q0: example.com. A: ServFail, 0 answers
+          => q0 Failed Server(ServFail)
+          next none
+        ");
+    }
+
+    /// A server that didn't answer stays in the list: a later, longer wait
+    /// may reach it.
+    #[rstest]
+    fn timeout_keeps_the_server(mut trace: Trace) {
+        trace.query("example.com.", RecordType::A);
+        trace.timeout();
+        let sent = trace.last();
+        trace.answer(&sent, &with_code(reply(&sent), ResponseCode::ServFail));
+        let sent = trace.last();
+        trace.answer(&sent, &reply(&sent));
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 example.com. A
+          -> S1 udp q0: example.com. A
+          next t=2s
+        t=2s timeout
+          -> S2 udp q0: example.com. A
+          next t=4s
+        t=2s <- S2 udp q0: example.com. A: ServFail, 0 answers
+          -> S1 udp q0: example.com. A
+          next t=6s
+        t=2s <- S1 udp q0: example.com. A: NoError, 1 answer
+          => q0 Response example.com. A: NoError, 1 answer
+          next none
+        ");
+    }
+
+    /// The next search candidate is a new question: every server may be
+    /// asked again.
+    #[test]
+    fn next_search_candidate_asks_every_server_again() {
+        let mut config = config();
+        config.search = vec![Name::from_ascii("corp.example.").unwrap()];
+        let mut trace = Trace::new(Resolver::new(config));
+        trace.query("db", RecordType::A);
+        let sent = trace.last();
+        trace.answer(&sent, &with_code(reply(&sent), ResponseCode::ServFail));
+        let sent = trace.last();
+        trace.answer(&sent, &with_code(reply(&sent), ResponseCode::NXDomain));
+        let sent = trace.last();
+        trace.answer(&sent, &reply(&sent));
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 db A
+          -> S1 udp q0: db.corp.example. A
+          next t=2s
+        t=0s <- S1 udp q0: db.corp.example. A: ServFail, 0 answers
+          -> S2 udp q0: db.corp.example. A
+          next t=2s
+        t=0s <- S2 udp q0: db.corp.example. A: NXDomain, 0 answers
+          -> S1 udp q0: db. A
+          next t=2s
+        t=0s <- S1 udp q0: db. A: NoError, 1 answer
+          => q0 Response db. A: NoError, 1 answer
+          next none
+        ");
+    }
+
     #[test]
     fn zero_failure_memory_always_starts_at_the_first_server() {
-        let mut config = sansio_dns::Config::new(S1, [S2]);
+        let mut config = Config::new(S1, [S2]);
         config.failure_memory = Duration::ZERO;
         let mut trace = Trace::new(Resolver::new(config));
         trace.query("a.example.", RecordType::A);
@@ -374,7 +589,7 @@ mod section_7_2 {
 
     #[test]
     fn timeout_too_large_for_instant_waits_forever() {
-        let mut config = sansio_dns::Config::new(S1, []);
+        let mut config = Config::new(S1, []);
         config.timeout = Duration::MAX;
         let mut r = Resolver::new(config);
         let now = Instant::now();
@@ -412,6 +627,51 @@ mod section_7_3 {
         resolver.handle_datagram(udp(&sent), S1, &encode(&response), now);
 
         assert!(resolver.poll_event().is_none());
+    }
+
+    /// A reply whose header and question match but whose records don't
+    /// parse is a "bizarre response" (§7.2): the query moves on to the next
+    /// server at once instead of waiting out its deadline.
+    #[rstest]
+    fn undecodable_reply_moves_on_at_once(mut trace: Trace) {
+        trace.query("example.com.", RecordType::A);
+        let sent = trace.last();
+        trace.answer_bytes(&sent, &cut(&encode(&reply(&sent))), "cut short");
+        let sent = trace.last();
+        trace.answer(&sent, &reply(&sent));
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 example.com. A
+          -> S1 udp q0: example.com. A
+          next t=2s
+        t=0s <- S1 udp q0: cut short
+          -> S2 udp q0: example.com. A
+          next t=2s
+        t=0s <- S2 udp q0: example.com. A: NoError, 1 answer
+          => q0 Response example.com. A: NoError, 1 answer
+          next none
+        ");
+    }
+
+    #[rstest]
+    fn undecodable_reply_on_a_stream_moves_on(mut trace: Trace) {
+        trace.query("example.com.", RecordType::A);
+        let sent = trace.last();
+        trace.answer(&sent, &truncated(reply(&sent)));
+        let tcp = trace.last();
+        trace.answer_bytes(&tcp, &cut(&encode(&reply(&tcp))), "cut short");
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 example.com. A
+          -> S1 udp q0: example.com. A
+          next t=2s
+        t=0s <- S1 udp q0: example.com. A: NoError, 1 answer, TC
+          -> S1 connect c0: example.com. A
+          next t=2s
+        t=0s <- S1 c0: cut short
+          -> S2 connect c1: example.com. A
+          next t=2s
+        ");
     }
 
     proptest! {

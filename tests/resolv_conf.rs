@@ -109,8 +109,8 @@ fn no_nameserver_asks_the_local_host() {
     assert_eq!(sent, [addr("127.0.0.1:53"), addr("127.0.0.1:53")]);
 }
 
-/// `search` and `ndots`, following glibc's `res_search` order and stopping,
-/// like musl, as soon as the name exists.
+/// `search` and `ndots`, following glibc's `res_search` order and stopping
+/// as soon as a candidate has data of the type asked for.
 mod search {
     use super::*;
     use hickory_proto::op::ResponseCode;
@@ -175,7 +175,8 @@ mod search {
         assert_eq!(asked, expected);
     }
 
-    /// NOERROR, with or without records, means the name exists: stop.
+    /// A record of the type asked for ends the search. NODATA doesn't; see
+    /// `rfc1123::section_6_1_4_3`.
     #[test]
     fn existing_name_ends_the_search() {
         let (asked, event) = tried(CONF, "db", ResponseCode::NoError);
