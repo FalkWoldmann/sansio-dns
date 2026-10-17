@@ -4,7 +4,8 @@
 //! - each query gets at most one event, and none after it was cancelled;
 //! - datagrams and stream writes belong to live queries, stream writes and
 //!   closes to open connections, and connection ids are never reused;
-//! - a query causes a bounded number of sends;
+//! - a query causes a bounded number of sends, and at most three to one
+//!   server over one transport (RFC 9520 §3.1);
 //! - there is a timer exactly while queries are pending or connections open,
 //!   and `handle_timeout(now)` leaves no deadline at or before `now`.
 
@@ -62,14 +63,27 @@ pub struct Harness {
     /// Groups whose sender was cancelled in the current step.
     handed_over: BTreeSet<Group>,
     sends: BTreeMap<Group, usize>,
+    /// Sends of each group to each server, over UDP (`true`) or a stream.
+    per_server: BTreeMap<(Group, SocketAddr, bool), usize>,
     by_message_id: BTreeMap<u16, Group>,
+    /// The message ID of each group's last datagram. A new one from the
+    /// same sender starts a new budget: a new search candidate, or the
+    /// sender starting over because it took the query over after joining
+    /// late.
+    message_id: BTreeMap<Group, u16>,
+    /// The member that sent each group's first datagram, which never
+    /// starts over itself (with `max_sends`, so for absolute names).
+    began: BTreeMap<Group, QueryId>,
     pub recent: VecDeque<Sent>,
     events: Vec<Event>,
 }
 
 impl Harness {
     /// `servers` are the ones `config` uses, or empty if unknown. With
-    /// `max_sends`, no query may cause more datagrams and stream writes.
+    /// `max_sends`, no query may cause more datagrams and stream writes,
+    /// nor more than three to one server over one transport. Both are
+    /// counted per query, not per search candidate, so they hold only for
+    /// absolute names.
     #[expect(clippy::disallowed_methods, reason = "the driver owns the clock")]
     pub fn new(config: Config, servers: Vec<SocketAddr>, max_sends: Option<usize>) -> Self {
         Self {
@@ -83,11 +97,14 @@ impl Harness {
             open: BTreeSet::new(),
             opened: BTreeSet::new(),
             sends: BTreeMap::new(),
+            per_server: BTreeMap::new(),
             groups: BTreeMap::new(),
             group_of: BTreeMap::new(),
             sender: BTreeMap::new(),
             handed_over: BTreeSet::new(),
             by_message_id: BTreeMap::new(),
+            message_id: BTreeMap::new(),
+            began: BTreeMap::new(),
             recent: VecDeque::new(),
             events: Vec::new(),
         }
@@ -122,7 +139,10 @@ impl Harness {
             self.sender.remove(&group);
             self.handed_over.remove(&group);
             self.sends.remove(&group);
+            self.per_server.retain(|(g, _, _), _| *g != group);
             self.by_message_id.retain(|_, g| *g != group);
+            self.message_id.remove(&group);
+            self.began.remove(&group);
         }
     }
 
@@ -216,20 +236,39 @@ impl Harness {
                         "datagram for {q:?}, which isn't live"
                     );
                     let group = self.group_of[&q].clone();
+                    let request = Message::from_vec(&t.payload).expect("the resolver sent garbage");
+                    let id = request.metadata.id;
+                    let fresh = self
+                        .message_id
+                        .insert(group.clone(), id)
+                        .is_some_and(|previous| previous != id);
                     match self.sender.insert(group.clone(), q) {
                         Some(previous) if previous != q => {
-                            if !self.handed_over.remove(&group) {
+                            let heir = self.groups.get(&group).and_then(|m| m.first());
+                            if self.handed_over.remove(&group) && heir == Some(&q) {
+                                if fresh {
+                                    // The heir joined late and starts over.
+                                    self.restart(&group, q, t.destination);
+                                } else {
+                                    // The heir sends the attempt again, or
+                                    // its next one: outside `max_sends`, but
+                                    // not outside the per-server limit.
+                                    self.count_per_server(&group, t.destination, true);
+                                }
+                            } else {
                                 // A late joiner starting over with a budget
                                 // of its own: `previous` must fail now.
                                 started_over.push(previous);
-                                self.sends.remove(&group);
-                                self.count(&group);
+                                self.restart(&group, q, t.destination);
                             }
                         }
-                        _ => self.count(&group),
+                        _ if fresh => self.restart(&group, q, t.destination),
+                        _ => {
+                            self.began.entry(group.clone()).or_insert(q);
+                            self.count(&group, t.destination, true);
+                        }
                     }
-                    let request = Message::from_vec(&t.payload).expect("the resolver sent garbage");
-                    self.by_message_id.insert(request.metadata.id, group);
+                    self.by_message_id.insert(id, group);
                     self.remember(&t, request);
                 }
                 Transport::TcpConnect(c) | Transport::TcpWrite(c) => {
@@ -301,15 +340,46 @@ impl Harness {
             self.groups.contains_key(&group),
             "stream query for {group:?}, which has no live query"
         );
-        self.count(&group);
+        self.count(&group, t.destination, false);
         self.remember(t, request);
     }
 
-    fn count(&mut self, group: &Group) {
+    /// `q` sent a datagram with a new message ID: a new budget for
+    /// `group`. With absolute names (`max_sends`) only a query that joined
+    /// late does that.
+    fn restart(&mut self, group: &Group, q: QueryId, to: SocketAddr) {
+        if self.max_sends.is_some() {
+            assert!(
+                self.began.get(group) != Some(&q),
+                "{q:?} started over, but it didn't join late"
+            );
+        }
+        self.began.insert(group.clone(), q);
+        self.sends.remove(group);
+        self.per_server.retain(|(g, _, _), _| g != group);
+        self.count(group, to, true);
+    }
+
+    fn count(&mut self, group: &Group, to: SocketAddr, datagram: bool) {
         let sends = self.sends.entry(group.clone()).or_default();
         *sends += 1;
         if let Some(max) = self.max_sends {
             assert!(*sends <= max, "{group:?} sent more than {max} times");
+        }
+        self.count_per_server(group, to, datagram);
+    }
+
+    fn count_per_server(&mut self, group: &Group, to: SocketAddr, datagram: bool) {
+        let sends = self
+            .per_server
+            .entry((group.clone(), to, datagram))
+            .or_default();
+        *sends += 1;
+        if self.max_sends.is_some() {
+            assert!(
+                *sends <= 3,
+                "{group:?} sent a fourth time to {to} over one transport"
+            );
         }
     }
 

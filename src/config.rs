@@ -46,6 +46,22 @@ impl IpStrategy {
     }
 }
 
+/// The shortest wait for an answer, whatever [`Config::timeout`] says
+/// (RFC 1123 §6.1.3.3 (5)).
+const MIN_WAIT: Duration = Duration::from_secs(1);
+
+/// The longest wait for an answer, after backoff (RFC 1123 §6.1.3.3 (5)).
+/// Above twice the maximum segment lifetime of two minutes (RFC 9293), as
+/// that section requires of a limit.
+const MAX_WAIT: Duration = Duration::from_secs(300);
+
+/// The longest a server stays failed (RFC 2308 §7.2, RFC 9520 §3.2).
+const MAX_FAILURE_MEMORY: Duration = Duration::from_secs(300);
+
+/// How often a search candidate may be sent to one server over one
+/// transport (RFC 9520 §3.1).
+pub(crate) const MAX_SENDS_PER_SERVER: u8 = 3;
+
 /// Resolver settings.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -53,8 +69,12 @@ pub struct Config {
     servers: Vec<SocketAddr>,
     /// How long to wait for a response before retrying, on each server's
     /// first attempt. Each later round through the servers waits twice as
-    /// long as the one before (RFC 1123 §6.1.3.3). A value too large to add
-    /// to an `Instant`, such as `Duration::MAX`, means wait forever.
+    /// long as the one before (RFC 1123 §6.1.3.3 (5)). That section also
+    /// asks for a lower and an upper bound: a value below one second counts
+    /// as one second, and no wait is longer than 300 seconds, above the
+    /// 240 that the section's limit must exceed (twice the maximum segment
+    /// lifetime of RFC 9293, plus service delay). So `Duration::MAX` waits
+    /// 300 seconds on every attempt.
     pub timeout: Duration,
     /// Total number of attempts per query, across all servers: the first
     /// goes to the first server that hasn't failed recently (see
@@ -65,6 +85,12 @@ pub struct Config {
     /// Switching to TCP, dropping EDNS and resending after a lost
     /// connection don't count as one; see the crate docs on how a query
     /// moves on.
+    ///
+    /// RFC 9520 §3.1 allows at most three sends of a query to a server over
+    /// one transport, free ones included, so a search candidate gets at
+    /// most three attempts per server over UDP, and three more over TCP
+    /// after a truncated answer. Attempts beyond that go unused: a query
+    /// whose servers have all had their three fails early.
     pub attempts: NonZeroUsize,
     /// Domains to try appending to names without a trailing dot, in order.
     /// Empty means every name is used as given.
@@ -75,13 +101,17 @@ pub struct Config {
     pub ndots: u8,
     /// How long a stream connection may go without any query on it before
     /// the resolver asks for it to be closed (RFC 7766 §6.2.3), counted
-    /// from the last write or read on it.
+    /// from the last write or read on it, or from when the last query on it
+    /// was cancelled.
     pub idle_timeout: Duration,
     /// How long a server that failed to answer, by timing out or with a
     /// network error, stays failed: until then, new queries start at the
     /// next server in the list instead, and their attempts rotate on from
     /// there. An answer from the server, even an error code, ends it early.
-    /// Zero turns it off.
+    /// Zero turns it off. At most five minutes: longer values count as five
+    /// minutes, the longest RFC 2308 §7.2 and RFC 9520 §3.2 let a server be
+    /// deemed dead. The failure is kept per server address, for every
+    /// query, as RFC 9520 §3.2 allows for unresponsive servers.
     pub failure_memory: Duration,
     /// Static entries answered before DNS, like `/etc/hosts`. Empty by
     /// default; fill it with [`Hosts::parse`].
@@ -150,10 +180,13 @@ impl Config {
     /// reads it: the first three usable `nameserver` lines (port 53),
     /// `search` or `domain`, `options ndots:` (default 1, at most 15),
     /// `options timeout:` in seconds (default 5, at most 30),
-    /// `options attempts:` per server (default 2, at most 5) and
+    /// `options attempts:` per server (default 2) and
     /// `options no-aaaa` ([`IpStrategy::Ipv4Only`]). Without usable
     /// `nameserver` lines, the local host is asked (127.0.0.1). Unlike glibc,
-    /// later rounds through the servers wait longer; see `timeout`.
+    /// later rounds through the servers wait longer; see `timeout`. And
+    /// where glibc takes up to 5 attempts per server, this takes at most 3,
+    /// since RFC 9520 §3.1 allows no more than three sends of a query to a
+    /// server over one transport.
     ///
     /// Like glibc, it never fails: lines and options it can't use are
     /// skipped, and so is a link-local server with a named scope
@@ -180,7 +213,8 @@ impl Config {
             .unwrap_or_else(|| SocketAddr::from((Ipv4Addr::LOCALHOST, 53)));
         let mut config = Self::new(first, servers);
         config.timeout = Duration::from_secs(u64::from(parsed.timeout.clamp(1, 30)));
-        let per_server = usize::try_from(parsed.attempts.clamp(1, 5)).unwrap_or(1);
+        let per_server =
+            usize::try_from(parsed.attempts.clamp(1, MAX_SENDS_PER_SERVER.into())).unwrap_or(1);
         config.attempts =
             NonZeroUsize::new(per_server * config.servers.len()).unwrap_or(NonZeroUsize::MIN);
         config.search = parsed
@@ -219,6 +253,25 @@ impl Config {
         } else {
             searched.chain(std::iter::once(absolute)).collect()
         }
+    }
+
+    /// How long an attempt in `round` waits for an answer: `timeout`,
+    /// doubled for each round through the servers before it, between
+    /// [`MIN_WAIT`] and [`MAX_WAIT`].
+    pub(crate) fn wait(&self, round: usize) -> Duration {
+        let factor = u32::try_from(round)
+            .ok()
+            .and_then(|round| 1u32.checked_shl(round))
+            .unwrap_or(u32::MAX);
+        self.timeout
+            .max(MIN_WAIT)
+            .saturating_mul(factor)
+            .min(MAX_WAIT)
+    }
+
+    /// How long a server that failed to answer stays failed.
+    pub(crate) fn failed_for(&self) -> Duration {
+        self.failure_memory.min(MAX_FAILURE_MEMORY)
     }
 
     pub(crate) fn servers(&self) -> &[SocketAddr] {

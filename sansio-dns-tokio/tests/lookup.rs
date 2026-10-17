@@ -168,7 +168,8 @@ async fn dropping_the_resolver_closes_its_connections() {
 async fn dropped_lookup_sends_no_retries() {
     let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let mut config = Config::new(silent.local_addr().unwrap(), []);
-    config.timeout = Duration::from_millis(500);
+    // The shortest wait the core allows; a retry would come after it.
+    config.timeout = Duration::from_secs(1);
     let resolver = Resolver::new(config);
     let mut buf = [0; 512];
 
@@ -179,7 +180,7 @@ async fn dropped_lookup_sends_no_retries() {
             silent.recv_from(&mut buf).await.unwrap();
         } => {}
     }
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
 
     let nothing = silent.try_recv_from(&mut buf).unwrap_err();
     assert_eq!(nothing.kind(), ErrorKind::WouldBlock);
@@ -291,7 +292,7 @@ async fn retry_reaches_a_server_of_the_other_family() {
     let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let (server, _) = name_server_on(IpAddr::V6(Ipv6Addr::LOCALHOST), "app.example.", false).await;
     let mut config = Config::new(silent.local_addr().unwrap(), [server]);
-    config.timeout = Duration::from_millis(200);
+    config.timeout = Duration::from_secs(1);
     let resolver = Resolver::new(config);
 
     let addresses = resolver.lookup_ip("app.example").await.unwrap();

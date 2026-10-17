@@ -23,4 +23,5 @@ mod rfc6891;
 mod rfc7766;
 #[cfg(feature = "tls")]
 mod rfc7858;
+mod rfc9520;
 mod state_machine;

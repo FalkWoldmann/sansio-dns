@@ -31,14 +31,18 @@
 //! server that answered with an error is skipped for the rest of the
 //! search candidate, as RFC 1035 §7.2 removes it from the list of servers
 //! to ask; one that didn't answer isn't, since a later, longer wait may
-//! reach it. Answers are matched by message ID and question, which are the
-//! same for every attempt, so an answer to an earlier attempt still counts
-//! if it comes from the server of the current one.
+//! reach it. A server is skipped too once the search candidate was sent to
+//! it three times over the query's transport (RFC 9520 §3.1; see below).
+//! Answers are matched by message ID and question, which are the same for
+//! every attempt, so an answer to an earlier attempt still counts if it
+//! comes from the server of the current one.
 //!
 //! A fresh deadline is [`Config::timeout`] from now, doubled for each round
 //! the attempts have made through the servers not skipped (exponential
 //! backoff, RFC 1123 §6.1.3.3): with two servers and the defaults, the four
-//! attempts wait 5, 5, 10 and 10 seconds.
+//! attempts wait 5, 5, 10 and 10 seconds, and a query that gets no answer
+//! fails after 30. Each wait is at least one second and at most 300, the
+//! bounds §6.1.3.3 (5) asks for, so no query waits forever.
 //!
 //! Only `NOERROR` and `NXDOMAIN` answer the question (RFC 1035 §4.1.1).
 //! Every other code is a server error: `SERVFAIL`, `REFUSED`, `NOTIMP`, the
@@ -48,6 +52,12 @@
 //! `NOERROR` with no answer and neither AA nor RA set: the server neither
 //! recursed nor is authoritative, so the answer is typically a referral,
 //! which a stub resolver can't follow (RFC 1034 §4.3.1, §5.3.1).
+//!
+//! In the table, "next" is the next server in the rotation that isn't
+//! skipped. A send to the "same" server that would be the fourth over that
+//! transport isn't made: the query sends its next attempt to the next
+//! server instead, using an attempt, and if that send was to drop EDNS, it
+//! keeps EDNS.
 //!
 //! | What happens | What the query does next | Server | Uses an attempt | Deadline |
 //! |---|---|---|---|---|
@@ -61,7 +71,7 @@
 //! | A connection that never answered is lost, or TLS rejects bytes received on any connection | sends its next attempt | next | yes | fresh |
 //! | `NXDOMAIN`, or NODATA (`NOERROR` without records of the type asked for), with search candidates left | starts over with the next candidate: new message ID, with EDNS, back on UDP unless over TLS, no server skipped, a new free resend | first that hasn't failed | fresh attempts | fresh |
 //! | It was the first to join a query that is cancelled (see below) | takes the query over; over UDP the current attempt is sent again from its own socket | same | no | fresh over UDP, kept on a stream |
-//! | Out of attempts, or every server skipped | fails with the last error | | | |
+//! | Out of attempts, or every server skipped | fails with the last error, or [`Error::Timeout`] when a query that took over a cancelled one has no server left; a query that joined after the search candidate started starts over instead (see below) | | | |
 //!
 //! If a TLS session can't be started or written to, the query fails at once
 //! with [`Error::Tls`]. A `NOERROR` answer with records of the type asked
@@ -72,12 +82,28 @@
 //! candidates itself, with an A and an AAAA query per candidate, and moves
 //! on when neither has an address.
 //!
-//! Each search candidate is sent at most `attempts + 3` times: once per
-//! attempt, plus at most one switch to TCP, one EDNS drop and one free
-//! resend. Skipping servers only lowers that: with one server, a server
-//! error ends the query. With k candidates that is k × (`attempts` + 3).
-//! Not counted are the datagram a query sends again when it takes over a
-//! cancelled one, and a late joiner starting over with attempts of its own.
+//! Each search candidate is sent at most three times to each server over
+//! each transport, UDP and TCP, or TLS (RFC 9520 §3.1). Every send counts:
+//! attempts, the free ones, and the datagram a query sends again when it
+//! takes over a cancelled one. So with n servers a search candidate is sent
+//! at most 3n times over UDP and 3n over a stream, and attempts beyond three
+//! per server are only used after a switch to TCP. Within that, it is sent
+//! at most `attempts + 3` times: once per attempt, plus at most one switch
+//! to TCP, one EDNS drop and one free resend, not counting the hand-over
+//! datagrams. Skipping servers only lowers that: with one server, a server
+//! error ends the query. With k candidates that is k times as many. A late
+//! joiner starting over has attempts and sends of its own.
+//!
+//! Every send waits at most 300 seconds for its answer, and a send that
+//! keeps its deadline adds no time. So with n servers a search candidate
+//! makes at most `min(attempts + 3 + h, 6n)` sends, where h is the number
+//! of hand-over datagrams, and takes at most 300 seconds per send. Over
+//! TLS, which sends no datagrams and neither switches to TCP nor drops
+//! EDNS, that is `min(attempts + 1, 3n)` sends. With [`Config::new`]'s
+//! defaults, a query that no server answers fails after 15 seconds per
+//! server (5 and then 10), so 30 with two servers. With `timeout:30` and
+//! `attempts:3`, the most [`Config::from_resolv_conf`] takes, each server
+//! waits 30, 60 and 120 seconds: 210 per server.
 //!
 //! A query for the same name (as given, trailing dot included, case ignored)
 //! and type as one in flight joins it instead of being sent, and gets its
@@ -87,7 +113,8 @@
 //! after its current search candidate started don't share the failure:
 //! the first of them starts over as a new query, with every server to
 //! ask, and the others join it. [`Resolver::cancel`] hands a query that
-//! others joined to the first of them.
+//! others joined to the first of them, which keeps its own join time: if
+//! it joined late, it starts over too rather than fail.
 //!
 //! # Driver obligations
 //!
@@ -209,7 +236,9 @@ pub enum Event {
 #[non_exhaustive]
 pub enum Error {
     /// The last attempt got no answer by its deadline, or its connection was
-    /// closed because another query on it timed out.
+    /// closed because another query on it timed out. Also when a query that
+    /// took over a cancelled one may send to no server any more (RFC 9520
+    /// §3.1).
     #[error("no response from any name server")]
     Timeout,
     /// The last TCP connection closed before a complete response arrived.

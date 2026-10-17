@@ -44,12 +44,24 @@ fn nameservers_in_order_two_attempts_each_by_default() {
     assert_eq!(wait, Duration::from_secs(5));
 }
 
+/// glibc takes up to 5 attempts per server, but RFC 9520 §3.1 allows no
+/// more than three sends of a query to one server over one transport. The
+/// sends alone don't show the clamp, since the resolver stops at three
+/// datagrams per server anyway; the attempts it leaves would go over TCP.
 #[rstest]
-#[case::as_given("options timeout:7 attempts:3", 7, 3)]
-#[case::capped_like_glibc("options timeout:99 attempts:9", 30, 5)]
+#[case::as_given("options timeout:7 attempts:2", 7, 2)]
+#[case::three("options timeout:7 attempts:3", 7, 3)]
+#[case::at_most_three_attempts("options timeout:7 attempts:5", 7, 3)]
+#[case::capped("options timeout:99 attempts:9", 30, 3)]
 fn timeout_and_attempts(#[case] options: &str, #[case] secs: u64, #[case] tries: usize) {
-    let (sent, wait) = attempts(format!("nameserver 192.0.2.53\n{options}\n"));
-    assert_eq!(sent.len(), tries);
+    let conf = format!("nameserver 192.0.2.53\nnameserver 192.0.2.54\n{options}\n");
+    assert_eq!(
+        Config::from_resolv_conf(conf.as_bytes()).attempts.get(),
+        2 * tries,
+        "attempts per server times servers"
+    );
+    let (sent, wait) = attempts(conf);
+    assert_eq!(sent.len(), 2 * tries);
     assert_eq!(wait, Duration::from_secs(secs));
 }
 

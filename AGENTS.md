@@ -88,16 +88,23 @@ The `Resolver` is a state machine over two maps: pending queries
   both through `advance`, which gives up once out of attempts or servers; `switch_to_tcp`
   and `drop_edns` (same server, free), `resend` (same server, free once per query via
   `forgive`, used by `lost` and `time_out_stream`), `next_candidate` (next search name,
-  fresh attempts, no exclusions), `give_up` and `fail`. The crate docs' "How a query moves
-  on" table states the rules (at most `attempts + 3` sends per search candidate, not
-  counting a cancel hand-over's resend or a late joiner's fresh start), and a comment above
-  `retry` maps each row to its function: change these functions together and keep the table
-  in sync.
+  fresh attempts, no exclusions), `give_up` and `fail`. `emit` counts every send in
+  `Pending::sends`: a search candidate goes at most three times to a server over one transport
+  (RFC 9520 §3.1), so `advance` skips servers without room, and the free sends check
+  `may_resend` first and move on instead. The crate docs' "How a query moves on" table
+  states the rules (at most `attempts + 3` sends per search candidate, not counting a cancel
+  hand-over's resend or a late joiner's fresh start, and at most three per server and
+  transport, hand-overs included), and a comment above `retry` maps each row to its
+  function: change these functions together and keep the table in sync.
+- Every wait is bounded (RFC 1123 §6.1.3.3): `Config::wait` keeps a deadline between 1 s
+  and 300 s after backoff, and `Config::failed_for` caps the failure memory at 5
+  minutes (RFC 9520 §3.2). Deadlines are plain `Instant`s; nothing waits forever.
 - A query for the same name (as given) and type as a pending one joins it as a
   follower (`Pending::followers`) and gets its outcome. When the leader runs out of attempts
   or servers, followers that joined after its current search candidate started start over
   (`give_up`); `cancel(id, now)` hands a query with followers to the first of them,
-  re-sending a UDP attempt from the follower's own socket.
+  re-sending a UDP attempt from the follower's own socket. The heir's join time goes into
+  `Pending::joined`, so `give_up` starts it over too if it joined late.
 - Special-use names (`localhost.`, `invalid.`, `onion.`) and `Config::hosts` entries are answered
   without a transmit. `IpLookup` (`src/lookup.rs`) walks the search candidates itself: per
   candidate it starts an A and an AAAA query for the absolute name

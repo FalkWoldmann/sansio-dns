@@ -3,13 +3,15 @@
 //! it says inside the session, when it sends close_notify, and what
 //! follows. The server checks each query it decrypts: it keeps its OPT
 //! record, is padded to a multiple of 128 octets (RFC 8467 §4.1), and is
-//! sent at most `attempts + 3` times. Run with `-timeout` so a receive loop that
+//! sent at most `attempts + 3` times, and at most three times to one server
+//! (RFC 9520 §3.1). Run with `-timeout` so a receive loop that
 //! stops making progress shows up as a hang.
 
 #![no_main]
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
+use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 
 use arbitrary::Arbitrary;
@@ -93,22 +95,29 @@ fn configs() -> &'static (Arc<ClientConfig>, Arc<ServerConfig>) {
     })
 }
 
-/// How often the servers decrypted each query, by message ID and name.
-/// Every query asks a different name, so a reused message ID can't add to
-/// another query's count.
+/// How often the servers decrypted each query, by message ID and name, in
+/// all and per server. Every query asks a different name, so a reused
+/// message ID can't add to another query's count.
 struct Sends {
     max: usize,
     counts: BTreeMap<(u16, Name), usize>,
+    per_server: BTreeMap<(u16, Name, SocketAddr), usize>,
 }
 
 impl Sends {
-    fn check(&mut self, query: &[u8]) -> Message {
+    fn check(&mut self, query: &[u8], server: SocketAddr) -> Message {
         let request = Message::from_vec(query).expect("the resolver sent garbage");
         assert!(request.edns.is_some(), "query without EDNS over TLS");
         assert_eq!(query.len() % 128, 0, "query not padded to 128 octets");
         let name = request.queries.first().map(|q| q.name().clone());
-        let key = (request.metadata.id, name.unwrap_or_default());
-        let count = self.counts.entry(key).or_default();
+        let (id, name) = (request.metadata.id, name.unwrap_or_default());
+        let count = self
+            .per_server
+            .entry((id, name.clone(), server))
+            .or_default();
+        *count += 1;
+        assert!(*count <= 3, "query sent to {server} a fourth time");
+        let count = self.counts.entry((id, name)).or_default();
         *count += 1;
         assert!(
             *count <= self.max,
@@ -121,6 +130,7 @@ impl Sends {
 
 /// The server's end of one connection.
 struct Peer {
+    server: SocketAddr,
     session: ServerConnection,
     /// Decrypted bytes from the resolver not yet split into queries.
     plaintext: Vec<u8>,
@@ -147,7 +157,7 @@ impl Peer {
             let Some(query) = rest.get(..len) else {
                 break;
             };
-            self.queries.push(sends.check(query));
+            self.queries.push(sends.check(query, self.server));
             self.plaintext.drain(..2 + len);
         }
         self.flush();
@@ -189,6 +199,7 @@ fn pump(harness: &mut Harness, peers: &mut BTreeMap<ConnectionId, Peer>, sends: 
                     continue;
                 };
                 let mut peer = Peer {
+                    server: t.destination,
                     session,
                     plaintext: Vec::new(),
                     queries: Vec::new(),
@@ -220,6 +231,7 @@ fuzz_target!(|steps: Vec<Step>| {
     let mut sends = Sends {
         max: config.attempts.get() + 3,
         counts: BTreeMap::new(),
+        per_server: BTreeMap::new(),
     };
     let mut harness = Harness::new(config, vec![S1, S2], None).tls();
     let mut peers = BTreeMap::new();

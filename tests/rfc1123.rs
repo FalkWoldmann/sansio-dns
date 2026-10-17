@@ -2,7 +2,7 @@
 //! <https://rfc-annotations.research.icann.org/rfc1123.html>
 
 use std::num::NonZeroUsize;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::common::*;
 use hickory_proto::ProtoError;
@@ -57,10 +57,23 @@ mod section_6_1_3_2 {
     }
 }
 
-/// §6.1.3.3 (5): retries back off exponentially, and without measured round
-/// trip times the first wait is no less than five seconds.
+/// §6.1.3.3: (1) a request consumes finite resources, and (2) gives up
+/// after several retransmissions. (5) Retries back off exponentially,
+/// within lower and upper bounds, and without measured round trip times the
+/// first wait is no less than five seconds. A limit "must exceed twice the
+/// Internet maximum segment lifetime plus service delay", 240 seconds and
+/// more with RFC 9293's MSL of two minutes: each wait is at most 300
+/// seconds, and at least one.
 mod section_6_1_3_3 {
     use super::*;
+
+    /// `S1` alone, with `timeout` and three attempts.
+    fn one_server(timeout: Duration) -> Trace {
+        let mut config = Config::new(S1, []);
+        config.timeout = timeout;
+        config.attempts = NonZeroUsize::new(3).unwrap();
+        Trace::new(Resolver::new(config))
+    }
 
     /// `Config::new`'s defaults: five seconds on each server, then ten.
     #[test]
@@ -93,9 +106,7 @@ mod section_6_1_3_3 {
     /// long as the one before.
     #[test]
     fn one_server_doubles_every_attempt() {
-        let mut config = Config::new(S1, []);
-        config.attempts = NonZeroUsize::new(3).unwrap();
-        let mut trace = Trace::new(Resolver::new(config));
+        let mut trace = one_server(Duration::from_secs(5));
         trace.query("example.com.", RecordType::A);
 
         trace.timeouts();
@@ -111,6 +122,83 @@ mod section_6_1_3_3 {
           -> S1 udp q0: example.com. A
           next t=35s
         t=35s timeout
+          => q0 Failed Timeout
+          next none
+        ");
+    }
+
+    #[test]
+    fn backoff_stops_at_300_seconds() {
+        let mut trace = one_server(Duration::from_secs(100));
+        trace.query("example.com.", RecordType::A);
+
+        trace.timeouts();
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 example.com. A
+          -> S1 udp q0: example.com. A
+          next t=100s
+        t=100s timeout
+          -> S1 udp q0: example.com. A
+          next t=300s
+        t=300s timeout
+          -> S1 udp q0: example.com. A
+          next t=600s
+        t=600s timeout
+          => q0 Failed Timeout
+          next none
+        ");
+    }
+
+    /// No timeout waits forever: even `Duration::MAX` gives up after three
+    /// waits of 300 seconds.
+    #[test]
+    fn largest_timeout_waits_300_seconds() {
+        let mut trace = one_server(Duration::MAX);
+        trace.query("example.com.", RecordType::A);
+
+        trace.timeouts();
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 example.com. A
+          -> S1 udp q0: example.com. A
+          next t=300s
+        t=300s timeout
+          -> S1 udp q0: example.com. A
+          next t=600s
+        t=600s timeout
+          -> S1 udp q0: example.com. A
+          next t=900s
+        t=900s timeout
+          => q0 Failed Timeout
+          next none
+        ");
+    }
+
+    /// A zero timeout would send every attempt at once.
+    #[test]
+    fn timeout_below_one_second_waits_one() {
+        let mut config = Config::new(S1, [S2]);
+        config.timeout = Duration::ZERO;
+        let mut trace = Trace::new(Resolver::new(config));
+        trace.query("example.com.", RecordType::A);
+
+        trace.timeouts();
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 example.com. A
+          -> S1 udp q0: example.com. A
+          next t=1s
+        t=1s timeout
+          -> S2 udp q0: example.com. A
+          next t=2s
+        t=2s timeout
+          -> S1 udp q0: example.com. A
+          next t=4s
+        t=4s timeout
+          -> S2 udp q0: example.com. A
+          next t=6s
+        t=6s timeout
           => q0 Failed Timeout
           next none
         ");

@@ -25,6 +25,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::ErrorKind;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 use crate::common::*;
@@ -39,14 +40,23 @@ use sansio_dns::{ConnectionId, Event, QueryId, Resolver, Transmit, Transport};
 /// Names to query. Few, so that queries often join one in flight.
 const NAMES: usize = 3;
 
-/// Datagrams one query may cause: one per attempt, plus one EDNS downgrade.
-const MAX_DATAGRAMS: usize = 2 * 2 + 1;
+/// Attempts per query: four per server, more than RFC 9520 §3.1 lets a
+/// query send over UDP, so that limit is reached.
+const ATTEMPTS: usize = 8;
+
+/// Sends of one search candidate to one server over one transport, a
+/// hand-over's resend included (RFC 9520 §3.1).
+const MAX_SENDS_PER_SERVER: usize = 3;
+
+/// Datagrams one query may cause: three to each of the two servers. One per
+/// attempt plus one EDNS downgrade would allow more.
+const MAX_DATAGRAMS: usize = 2 * MAX_SENDS_PER_SERVER;
 
 /// Datagrams and stream writes one search candidate may cause: one per
 /// attempt, plus switching to TCP, dropping EDNS and one free resend. A
 /// cancel hand-over's resend and a late joiner's fresh start don't count
 /// (see `Group`).
-const MAX_SENDS: usize = 2 * 2 + 3;
+const MAX_SENDS: usize = ATTEMPTS + 3;
 
 /// Transmits kept for replies, so late replies to old ones still happen.
 const RECENT: usize = 16;
@@ -279,12 +289,20 @@ struct Group {
     /// Whether the sender was cancelled in this step, so that its heir may
     /// send the attempt again for free.
     handed_over: bool,
+    /// The message ID of its datagrams. A new one means a new query: the
+    /// sender, or its heir, starting over because it joined late.
+    message_id: Option<u16>,
+    /// The query that sent its first datagram. It can't have joined late,
+    /// so it never starts over itself.
+    began: Option<QueryId>,
     datagrams: usize,
     sends: usize,
+    /// Sends to each server, over UDP (`true`) or TCP.
+    per_server: BTreeMap<(SocketAddr, bool), usize>,
 }
 
 impl Group {
-    fn count(&mut self, datagram: bool) {
+    fn count(&mut self, to: SocketAddr, datagram: bool) {
         self.sends += 1;
         assert!(self.sends <= MAX_SENDS, "too many sends for one name");
         if datagram {
@@ -294,6 +312,16 @@ impl Group {
                 "too many datagrams for one name"
             );
         }
+        self.count_per_server(to, datagram);
+    }
+
+    fn count_per_server(&mut self, to: SocketAddr, datagram: bool) {
+        let sends = self.per_server.entry((to, datagram)).or_default();
+        *sends += 1;
+        assert!(
+            *sends <= MAX_SENDS_PER_SERVER,
+            "a fourth send to one server over one transport"
+        );
     }
 }
 
@@ -324,7 +352,11 @@ struct Harness {
 impl Harness {
     fn new() -> Self {
         Self {
-            resolver: resolver(),
+            resolver: {
+                let mut config = config();
+                config.attempts = NonZeroUsize::new(ATTEMPTS).unwrap();
+                Resolver::new(config)
+            },
             now: Instant::now(),
             started: Vec::new(),
             name_of: BTreeMap::new(),
@@ -465,38 +497,51 @@ impl Harness {
 
     /// Drain the resolver's transmits and events, checking each.
     fn observe(&mut self) {
-        // Names whose queries started over, and the sender before that.
+        // Names whose queries started over, and the sender before that if
+        // another query took over.
         let mut started_over = Vec::new();
         while let Some(t) = self.resolver.poll_transmit() {
             assert!(t.destination == S1 || t.destination == S2, "unknown server");
             match t.transport {
                 Transport::Udp(q) => {
                     assert!(self.live.contains(&q), "datagram for a finished query");
+                    let id = decode(&t).metadata.id;
+                    let name = self.name_of[&q];
+                    let group = self.groups.entry(name).or_default();
+                    let previous = group.sender.replace(q);
+                    let other = previous.filter(|&p| p != q);
+                    let fresh = group.message_id.is_some_and(|m| m != id);
+                    assert!(
+                        !fresh || other.is_some() || group.began != Some(q),
+                        "a query started over that didn't join late"
+                    );
+                    if other.is_some() || fresh {
+                        // A late joiner starting over with a budget of its
+                        // own: a new query with a new message ID, whose old
+                        // IDs may come up again for any query. Another
+                        // query that sent before must fail now.
+                        started_over.push((name, other));
+                        self.streamed.retain(|_, n| *n != name);
+                        self.datagrams.remove(&q);
+                        *group = Group {
+                            sender: Some(q),
+                            began: Some(q),
+                            ..Group::default()
+                        };
+                        group.count(t.destination, true);
+                    } else if group.handed_over {
+                        // The heir of a sender cancelled in this step sends
+                        // the attempt again for free.
+                        group.handed_over = false;
+                        group.count_per_server(t.destination, true);
+                    } else {
+                        group.count(t.destination, true);
+                    }
+                    group.message_id = Some(id);
+                    group.began.get_or_insert(q);
                     let count = self.datagrams.entry(q).or_default();
                     *count += 1;
                     assert!(*count <= MAX_DATAGRAMS, "too many datagrams for one query");
-                    let name = self.name_of[&q];
-                    let group = self.groups.entry(name).or_default();
-                    match group.sender.replace(q) {
-                        // The heir of a sender cancelled in this step sends
-                        // the attempt again for free.
-                        Some(heir) if heir == q && group.handed_over => {
-                            group.handed_over = false;
-                        }
-                        Some(previous) if previous != q => {
-                            started_over.push((name, previous));
-                            // A new query with a new message ID; the old one's
-                            // IDs may come up again for any query.
-                            self.streamed.retain(|_, n| *n != name);
-                            *group = Group {
-                                sender: Some(q),
-                                ..Group::default()
-                            };
-                            group.count(true);
-                        }
-                        _ => group.count(true),
-                    }
-                    let id = decode(&t).metadata.id;
                     assert!(
                         !self.streamed.contains_key(&id),
                         "a query back on UDP after a stream"
@@ -520,7 +565,7 @@ impl Harness {
                     let Some(group) = name.and_then(|name| self.groups.get_mut(name)) else {
                         panic!("stream write for no query in flight");
                     };
-                    group.count(false);
+                    group.count(t.destination, false);
                 }
                 Transport::TcpClose(c) => {
                     assert!(self.open.remove(&c), "closing a connection that isn't open");
@@ -547,7 +592,7 @@ impl Harness {
         }
         for (_, previous) in &started_over {
             assert!(
-                !self.live.contains(previous),
+                !previous.is_some_and(|p| self.live.contains(&p)),
                 "a query sent for a name while another one for it is in flight"
             );
         }

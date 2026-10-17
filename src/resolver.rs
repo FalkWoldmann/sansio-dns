@@ -10,6 +10,7 @@ use hickory_proto::ProtoError;
 use hickory_proto::op::{Edns, Message, Query, ResponseCode};
 use hickory_proto::rr::{Name, RecordType};
 
+use crate::config::MAX_SENDS_PER_SERVER;
 #[cfg(feature = "tls")]
 use crate::tls;
 #[cfg(feature = "tls")]
@@ -38,9 +39,13 @@ struct Pending {
     /// that couldn't be decoded, or a referral: later attempts skip them
     /// (RFC 1035 §7.2, RFC 1034 §5.3.3 step 4d).
     excluded: Vec<SocketAddr>,
-    /// `None` if `now + timeout` overflows: the query then waits forever.
-    deadline: Option<Instant>,
+    /// When the current attempt times out.
+    deadline: Instant,
     route: Route,
+    /// How often this search candidate was sent to each server over each
+    /// channel, free sends included: at most `MAX_SENDS_PER_SERVER` times
+    /// (RFC 9520 §3.1).
+    sends: Vec<(SocketAddr, Channel, u8)>,
     /// Search candidates still to try if this name has no data of the type
     /// asked for.
     rest: VecDeque<Name>,
@@ -59,6 +64,11 @@ struct Pending {
     /// When this query's current search candidate started; joiners from
     /// after this instant don't share its failure (`Resolver::give_up`).
     started: Instant,
+    /// When the query it is filed under was issued, or joined if it took
+    /// over from a cancelled one (`Resolver::cancel`). One that joined after
+    /// `started` starts over rather than share the failure, as a follower
+    /// would.
+    joined: Instant,
     /// Queries that joined this one, and when; each gets its outcome too.
     /// Every `QueryId` in flight is in exactly one place: a key of
     /// `Resolver::pending`, or one leader's followers.
@@ -73,15 +83,40 @@ impl Pending {
 
     /// The deadline of the current attempt sent at `now`: `Config::timeout`,
     /// doubled each time the attempts have gone round the server list
-    /// (exponential backoff, RFC 1123 §6.1.3.3). `None` if it doesn't fit
-    /// in an `Instant`.
-    fn deadline(&self, config: &Config, now: Instant) -> Option<Instant> {
+    /// (exponential backoff, RFC 1123 §6.1.3.3), within the bounds of
+    /// `Config::wait`.
+    fn deadline(&self, config: &Config, now: Instant) -> Instant {
         let round = self.position.saturating_sub(self.first) / config.servers().len();
-        let factor = u32::try_from(round)
-            .ok()
-            .and_then(|round| 1u32.checked_shl(round))
-            .unwrap_or(u32::MAX);
-        now.checked_add(config.timeout.saturating_mul(factor))
+        // Only an `Instant` within minutes of the end of its range
+        // overflows; the attempt then times out at once.
+        now.checked_add(config.wait(round)).unwrap_or(now)
+    }
+
+    /// Whether this search candidate may be sent to `server` over `channel`
+    /// once more: RFC 9520 §3.1 allows three sends in all.
+    fn may_send(&self, server: SocketAddr, channel: Channel) -> bool {
+        self.sends
+            .iter()
+            .find(|(s, c, _)| *s == server && *c == channel)
+            .is_none_or(|(_, _, sent)| *sent < MAX_SENDS_PER_SERVER)
+    }
+
+    /// Whether the current attempt may be sent again to its server, over
+    /// its route.
+    fn may_resend(&self, config: &Config) -> bool {
+        self.may_send(self.server(config), self.route.channel())
+    }
+
+    /// Count a send to `server` over `channel`.
+    fn count_send(&mut self, server: SocketAddr, channel: Channel) {
+        match self
+            .sends
+            .iter_mut()
+            .find(|(s, c, _)| *s == server && *c == channel)
+        {
+            Some((_, _, sent)) => *sent = sent.saturating_add(1),
+            None => self.sends.push((server, channel, 1)),
+        }
     }
 }
 
@@ -97,6 +132,25 @@ enum Route {
     /// Over a stream: after a truncated UDP answer, or always with DNS over
     /// TLS. Names the connection once the attempt has been written to one.
     Stream(Option<ConnectionId>),
+}
+
+impl Route {
+    /// The channel it sends over.
+    fn channel(self) -> Channel {
+        match self {
+            Self::Udp => Channel::Udp,
+            Self::Stream(_) => Channel::Stream,
+        }
+    }
+}
+
+/// A DNS transport, as RFC 9520 §3.1 counts sends to a server: UDP, or the
+/// stream a query switches to, which is TCP, or TLS with DNS over TLS. A
+/// resolver uses one kind of stream, so the two never mix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Channel {
+    Udp,
+    Stream,
 }
 
 /// A stream connection to one server, shared by its queries.
@@ -304,17 +358,19 @@ impl Resolver {
             position: first,
             attempt: 0,
             excluded: Vec::new(),
-            deadline: now.checked_add(self.config.timeout),
+            deadline: now.checked_add(self.config.wait(0)).unwrap_or(now),
             route: if self.config.uses_tls() {
                 Route::Stream(None)
             } else {
                 Route::Udp
             },
+            sends: Vec::new(),
             rest,
             nodata: None,
             forgiven: false,
             asked,
             started: now,
+            joined: now,
             followers: Vec::new(),
         })
     }
@@ -352,6 +408,7 @@ impl Resolver {
         if let Some(previous) = self.pending.get_mut(&id) {
             next.followers = std::mem::take(&mut previous.followers);
             next.nodata = previous.nodata.take();
+            next.joined = previous.joined;
         }
         self.pending.insert(id, next);
         self.emit(id, now);
@@ -472,10 +529,11 @@ impl Resolver {
     /// each query on it is sent once more to the same server, over another
     /// connection, without using up an attempt. Its deadline starts over:
     /// the close can come at any time, even just before the old deadline,
-    /// and the query most likely never reached the server. Otherwise, and
-    /// for a query already resent for free, the query moves on to its next
-    /// attempt, still over a stream, and a query out of attempts fails with
-    /// [`Error::ConnectionClosed`]. No [`Transport::TcpClose`] follows.
+    /// and the query most likely never reached the server. Otherwise, for a
+    /// query already resent for free, and for one already sent to the server
+    /// three times over a stream (RFC 9520 §3.1), the query moves on to its
+    /// next attempt, still over a stream, and a query out of attempts fails
+    /// with [`Error::ConnectionClosed`]. No [`Transport::TcpClose`] follows.
     pub fn handle_stream_closed(&mut self, connection: ConnectionId, now: Instant) {
         self.lost(connection, now, &Error::ConnectionClosed);
     }
@@ -525,7 +583,7 @@ impl Resolver {
             return;
         };
         for id in self.queries_on(connection) {
-            if conn.answered && self.forgive(id) {
+            if conn.answered && self.may_resend(id) && self.forgive(id) {
                 if let Some(pending) = self.pending.get_mut(&id) {
                     pending.deadline = pending.deadline(&self.config, now);
                 }
@@ -627,7 +685,9 @@ impl Resolver {
     /// A query that times out on a stream suggests the connection is dead,
     /// so the connection is closed. The queries that timed out move on to
     /// their next attempt, and the others go to another connection to the
-    /// same server with their attempt and deadline unchanged, once per query.
+    /// same server with their attempt and deadline unchanged, once per query
+    /// and only if that isn't their fourth send to the server over a stream
+    /// (RFC 9520 §3.1); otherwise they move on too.
     ///
     /// Calling it before [`Resolver::poll_timeout`]'s instant does nothing.
     /// Calling it late handles every deadline that has passed in one step,
@@ -638,7 +698,7 @@ impl Resolver {
         let expired: Vec<QueryId> = self
             .pending
             .iter()
-            .filter(|(_, p)| p.deadline.is_some_and(|d| d <= now))
+            .filter(|(_, p)| p.deadline <= now)
             .map(|(id, _)| *id)
             .collect();
         for id in expired {
@@ -646,7 +706,7 @@ impl Resolver {
             let Some(pending) = self.pending.get(&id) else {
                 continue;
             };
-            if !pending.deadline.is_some_and(|d| d <= now) {
+            if pending.deadline > now {
                 continue;
             }
             match pending.route {
@@ -684,12 +744,11 @@ impl Resolver {
     }
 
     /// Earliest instant at which [`Resolver::handle_timeout`] must be called.
-    /// `None` means no timer is needed: no pending query has a deadline
-    /// (there is none, or [`Config::timeout`] is too large for an `Instant`)
-    /// and no open connection is waiting out [`Config::idle_timeout`]. An
-    /// idle connection keeps a timer running after the last query is done.
+    /// `None` means no timer is needed: no query is pending and no open
+    /// connection is waiting out [`Config::idle_timeout`]. An idle
+    /// connection keeps a timer running after the last query is done.
     pub fn poll_timeout(&self) -> Option<Instant> {
-        let queries = self.pending.values().filter_map(|p| p.deadline);
+        let queries = self.pending.values().map(|p| p.deadline);
         let idle = self
             .connections
             .keys()
@@ -723,9 +782,14 @@ impl Resolver {
     /// Queries that joined it go on, and the first of them takes it over. If
     /// its attempt went over UDP, that attempt is sent again as
     /// [`Transport::Udp`] for the heir, to the same server, with a fresh
-    /// deadline: bind a new socket for it. Over a stream nothing is sent; the
-    /// answer still arrives on the same connection, and the heir keeps the
-    /// deadline.
+    /// deadline: bind a new socket for it. If that would be the fourth
+    /// datagram of the search candidate to that server, the heir sends its
+    /// next attempt to the next server instead (RFC 9520 §3.1). If it has
+    /// none left, it fails with [`Error::Timeout`], unless it joined after
+    /// the current search candidate started: then it starts over with
+    /// attempts of its own, as [`Resolver::query`] promises. Over a stream
+    /// nothing is sent; the answer still arrives on the same connection,
+    /// and the heir keeps the deadline.
     pub fn cancel(&mut self, id: QueryId, now: Instant) {
         let Some(mut pending) = self.pending.remove(&id) else {
             for p in self.pending.values_mut() {
@@ -734,19 +798,27 @@ impl Resolver {
             return;
         };
         if pending.followers.is_empty() {
+            // Its connection may have no query left: it is idle from now.
+            if let Route::Stream(Some(connection)) = pending.route
+                && let Some(conn) = self.connections.get_mut(&connection)
+            {
+                conn.last_active = now;
+            }
             return;
         }
-        let (heir, _) = pending.followers.remove(0);
-        let resend = (pending.route == Route::Udp).then(|| Transmit {
-            transport: Transport::Udp(heir),
-            destination: pending.server(&self.config),
-            payload: pending.payload.clone(),
-        });
-        if resend.is_some() {
+        let (heir, joined) = pending.followers.remove(0);
+        pending.joined = joined;
+        let udp = pending.route == Route::Udp;
+        let room = pending.may_resend(&self.config);
+        if udp && room {
             pending.deadline = pending.deadline(&self.config, now);
         }
         self.pending.insert(heir, pending);
-        self.transmits.extend(resend);
+        match (udp, room) {
+            (true, true) => self.emit(heir, now),
+            (true, false) => self.advance(heir, now, Error::Timeout),
+            (false, _) => {}
+        }
     }
 
     // How a query moves on, row by row of the crate docs' table, and the
@@ -768,10 +840,21 @@ impl Resolver {
     // - NXDOMAIN or NODATA, with candidates left: `search_on`, then
     //   `next_candidate`, which resets all of the above with a new
     //   `Pending`
-    // - joined query cancelled: `cancel`, not limited (each hand-over over
-    //   UDP sends again; the crate docs' send bound leaves it out)
-    // - out of attempts, or every server excluded: `advance` calls
-    //   `give_up`, then `fail`
+    // - joined query cancelled: `cancel`, limited only by the rule below
+    //   (each hand-over over UDP sends again; the crate docs' `attempts + 3`
+    //   bound leaves it out)
+    // - out of attempts, or every server excluded or without room: `advance`
+    //   calls `give_up`, then `fail`; `give_up` starts the late joiners
+    //   over, the query itself too if it took over from a cancelled one
+    //   after the search candidate started (`Pending::joined`)
+    //
+    // `emit` counts every send in `Pending::sends`, and no search candidate
+    // goes to a server over a channel more than three times (RFC 9520
+    // §3.1): `advance` skips servers without room, and `drop_edns`, `lost`,
+    // `time_out_stream` and `cancel` check `Pending::may_resend` before a
+    // free send and move on as `retry` (`lost`, `time_out_stream`) or
+    // `advance` (`drop_edns`, `cancel`) instead.
+    // `switch_to_tcp` needs no check: it is the first send over a stream.
 
     /// The server of `id`'s current attempt gave no answer: new queries
     /// start after it for a while (`Config::failure_memory`). It stays in
@@ -781,7 +864,7 @@ impl Resolver {
         let Some(pending) = self.pending.get(&id) else {
             return;
         };
-        if let Some(until) = now.checked_add(self.config.failure_memory) {
+        if let Some(until) = now.checked_add(self.config.failed_for()) {
             self.failed.insert(pending.server(&self.config), until);
         }
         self.advance(id, now, error);
@@ -800,19 +883,23 @@ impl Resolver {
         self.advance(id, now, error);
     }
 
-    /// Send `id`'s next attempt to the next server it hasn't excluded, or
-    /// fail it with `error` if it is out of attempts or every server is
-    /// excluded. The route stays, so after a truncated answer later
-    /// attempts also go over TCP, and with TLS every attempt stays off UDP
-    /// (RFC 7858 §3): `emit` opens or reuses a connection to the new server.
+    /// Send `id`'s next attempt to the next server it hasn't excluded and
+    /// may still send to over its route, or fail it with `error` if it is
+    /// out of attempts or no server is left. The route stays, so after a
+    /// truncated answer later attempts also go over TCP, and with TLS every
+    /// attempt stays off UDP (RFC 7858 §3): `emit` opens or reuses a
+    /// connection to the new server.
     fn advance(&mut self, id: QueryId, now: Instant, error: Error) {
         let Some(pending) = self.pending.get_mut(&id) else {
             return;
         };
         pending.attempt += 1;
         let servers = self.config.servers().len();
-        let next = (pending.position + 1..=pending.position + servers)
-            .find(|&p| !pending.excluded.contains(&self.config.server(p)));
+        let channel = pending.route.channel();
+        let next = (pending.position + 1..=pending.position + servers).find(|&p| {
+            let server = self.config.server(p);
+            !pending.excluded.contains(&server) && pending.may_send(server, channel)
+        });
         let Some(position) = next.filter(|_| pending.attempt < self.config.attempts.get()) else {
             self.give_up(id, error, now);
             return;
@@ -850,16 +937,21 @@ impl Resolver {
             payload: Vec::new(),
         });
         for id in self.queries_on(connection) {
-            let expired = self
-                .pending
-                .get(&id)
-                .is_some_and(|p| p.deadline.is_some_and(|d| d <= now));
-            if !expired && self.forgive(id) {
+            let expired = self.pending.get(&id).is_some_and(|p| p.deadline <= now);
+            if !expired && self.may_resend(id) && self.forgive(id) {
                 self.resend(id, now);
             } else {
                 self.retry(id, now, Error::Timeout);
             }
         }
+    }
+
+    /// Whether `id`'s current attempt may go to its server once more over
+    /// its route (RFC 9520 §3.1).
+    fn may_resend(&self, id: QueryId) -> bool {
+        self.pending
+            .get(&id)
+            .is_some_and(|p| p.may_resend(&self.config))
     }
 
     /// Whether `id` may send its attempt again for free, which it may once.
@@ -897,7 +989,8 @@ impl Resolver {
 
     /// Re-send `id` to the same server over TCP (RFC 7766 §5). Doesn't
     /// consume an attempt. Returns `false` if it already uses TCP, in which
-    /// case the response is used as it is.
+    /// case the response is used as it is. While on UDP the query has sent
+    /// nothing over a stream, so this send is always allowed.
     fn switch_to_tcp(&mut self, id: QueryId, now: Instant) -> bool {
         let Some(pending) = self.pending.get_mut(&id) else {
             return false;
@@ -913,14 +1006,21 @@ impl Resolver {
 
     /// Re-send `id` to the same server without an OPT record. Doesn't consume
     /// an attempt. If EDNS was already dropped, FORMERR is a plain server error.
+    /// If the server may not be sent the query again (RFC 9520 §3.1), the
+    /// query keeps EDNS and sends its next attempt to the next server.
     fn drop_edns(&mut self, id: QueryId, now: Instant) {
         let Some(pending) = self.pending.get_mut(&id) else {
             return;
         };
-        if pending.request.edns.take().is_none() {
+        if pending.request.edns.is_none() {
             self.reject(id, now, Error::Server(ResponseCode::FormErr));
             return;
         }
+        if !pending.may_resend(&self.config) {
+            self.advance(id, now, Error::Server(ResponseCode::FormErr));
+            return;
+        }
+        pending.request.edns = None;
         let Ok(payload) = pending.request.to_vec() else {
             self.fail(id, Error::Server(ResponseCode::FormErr));
             return;
@@ -931,13 +1031,14 @@ impl Resolver {
     }
 
     /// Send `id`'s current attempt: as a datagram, or on the open
-    /// connection to its server, opening one if there is none. Fails the
-    /// query if the bytes can't be produced.
+    /// connection to its server, opening one if there is none, and count
+    /// the send. Fails the query if the bytes can't be produced.
     fn emit(&mut self, id: QueryId, now: Instant) {
-        let Some(pending) = self.pending.get(&id) else {
+        let Some(pending) = self.pending.get_mut(&id) else {
             return;
         };
         let server = pending.server(&self.config);
+        pending.count_send(server, pending.route.channel());
         if pending.route == Route::Udp {
             self.transmits.push_back(Transmit {
                 transport: Transport::Udp(id),
@@ -1045,18 +1146,22 @@ impl Resolver {
     /// `id` is out of attempts, or every server is excluded. Queries that
     /// joined it after its current search candidate started haven't had
     /// attempts of their own yet: instead of sharing the failure they start
-    /// over, the first as a new query that the others join. The comparison
-    /// is strict on purpose: a query that joined at the very instant the
-    /// candidate started, such as a duplicate issued in the same tick,
-    /// shares its failure.
+    /// over, the first as a new query that the others join. That includes
+    /// `id` itself when it took over from a cancelled query it joined late
+    /// (`Pending::joined`). The comparison is strict on purpose: a query
+    /// that joined at the very instant the candidate started, such as a
+    /// duplicate issued in the same tick, shares its failure.
     fn give_up(&mut self, id: QueryId, error: Error, now: Instant) {
         let Some(pending) = self.pending.get_mut(&id) else {
             return;
         };
         let started = pending.started;
-        let (late, early): (Vec<_>, Vec<_>) = std::mem::take(&mut pending.followers)
+        let (mut late, early): (Vec<_>, Vec<_>) = std::mem::take(&mut pending.followers)
             .into_iter()
             .partition(|&(_, joined)| joined > started);
+        if pending.joined > started {
+            late.insert(0, (id, pending.joined));
+        }
         pending.followers = early;
         let asked = pending.asked.clone();
         let Some((&(heir, _), others)) = late.split_first() else {
@@ -1067,12 +1172,25 @@ impl Resolver {
         // the late queries would share the failure.
         let Ok(mut fresh) = self.begin(asked, now) else {
             if let Some(pending) = self.pending.get_mut(&id) {
-                pending.followers.extend(late);
+                pending
+                    .followers
+                    .extend(late.into_iter().filter(|&(query, _)| query != id));
             }
             self.fail(id, error);
             return;
         };
-        self.fail(id, error);
+        if heir == id {
+            // `id` starts over itself: only the queries that joined early
+            // fail.
+            let early = self.pending.remove(&id).map(|p| p.followers);
+            self.events
+                .extend(early.into_iter().flatten().map(|(query, _)| Event::Failed {
+                    query,
+                    error: error.clone(),
+                }));
+        } else {
+            self.fail(id, error);
+        }
         fresh.followers = others.to_vec();
         self.pending.insert(heir, fresh);
         self.emit(heir, now);

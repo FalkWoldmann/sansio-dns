@@ -650,4 +650,34 @@ mod section_6_2_3 {
           next none
         ");
     }
+
+    /// Without this, a query that waited longer than the idle timeout would
+    /// leave a deadline that has already passed.
+    #[test]
+    fn idle_time_starts_when_the_last_query_is_cancelled() {
+        let mut config = config();
+        config.timeout = Duration::from_secs(30);
+        let mut trace = Trace::new(Resolver::new(config));
+        let q0 = trace.query("example.com.", RecordType::A);
+        let sent = trace.last();
+        trace.answer(&sent, &truncated(reply(&sent)));
+        trace.at(Duration::from_secs(15));
+        trace.cancel(q0);
+
+        trace.timeout();
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 example.com. A
+          -> S1 udp q0: example.com. A
+          next t=30s
+        t=0s <- S1 udp q0: example.com. A: NoError, 1 answer, TC
+          -> S1 connect c0: example.com. A
+          next t=30s
+        t=15s cancel q0
+          next t=25s
+        t=25s timeout
+          -> S1 close c0
+          next none
+        ");
+    }
 }

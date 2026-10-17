@@ -40,7 +40,8 @@ while let Some(event) = resolver.poll_event() {
 A query for the same name and type as one already in flight joins it instead of being sent,
 and gets the same outcome as its own event, so parallel lookups of one host share their
 queries. One that joins late doesn't inherit the first one's spent attempts: if that one runs
-out, the later query starts over with its own. Cancelling the first hands the query to the next.
+out, the later query starts over with its own. Cancelling the first hands the query to the next,
+which still starts over rather than fail if it joined late.
 
 ### Tokio and reqwest
 
@@ -79,9 +80,11 @@ before any DNS query, as glibc's `hosts: files dns` does.
 `Config::from_resolv_conf(&bytes)` reads the text of a `resolv.conf` (you read the file) with
 the [`resolv-conf`](https://crates.io/crates/resolv-conf) crate and applies glibc's rules:
 the first three nameservers, `search`/`domain`, `ndots`, `timeout` and `attempts`, skipping
-lines it can't use instead of failing; `options no-aaaa` asks for IPv4 addresses only. With
-search domains, a name without a trailing dot is tried with each of them, before the name as
-given if it has fewer than `ndots` dots and after it otherwise. For `Resolver::query` the
+lines it can't use instead of failing. Unlike glibc, it takes at most 3 attempts per server
+instead of 5, since RFC 9520 §3.1 allows no more than three sends of a query to one server
+over one transport. `options no-aaaa` asks for IPv4 addresses only. With search domains, a
+name without a trailing dot is tried with each of them, before the name as given if it has
+fewer than `ndots` dots and after it otherwise. For `Resolver::query` the
 search moves on after NXDOMAIN and after NODATA (the name exists without records of the type
 asked for at the end of its CNAME chain), until a candidate has data (RFC 1123 §6.1.4.3, RFC
 2308 §2.2); when it runs out the outcome is the first NODATA, else the last NXDOMAIN. glibc
@@ -103,7 +106,7 @@ hickory-resolver 0.26.3 and its cache off:
 | `lookup_ip` over UDP | 226 µs | 311 µs |
 | `lookup_ip` after a truncated answer, over TCP | 305 µs | 396 µs |
 | reqwest GET on a new connection | 396 µs | 425 µs |
-| Heap allocations per UDP lookup, incl. 18 by the test server | 57 | 145 |
+| Heap allocations per UDP lookup, incl. 18 by the test server | 61 | 145 |
 | Stripped binary size over reqwest's default resolver | +0.58 MB | +1.44 MB |
 
 On localhost the times are mostly task wakeups; on a real network the round trip to the
@@ -134,7 +137,8 @@ Tests mostly live in `tests/rfc<number>.rs`, with one module per section. The ex
 RFC 1034 is in `tests/lookup.rs`, except §4.3.1, tested with the RA bit and RFC 2308 §2.2's
 authority-section rule in `rfc1035.rs`'s §4.1.1 module, which also has the extended RCODEs of
 RFC 6891 §6.1.3 and RFC 7873 §5.3; RFC 2308 §2.2's NODATA is in `rfc1123.rs`'s §6.1.4.3
-module, and RFC 6895, 8482 and 9824 in its §6.1.3.2 module; RFC 6762 and 7686 are tested in `rfc6761.rs`'s §6.4 module;
+module, and RFC 6895, 8482 and 9824 in its §6.1.3.2 module; RFC 2308 §7.2's cap is in
+`rfc9520.rs`'s §3.2 module; RFC 6762 and 7686 are tested in `rfc6761.rs`'s §6.4 module;
 `rfc7858.rs` holds the RFC 7858, 8310 and 8467 tests as plain functions, without section
 modules; and `rfc7766.rs` also has `stream_timeout` and `lost_connection` modules.
 `tests/main.rs` builds them all as one crate.
@@ -150,7 +154,7 @@ modules; and `rfc7766.rs` also has `stream_timeout` and `lost_connection` module
 | 1035 | §7.3 | Non-responses (`QR=0`) and wrong opcodes are discarded; a matching reply whose records don't decode moves on to the next server at once |
 | 1034 | §4.3.1 | An empty `NOERROR` answer with neither AA nor RA, from a server that doesn't recurse and isn't authoritative (such as a referral), fails over (`Error::NoRecursion` on the last), as glibc does; with AA or RA it is NODATA |
 | 1123 | §6.1.3.2 | Zone transfer and meta query types (AXFR, IXFR, OPT, TSIG, TKEY, MAILA, MAILB, NXNAME, TYPE 0; RFC 6895 §3.1, RFC 9824 §3.5) are rejected by `query`; ANY is allowed (RFC 8482) |
-| 1123 | §6.1.3.3 | Retries back off exponentially: each round through the servers waits twice as long, starting at 5 s by default |
+| 1123 | §6.1.3.3 | Retries back off exponentially: each round through the servers waits twice as long, starting at 5 s by default. Each wait lasts at least 1 s and at most 300 s, above the 240 s (twice TCP's maximum segment lifetime) that any limit must exceed, so every query gives up in finite time |
 | 1123 | §6.1.4.3 | Search candidates are tried until one has data of the type asked for: NXDOMAIN and NODATA (RFC 2308 §2.2) move on; then the first NODATA is the outcome, else the last NXDOMAIN; a failure ends the search. `IpLookup` asks each candidate for A and AAAA and moves on when neither has an address, so both families come from the same name (§6.1.4.3 (b)) |
 | 2181 | §8 | TTLs with the most significant bit set are passed on as zero |
 | 2181 | §9 | A truncated UDP reply switches to TCP even when it is cut off mid-record and doesn't decode; over TCP a truncated reply is used as it is |
@@ -164,7 +168,7 @@ modules; and `rfc7766.rs` also has `stream_timeout` and `lost_connection` module
 | 7873 | §5.3 | No cookie is sent, so BADCOOKIE is a server error and fails over |
 | 7766 | §5 | Truncated UDP response → same server over TCP; later attempts stay on TCP; UDP replies then ignored |
 | 7766 | §6.2.1 | One connection per server, reused and pipelined; answers matched in any order |
-| 7766 | §6.2.3 | Idle connections closed after `idle_timeout`; a timeout closes the connection |
+| 7766 | §6.2.3 | Idle connections closed after `idle_timeout`, counted from the last read or write or from cancelling the last query on it; a timeout closes the connection |
 | 7766 | §8 | Two-byte length prefix; replies reassembled from any chunking |
 | 1034 | §3.6.2 | `addresses` follows the CNAME chain and ignores records owned by other names |
 | 6761 | §6.3 | `localhost` names → loopback for A/AAAA, empty answer otherwise; nothing sent |
@@ -175,6 +179,8 @@ modules; and `rfc7766.rs` also has `stream_timeout` and `lost_connection` module
 | 7858 | §3.4 | The TLS session is reused for later queries; queries wait out a handshake in progress |
 | 8310 | §5 | Strict profile: the certificate must match the configured name |
 | 8467 | §4.1 | Queries padded to a multiple of 128 octets |
+| 9520 | §3.1 | A search candidate is sent at most three times to each server over each transport (UDP, and TCP or TLS), free resends and cancel hand-overs included; a send that would be the fourth goes to the next server as a new attempt, and the query fails when no server is left, unless it took over from a cancelled query after joining late: then it starts over. `resolv.conf` attempts are capped at 3 per server |
+| 9520 | §3.2 | A server that failed to answer goes after the others for at most 5 minutes (`failure_memory`, 60 s by default), kept per server address (RFC 2308 §7.2 caps it too) |
 
 ### Driver obligations
 
@@ -231,7 +237,8 @@ queries and open connections, and a timer exactly while something is pending; `d
 answers for hosts and special-use names, the order of the search candidates and the answer
 the search ends on, and
 `tls_stream` checks that every query the server decrypts keeps EDNS, is padded to a multiple
-of 128 octets and is sent at most `attempts + 3` times. They need nightly:
+of 128 octets and is sent at most `attempts + 3` times, and at most three times to one
+server. They need nightly:
 
 ```sh
 cd fuzz && cargo fuzz run driver_ops -- -max_total_time=60 -timeout=5
