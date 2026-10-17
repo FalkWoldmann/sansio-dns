@@ -18,9 +18,18 @@ pub const S2: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)
 pub const ADDR: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 7);
 pub const ADDR6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 7);
 
+/// Servers `S1` and `S2` with `Config::new`'s settings, except a timeout
+/// of two seconds instead of five, which keeps traces short.
 #[fixture]
 pub fn resolver() -> Resolver {
-    Resolver::new(Config::new(S1, [S2]))
+    Resolver::new(config())
+}
+
+/// The settings of [`resolver`].
+pub fn config() -> Config {
+    let mut config = Config::new(S1, [S2]);
+    config.timeout = Duration::from_secs(2);
+    config
 }
 
 /// Start an `example.com. A` lookup and return the first datagram.

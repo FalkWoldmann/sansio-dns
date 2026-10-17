@@ -136,6 +136,7 @@ modules; and `rfc7766.rs` also has `stream_timeout` and `lost_connection` module
 | 1035 | §4.2.1 | `TC` set → retry over TCP (RFC 7766) |
 | 1035 | §7.2 | Retransmit on timeout, or at once when the datagram can't be sent, rotating through servers; new queries start after a server that recently failed to answer |
 | 1035 | §7.3 | Non-responses (`QR=0`) and wrong opcodes are discarded |
+| 1123 | §6.1.3.3 | Retries back off exponentially: each round through the servers waits twice as long, starting at 5 s by default |
 | 5452 | §9.1 | Responses must match source address, port, ID, QNAME, QTYPE and QCLASS |
 | 5452 | §4.6 | Only the first matching response is accepted |
 | 5452 | §9.2 | IDs from a CSPRNG, avoiding those of outstanding queries (up to 16 picks); per-query source ports are the driver's job (see below) |

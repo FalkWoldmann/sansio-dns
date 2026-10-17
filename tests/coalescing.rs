@@ -77,11 +77,11 @@ fn joined_query_gets_the_failure(mut trace: Trace) {
       next t=4s
     t=4s timeout
       -> S1 udp q0: example.com. A
-      next t=6s
-    t=6s timeout
-      -> S2 udp q0: example.com. A
       next t=8s
     t=8s timeout
+      -> S2 udp q0: example.com. A
+      next t=12s
+    t=12s timeout
       => q0 Failed Timeout
       => q1 Failed Timeout
       next none
@@ -174,13 +174,15 @@ fn cancelled_leader_on_a_stream_hands_over_without_sending(mut trace: Trace) {
 /// Joining late doesn't mean sharing the first query's spent attempts.
 #[test]
 fn late_joiner_starts_over_when_the_first_runs_out() {
-    let mut trace = Trace::new(Resolver::new(Config::new(S1, [])));
+    let mut config = Config::new(S1, []);
+    config.timeout = Duration::from_secs(2);
+    let mut trace = Trace::new(Resolver::new(config));
     trace.query("example.com.", RecordType::A);
     trace.timeout_at(Duration::from_secs(2));
-    trace.at(Duration::from_millis(3990));
+    trace.at(Duration::from_millis(5990));
     trace.query("example.com.", RecordType::A);
 
-    trace.timeout_at(Duration::from_secs(4));
+    trace.timeout_at(Duration::from_secs(6));
 
     assert_snapshot!(trace, @"
     t=0s query q0 example.com. A
@@ -188,19 +190,20 @@ fn late_joiner_starts_over_when_the_first_runs_out() {
       next t=2s
     t=2s timeout
       -> S1 udp q0: example.com. A
-      next t=4s
-    t=3.99s query q1 example.com. A
-      next t=4s
-    t=4s timeout
+      next t=6s
+    t=5.99s query q1 example.com. A
+      next t=6s
+    t=6s timeout
       => q0 Failed Timeout
       -> S1 udp q1: example.com. A
-      next t=6s
+      next t=8s
     ");
 }
 
 #[test]
 fn joined_query_follows_the_search() {
     let mut config = Config::new(S1, []);
+    config.timeout = Duration::from_secs(2);
     config.search = vec![Name::from_ascii("corp.example.").unwrap()];
     let mut trace = Trace::new(Resolver::new(config));
     trace.query("db", RecordType::A);

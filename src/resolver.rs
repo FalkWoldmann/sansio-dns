@@ -54,6 +54,19 @@ impl Pending {
     fn server(&self, config: &Config) -> SocketAddr {
         config.server(self.first + self.attempt)
     }
+
+    /// The deadline of the current attempt sent at `now`: `Config::timeout`,
+    /// doubled each time the attempts have gone round the server list
+    /// (exponential backoff, RFC 1123 §6.1.3.3). `None` if it doesn't fit
+    /// in an `Instant`.
+    fn deadline(&self, config: &Config, now: Instant) -> Option<Instant> {
+        let round = self.attempt / config.servers().len();
+        let factor = u32::try_from(round)
+            .ok()
+            .and_then(|round| 1u32.checked_shl(round))
+            .unwrap_or(u32::MAX);
+        now.checked_add(config.timeout.saturating_mul(factor))
+    }
 }
 
 /// How a query's current attempt travels.
@@ -425,7 +438,7 @@ impl Resolver {
         for id in self.queries_on(connection) {
             if conn.answered && self.forgive(id) {
                 if let Some(pending) = self.pending.get_mut(&id) {
-                    pending.deadline = now.checked_add(self.config.timeout);
+                    pending.deadline = pending.deadline(&self.config, now);
                 }
                 self.resend(id, now);
             } else {
@@ -596,7 +609,7 @@ impl Resolver {
             payload: pending.payload.clone(),
         });
         if resend.is_some() {
-            pending.deadline = now.checked_add(self.config.timeout);
+            pending.deadline = pending.deadline(&self.config, now);
         }
         self.pending.insert(heir, pending);
         self.transmits.extend(resend);
@@ -642,7 +655,7 @@ impl Resolver {
             self.give_up(id, error, now);
             return;
         }
-        pending.deadline = now.checked_add(self.config.timeout);
+        pending.deadline = pending.deadline(&self.config, now);
         self.emit(id, now);
     }
 
@@ -730,7 +743,7 @@ impl Resolver {
             return false;
         }
         pending.route = Route::Stream(None);
-        pending.deadline = now.checked_add(self.config.timeout);
+        pending.deadline = pending.deadline(&self.config, now);
         self.emit(id, now);
         true
     }
@@ -750,7 +763,7 @@ impl Resolver {
             return;
         };
         pending.payload = payload;
-        pending.deadline = now.checked_add(self.config.timeout);
+        pending.deadline = pending.deadline(&self.config, now);
         self.emit(id, now);
     }
 

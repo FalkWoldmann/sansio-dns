@@ -97,7 +97,7 @@ mod section_7 {
           next t=2s
         t=0s <- S2 udp q0: example.com. A: FormErr, 0 answers, no EDNS
           -> S1 udp q0: example.com. A, no EDNS
-          next t=2s
+          next t=4s
         ");
     }
 }

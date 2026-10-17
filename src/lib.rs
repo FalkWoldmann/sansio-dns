@@ -32,6 +32,11 @@
 //! every attempt, so an answer to an earlier attempt still counts if it
 //! comes from the server of the current one.
 //!
+//! A fresh deadline is [`Config::timeout`] from now, doubled for each round
+//! the attempts have made through the servers (exponential backoff, RFC
+//! 1123 §6.1.3.3): with two servers and the defaults, the four attempts
+//! wait 5, 5, 10 and 10 seconds.
+//!
 //! | What happens | What the query does next | Server | Uses an attempt | Deadline |
 //! |---|---|---|---|---|
 //! | No answer by its deadline, or its datagram couldn't be sent | sends its next attempt | next | yes | fresh |

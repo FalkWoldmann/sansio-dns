@@ -108,10 +108,10 @@ mod section_5 {
           next t=2s
         t=0s c1 closed
           -> S1 connect c2: example.com. A
-          next t=2s
+          next t=4s
         t=0s c2 closed
           -> S2 connect c3: example.com. A
-          next t=2s
+          next t=4s
         t=0s c3 closed
           => q0 Failed ConnectionClosed
           next none
@@ -136,10 +136,10 @@ mod section_5 {
           next t=2s
         t=0s c1 error ConnectionRefused
           -> S1 connect c2: example.com. A
-          next t=2s
+          next t=4s
         t=0s c2 error ConnectionRefused
           -> S2 connect c3: example.com. A
-          next t=2s
+          next t=4s
         t=0s c3 error ConnectionRefused
           => q0 Failed Io(ConnectionRefused)
           next none
@@ -166,12 +166,12 @@ mod section_5 {
         t=4s timeout
           -> S2 close c1
           -> S1 connect c2: example.com. A
-          next t=6s
-        t=6s timeout
-          -> S1 close c2
-          -> S2 connect c3: example.com. A
           next t=8s
         t=8s timeout
+          -> S1 close c2
+          -> S2 connect c3: example.com. A
+          next t=12s
+        t=12s timeout
           => q0 Failed Timeout
           -> S2 close c3
           next none
@@ -573,10 +573,10 @@ mod lost_connection {
           next t=2s
         t=0s c2 closed
           -> S1 connect c3: b.example. A
-          next t=2s
+          next t=4s
         t=0s c3 closed
           -> S2 connect c4: b.example. A
-          next t=2s
+          next t=4s
         t=0s c4 closed
           => q1 Failed ConnectionClosed
           next none

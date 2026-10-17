@@ -51,8 +51,10 @@ impl IpStrategy {
 pub struct Config {
     /// Name servers, tried in order and rotated on each retry. Never empty.
     servers: Vec<SocketAddr>,
-    /// How long to wait for a response before retrying. A value too large
-    /// to add to an `Instant`, such as `Duration::MAX`, means wait forever.
+    /// How long to wait for a response before retrying, on each server's
+    /// first attempt. Each later round through the servers waits twice as
+    /// long as the one before (RFC 1123 §6.1.3.3). A value too large to add
+    /// to an `Instant`, such as `Duration::MAX`, means wait forever.
     pub timeout: Duration,
     /// Total number of attempts per query, across all servers: attempt `n`
     /// goes to server `first + n` modulo their number, where `first` is the
@@ -89,15 +91,16 @@ pub struct Config {
 }
 
 impl Config {
-    /// `first` and then `more`, two attempts per server, two seconds each.
-    /// A server that fails to answer is tried after the others for a
-    /// minute.
+    /// `first` and then `more`, two attempts per server, waiting five
+    /// seconds on the first round and ten on the second: without measured
+    /// round trip times, RFC 1123 §6.1.3.3 asks for no less than five. A
+    /// server that fails to answer is tried after the others for a minute.
     pub fn new(first: SocketAddr, more: impl IntoIterator<Item = SocketAddr>) -> Self {
         let servers: Vec<SocketAddr> = std::iter::once(first).chain(more).collect();
         let attempts = NonZeroUsize::new(servers.len() * 2).unwrap_or(NonZeroUsize::MIN);
         Self {
             servers,
-            timeout: Duration::from_secs(2),
+            timeout: Duration::from_secs(5),
             attempts,
             search: Vec::new(),
             ndots: 1,
@@ -145,7 +148,8 @@ impl Config {
     /// `options timeout:` in seconds (default 5, at most 30),
     /// `options attempts:` per server (default 2, at most 5) and
     /// `options no-aaaa` ([`IpStrategy::Ipv4Only`]). Without usable
-    /// `nameserver` lines, the local host is asked (127.0.0.1).
+    /// `nameserver` lines, the local host is asked (127.0.0.1). Unlike glibc,
+    /// later rounds through the servers wait longer; see `timeout`.
     ///
     /// Like glibc, it never fails: lines and options it can't use are
     /// skipped, and so is a link-local server with a named scope

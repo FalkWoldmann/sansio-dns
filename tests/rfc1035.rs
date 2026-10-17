@@ -184,11 +184,11 @@ mod section_7_2 {
           next t=4s
         t=4s timeout
           -> S1 udp q0: example.com. A
-          next t=6s
-        t=6s timeout
-          -> S2 udp q0: example.com. A
           next t=8s
         t=8s timeout
+          -> S2 udp q0: example.com. A
+          next t=12s
+        t=12s timeout
           => q0 Failed Timeout
           next none
         ");
@@ -216,10 +216,10 @@ mod section_7_2 {
           next t=2.5s
         t=0.5s udp q0 to S2 error NetworkUnreachable
           -> S1 udp q0: example.com. A
-          next t=2.5s
+          next t=4.5s
         t=0.5s udp q0 to S1 error NetworkUnreachable
           -> S2 udp q0: example.com. A
-          next t=2.5s
+          next t=4.5s
         t=0.5s udp q0 to S2 error NetworkUnreachable
           => q0 Failed Io(NetworkUnreachable)
           next none
