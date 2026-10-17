@@ -1,11 +1,11 @@
-//! Address lookups: A and AAAA for one name, merged.
+//! Address lookups: A and AAAA for one name, merged in the configured order.
 
 use std::net::IpAddr;
 use std::time::Instant;
 
 use hickory_proto::ProtoError;
 use hickory_proto::op::Message;
-use hickory_proto::rr::{Name, RData, RecordType};
+use hickory_proto::rr::{Name, RData};
 
 use crate::{Error, Event, QueryId, Resolver};
 
@@ -41,16 +41,21 @@ pub fn addresses(response: &Message) -> Vec<IpAddr> {
         .collect()
 }
 
-/// An A and an AAAA query for the same name, with their addresses merged.
+/// The A and AAAA queries for the same name, as [`Config::ip_strategy`]
+/// picks them, with their addresses merged.
 ///
 /// Pass every [`Event`] to [`IpLookup::handle_event`], which hands the
-/// lookup back until both queries have finished, and then the outcome
-/// instead. Ordering the addresses (RFC 6724) and racing connections
-/// (RFC 8305) is up to the caller.
+/// lookup back until all its queries have finished, and then the outcome
+/// instead. Sorting the addresses by the host's own ones (RFC 6724 §6) and
+/// racing connections (RFC 8305) is up to the caller.
+///
+/// [`Config::ip_strategy`]: crate::Config::ip_strategy
 #[derive(Debug, PartialEq, Eq)]
 pub struct IpLookup {
-    queries: [QueryId; 2],
-    /// Only one can be filled: with both, the lookup is over.
+    /// In the order their addresses are listed; the second is `None` when
+    /// only one family is asked for.
+    queries: [Option<QueryId>; 2],
+    /// The outcome of each query, filled as its event arrives.
     results: [Option<Result<Vec<IpAddr>, Error>>; 2],
 }
 
@@ -59,28 +64,37 @@ pub struct IpLookup {
 pub enum Progress {
     /// A query is still running: pass the lookup the next event.
     Waiting(IpLookup),
-    /// Both queries have finished. The IPv4 addresses followed by the IPv6
-    /// ones, each in the server's order. An error only if no address was
-    /// found and a query failed; no address and no failure (NXDOMAIN, or no
-    /// records) is an empty list.
+    /// Every query has finished. The addresses of one family followed by
+    /// those of the other, in the order of [`Config::ip_strategy`], each in
+    /// the server's order. An error only if no address was found and a
+    /// query failed; no address and no failure (NXDOMAIN, or no records) is
+    /// an empty list.
+    ///
+    /// [`Config::ip_strategy`]: crate::Config::ip_strategy
     Done(Result<Vec<IpAddr>, Error>),
 }
 
 impl IpLookup {
-    /// Start the A and AAAA queries for `name` on `resolver`.
+    /// Start the queries for `name` on `resolver`, for the families of its
+    /// [`Config::ip_strategy`](crate::Config::ip_strategy).
     pub fn start(resolver: &mut Resolver, name: Name, now: Instant) -> Result<Self, ProtoError> {
-        let a = resolver.query(name.clone(), RecordType::A, now)?;
-        let aaaa = resolver.query(name, RecordType::AAAA, now)?;
+        let queries = match resolver.config().ip_strategy.record_types() {
+            (first, Some(second)) => [
+                Some(resolver.query(name.clone(), first, now)?),
+                Some(resolver.query(name, second, now)?),
+            ],
+            (only, None) => [Some(resolver.query(name, only, now)?), None],
+        };
         Ok(Self {
-            queries: [a, aaaa],
+            queries,
             results: [None, None],
         })
     }
 
-    /// The A and the AAAA query, to route events to this lookup or to
-    /// cancel them.
-    pub fn queries(&self) -> [QueryId; 2] {
-        self.queries
+    /// Its queries, one or two, to route events to this lookup or to cancel
+    /// them.
+    pub fn queries(&self) -> impl Iterator<Item = QueryId> + use<> {
+        self.queries.into_iter().flatten()
     }
 
     /// Take in `event`; events of other queries leave the lookup as it is.
@@ -93,23 +107,27 @@ impl IpLookup {
             .queries
             .iter()
             .zip(&mut self.results)
-            .find_map(|(q, slot)| (q == query).then_some(slot));
+            .find_map(|(q, slot)| (*q == Some(*query)).then_some(slot));
         if let Some(slot) = slot {
             *slot = Some(result);
         }
-        match self.results {
-            [Some(a), Some(aaaa)] => Progress::Done(merge(a, aaaa)),
-            _ => Progress::Waiting(self),
+        match (self.queries, self.results) {
+            (_, [Some(first), Some(second)]) => Progress::Done(merge(first, second)),
+            ([_, None], [Some(only), None]) => Progress::Done(only),
+            (_, results) => {
+                self.results = results;
+                Progress::Waiting(self)
+            }
         }
     }
 }
 
 fn merge(
-    a: Result<Vec<IpAddr>, Error>,
-    aaaa: Result<Vec<IpAddr>, Error>,
+    first: Result<Vec<IpAddr>, Error>,
+    second: Result<Vec<IpAddr>, Error>,
 ) -> Result<Vec<IpAddr>, Error> {
-    match (a, aaaa) {
-        (Ok(v4), Ok(v6)) => Ok(v4.into_iter().chain(v6).collect()),
+    match (first, second) {
+        (Ok(first), Ok(second)) => Ok(first.into_iter().chain(second).collect()),
         (Ok(found), Err(error)) | (Err(error), Ok(found)) if found.is_empty() => Err(error),
         (Ok(found), Err(_)) | (Err(_), Ok(found)) => Ok(found),
         (Err(error), Err(_)) => Err(error),

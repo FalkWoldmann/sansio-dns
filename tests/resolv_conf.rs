@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use crate::common::*;
 use rstest::rstest;
-use sansio_dns::{Config, Resolver};
+use sansio_dns::{Config, IpStrategy, Resolver};
 use std::assert_matches;
 
 /// Let one query time out on every attempt; return where each attempt went
@@ -93,6 +93,14 @@ fn unusable_lines_are_skipped() {
         ]
     );
     assert_eq!(wait, Duration::from_secs(7));
+}
+
+#[rstest]
+#[case::default("", IpStrategy::Ipv6First)]
+#[case::no_aaaa("options no-aaaa\n", IpStrategy::Ipv4Only)]
+fn no_aaaa_asks_only_for_ipv4(#[case] options: &str, #[case] expected: IpStrategy) {
+    let config = Config::from_resolv_conf(format!("nameserver 192.0.2.53\n{options}").as_bytes());
+    assert_eq!(config.ip_strategy, expected);
 }
 
 #[test]

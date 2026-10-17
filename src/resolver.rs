@@ -98,6 +98,11 @@ impl Resolver {
         }
     }
 
+    /// The settings it was created with.
+    pub(crate) fn config(&self) -> &Config {
+        &self.config
+    }
+
     /// Start a recursive lookup of `name`/`record_type`.
     ///
     /// A name ending in a dot is used as given. Other names are tried with

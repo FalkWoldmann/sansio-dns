@@ -123,8 +123,9 @@ impl Resolver {
         Ok(Self::new(config))
     }
 
-    /// The IPv4 and then the IPv6 addresses of `host`, which may also be an
-    /// IP address itself. A name with non-ASCII characters is converted to
+    /// The addresses of `host`, which may also be an IP address itself, in
+    /// the families and order of `Config::ip_strategy` (by default IPv6
+    /// first). A name with non-ASCII characters is converted to
     /// its ASCII form first (IDNA, so `bücher.example` asks for
     /// `xn--bcher-kva.example`); an ASCII name is used as given, so names
     /// like `my_host.example` work too.

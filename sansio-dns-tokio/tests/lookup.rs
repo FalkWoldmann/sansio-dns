@@ -27,7 +27,7 @@ async fn finds_both_families(#[case] truncate_udp: bool) {
 
     let addresses = resolver.lookup_ip("app.example").await.unwrap();
 
-    assert_eq!(addresses, [IpAddr::V4(V4), IpAddr::V6(V6)]);
+    assert_eq!(addresses, [IpAddr::V6(V6), IpAddr::V4(V4)]);
 }
 
 #[tokio::test]
@@ -37,7 +37,7 @@ async fn non_ascii_name_is_looked_up_in_its_ascii_form() {
 
     let addresses = resolver.lookup_ip("bücher.example").await.unwrap();
 
-    assert_eq!(addresses, [IpAddr::V4(V4), IpAddr::V6(V6)]);
+    assert_eq!(addresses, [IpAddr::V6(V6), IpAddr::V4(V4)]);
 }
 
 #[tokio::test]
@@ -47,7 +47,7 @@ async fn underscore_name_is_looked_up_as_given() {
 
     let addresses = resolver.lookup_ip("my_host.example").await.unwrap();
 
-    assert_eq!(addresses, [IpAddr::V4(V4), IpAddr::V6(V6)]);
+    assert_eq!(addresses, [IpAddr::V6(V6), IpAddr::V4(V4)]);
 }
 
 #[tokio::test]
@@ -82,7 +82,7 @@ async fn unsendable_datagram_moves_on_at_once(#[case] working_server: bool) {
     match result.expect("no deadline waited out") {
         Ok(addresses) => {
             assert!(working_server);
-            assert_eq!(addresses, [IpAddr::V4(V4), IpAddr::V6(V6)]);
+            assert_eq!(addresses, [IpAddr::V6(V6), IpAddr::V4(V4)]);
         }
         Err(error) => {
             assert!(!working_server, "{error:?}");
@@ -180,7 +180,7 @@ fn resolver_outlives_the_runtime_of_its_first_lookup() {
             .build()
             .unwrap();
         let addresses = runtime.block_on(resolver.lookup_ip("app.example")).unwrap();
-        assert_eq!(addresses, [IpAddr::V4(V4), IpAddr::V6(V6)]);
+        assert_eq!(addresses, [IpAddr::V6(V6), IpAddr::V4(V4)]);
     }
 }
 
@@ -222,7 +222,7 @@ async fn concurrent_lookups_of_one_name_share_their_queries() {
 
     for lookup in lookups {
         let addresses = lookup.await.unwrap().unwrap();
-        assert_eq!(addresses, [IpAddr::V4(V4), IpAddr::V6(V6)]);
+        assert_eq!(addresses, [IpAddr::V6(V6), IpAddr::V4(V4)]);
     }
 }
 
@@ -253,7 +253,7 @@ fn retry_runs_on_the_lookups_own_runtime() {
         .block_on(async { tokio::time::timeout(Duration::from_secs(1), waiting).await })
         .unwrap()
         .unwrap();
-    assert_eq!(addresses, [IpAddr::V4(V4), IpAddr::V6(V6)]);
+    assert_eq!(addresses, [IpAddr::V6(V6), IpAddr::V4(V4)]);
 
     // c's task stays the shared one: its connection serves c's next lookup.
     let opened = connections.opened.load(Ordering::Relaxed);
@@ -277,7 +277,7 @@ async fn retry_reaches_a_server_of_the_other_family() {
 
     let addresses = resolver.lookup_ip("app.example").await.unwrap();
 
-    assert_eq!(addresses, [IpAddr::V4(V4), IpAddr::V6(V6)]);
+    assert_eq!(addresses, [IpAddr::V6(V6), IpAddr::V4(V4)]);
 }
 
 /// An address needs no lookup; the server here doesn't exist.

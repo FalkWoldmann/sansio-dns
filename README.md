@@ -19,7 +19,8 @@ loop {
 Complete drivers are in `examples/` (`std`, `tokio`, `compio`), about 100 lines each including TCP.
 
 For hostnames, `IpLookup` runs the A and AAAA queries and merges the addresses, following
-CNAMEs:
+CNAMEs. `Config::ip_strategy` picks the families and their order: IPv6 first by default, or
+IPv4 first, or only one family.
 
 ```rust
 let mut lookup = IpLookup::start(&mut resolver, Name::from_ascii("example.com")?, now)?;
@@ -76,9 +77,10 @@ before any DNS query, as glibc's `hosts: files dns` does.
 `Config::from_resolv_conf(&bytes)` reads the text of a `resolv.conf` (you read the file) with
 the [`resolv-conf`](https://crates.io/crates/resolv-conf) crate and applies glibc's rules:
 the first three nameservers, `search`/`domain`, `ndots`, `timeout` and `attempts`, skipping
-lines it can't use instead of failing. With search domains, a name
-without a trailing dot is tried with each of them, before the name as given if it has fewer
-than `ndots` dots and after it otherwise; the search moves on only on NXDOMAIN.
+lines it can't use instead of failing; `options no-aaaa` asks for IPv4 addresses only. With
+search domains, a name without a trailing dot is tried with each of them, before the name as
+given if it has fewer than `ndots` dots and after it otherwise; the search moves on only on
+NXDOMAIN.
 
 ## Compared with hickory-resolver
 
@@ -108,6 +110,7 @@ Where the two behave differently:
 | EDNS | Always on at 1232 bytes, dropped once on `FORMERR` | From the system config only with `options edns0` |
 | Truncated answer over TCP | Used as it is | The lookup fails |
 | Hosts entry with only an IPv4 address | Empty AAAA answer, as glibc does | AAAA asked from DNS |
+| Address families | Both, IPv6 first, by default; or IPv4 first, or one family | The same, plus asking for the second family only when the first has no address |
 | Names with `_` | Resolved | Rejected |
 | Cache | None | Positive and negative, 8192 entries |
 | Server order | As configured, for every query | By measured latency, two servers raced |
@@ -181,6 +184,8 @@ destination's address family, pass the source address as received (an IPv4 serve
 - EDNS TCP keepalive (RFC 7828) to negotiate the idle timeout with the server.
 - DoH/DoQ, caching, DNS cookies (RFC 7873).
 - `resolv.conf` options other than the ones above (`rotate`, `use-vc`, `sortlist`, …).
+- Sorting addresses by the host's own ones (RFC 6724 §6); `IpLookup` lists them by family,
+  in the server's order within each.
 - `IpLookup` searches A and AAAA independently, so the two could end on different candidates.
 - Once EDNS is dropped for a query, it stays off for that query's remaining attempts,
   including other servers, until the search moves to the next candidate.

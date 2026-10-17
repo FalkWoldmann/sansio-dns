@@ -142,7 +142,7 @@ pub fn sansio(server: SocketAddr) -> sansio_dns_tokio::Resolver {
 }
 
 /// hickory-resolver using only `server`, made to match sansio-dns-tokio:
-/// A and AAAA in parallel, IPv4 first, no hosts file. With `cache` false
+/// A and AAAA in parallel, IPv6 first, no hosts file. With `cache` false
 /// its response cache holds nothing, so every lookup asks the server.
 ///
 /// Call inside a Tokio runtime: hickory takes the runtime's handle.
@@ -155,7 +155,7 @@ pub fn hickory(server: SocketAddr, cache: bool) -> TokioResolver {
     let config = ResolverConfig::from_parts(None, vec![], vec![name_server]);
     let mut builder = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
     let options = builder.options_mut();
-    options.ip_strategy = LookupIpStrategy::Ipv4AndIpv6;
+    options.ip_strategy = LookupIpStrategy::Ipv6AndIpv4;
     options.use_hosts_file = ResolveHosts::Never;
     if !cache {
         options.cache_size = 0;

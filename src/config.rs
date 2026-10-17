@@ -7,12 +7,44 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hickory_proto::rr::Name;
+use hickory_proto::rr::{Name, RecordType};
 
 use crate::Hosts;
 #[cfg(feature = "tls")]
 use crate::tls;
 use crate::wire::is_special_use;
+
+/// Which address families an [`IpLookup`](crate::IpLookup) asks for, and the
+/// order of its addresses.
+///
+/// With both families, the addresses of the first come first. Clients that
+/// race connections (RFC 8305), such as hyper's, try that family first and
+/// the other one shortly after.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum IpStrategy {
+    /// Only A queries.
+    Ipv4Only,
+    /// Only AAAA queries.
+    Ipv6Only,
+    /// Both; the IPv4 addresses first.
+    Ipv4First,
+    /// Both; the IPv6 addresses first, as RFC 6724's default policy orders
+    /// them on a host with global IPv6.
+    #[default]
+    Ipv6First,
+}
+
+impl IpStrategy {
+    /// The record types to ask for, in the order their addresses are listed.
+    pub(crate) fn record_types(self) -> (RecordType, Option<RecordType>) {
+        match self {
+            Self::Ipv4Only => (RecordType::A, None),
+            Self::Ipv6Only => (RecordType::AAAA, None),
+            Self::Ipv4First => (RecordType::A, Some(RecordType::AAAA)),
+            Self::Ipv6First => (RecordType::AAAA, Some(RecordType::A)),
+        }
+    }
+}
 
 /// Resolver settings.
 #[derive(Clone, Debug)]
@@ -41,6 +73,9 @@ pub struct Config {
     /// Static entries answered before DNS, like `/etc/hosts`. Empty by
     /// default; fill it with [`Hosts::parse`].
     pub hosts: Hosts,
+    /// Which addresses an [`IpLookup`](crate::IpLookup) asks for, and which
+    /// come first. [`IpStrategy::Ipv6First`] by default.
+    pub ip_strategy: IpStrategy,
     /// DNS over TLS settings; see `Config::with_tls`.
     #[cfg(feature = "tls")]
     pub(crate) tls: Option<tls::Settings>,
@@ -59,6 +94,7 @@ impl Config {
             ndots: 1,
             idle_timeout: Duration::from_secs(10),
             hosts: Hosts::default(),
+            ip_strategy: IpStrategy::default(),
             #[cfg(feature = "tls")]
             tls: None,
         }
@@ -96,8 +132,9 @@ impl Config {
     /// Settings from the text of a `resolv.conf` file, read the way glibc
     /// reads it: the first three usable `nameserver` lines (port 53),
     /// `search` or `domain`, `options ndots:` (default 1, at most 15),
-    /// `options timeout:` in seconds (default 5, at most 30) and
-    /// `options attempts:` per server (default 2, at most 5). Without usable
+    /// `options timeout:` in seconds (default 5, at most 30),
+    /// `options attempts:` per server (default 2, at most 5) and
+    /// `options no-aaaa` ([`IpStrategy::Ipv4Only`]). Without usable
     /// `nameserver` lines, the local host is asked (127.0.0.1).
     ///
     /// Like glibc, it never fails: lines and options it can't use are
@@ -137,6 +174,9 @@ impl Config {
             })
             .collect();
         config.ndots = u8::try_from(parsed.ndots.min(15)).unwrap_or(15);
+        if parsed.no_aaaa {
+            config.ip_strategy = IpStrategy::Ipv4Only;
+        }
         config
     }
 

@@ -16,7 +16,8 @@
 //! [`Resolver::query`].
 //!
 //! For hostnames, [`IpLookup`] runs the A and AAAA queries and collects the
-//! addresses, following CNAMEs.
+//! addresses, following CNAMEs; [`Config::ip_strategy`] picks the families
+//! and their order.
 //!
 //! With the `tls` feature, `Config::with_tls` sends every query over DNS
 //! over TLS (RFC 7858) instead.
@@ -114,7 +115,7 @@ mod resolver;
 mod tls;
 mod wire;
 
-pub use config::Config;
+pub use config::{Config, IpStrategy};
 pub use hosts::Hosts;
 pub use lookup::{IpLookup, Progress, addresses};
 pub use resolver::Resolver;
