@@ -41,8 +41,10 @@ const NAMES: usize = 3;
 /// Datagrams one query may cause: one per attempt, plus one EDNS downgrade.
 const MAX_DATAGRAMS: usize = 2 * 2 + 1;
 
-/// Datagrams and stream writes one query may cause: one per attempt, plus
-/// switching to TCP, dropping EDNS and one resend after a lost connection.
+/// Datagrams and stream writes one search candidate may cause: one per
+/// attempt, plus switching to TCP, dropping EDNS and one free resend. A
+/// cancel hand-over's resend and a late joiner's fresh start don't count
+/// (see `Group`).
 const MAX_SENDS: usize = 2 * 2 + 3;
 
 /// Transmits kept for replies, so late replies to old ones still happen.
@@ -280,6 +282,10 @@ struct Harness {
     /// The name each message ID was sent for over UDP, which tells the
     /// group of a stream write.
     by_message_id: BTreeMap<u16, usize>,
+    /// Message IDs sent over a stream since their name's query last
+    /// started, and that name: such a query never goes back to UDP, since a
+    /// retry keeps the route.
+    streamed: BTreeMap<u16, usize>,
 }
 
 impl Harness {
@@ -297,6 +303,7 @@ impl Harness {
             recent: VecDeque::new(),
             groups: BTreeMap::new(),
             by_message_id: BTreeMap::new(),
+            streamed: BTreeMap::new(),
         }
     }
 
@@ -408,6 +415,7 @@ impl Harness {
         if !self.has_live(name) {
             self.groups.remove(&name);
             self.by_message_id.retain(|_, n| *n != name);
+            self.streamed.retain(|_, n| *n != name);
         }
     }
 
@@ -433,6 +441,9 @@ impl Harness {
                         }
                         Some(previous) if previous != q => {
                             started_over.push((name, previous));
+                            // A new query with a new message ID; the old one's
+                            // IDs may come up again for any query.
+                            self.streamed.retain(|_, n| *n != name);
                             *group = Group {
                                 sender: Some(q),
                                 ..Group::default()
@@ -441,7 +452,12 @@ impl Harness {
                         }
                         _ => group.count(true),
                     }
-                    self.by_message_id.insert(decode(&t).metadata.id, name);
+                    let id = decode(&t).metadata.id;
+                    assert!(
+                        !self.streamed.contains_key(&id),
+                        "a query back on UDP after a stream"
+                    );
+                    self.by_message_id.insert(id, name);
                 }
                 Transport::TcpConnect(c) | Transport::TcpWrite(c) => {
                     if matches!(t.transport, Transport::TcpConnect(_)) {
@@ -452,7 +468,11 @@ impl Harness {
                     assert!(!self.live.is_empty(), "query written with none pending");
                     let len = usize::from(u16::from_be_bytes([t.payload[0], t.payload[1]]));
                     assert_eq!(len + 2, t.payload.len(), "wrong TCP length prefix");
-                    let name = self.by_message_id.get(&decode(&t).metadata.id);
+                    let id = decode(&t).metadata.id;
+                    let name = self.by_message_id.get(&id);
+                    if let Some(&name) = name {
+                        self.streamed.insert(id, name);
+                    }
                     let Some(group) = name.and_then(|name| self.groups.get_mut(name)) else {
                         panic!("stream write for no query in flight");
                     };
