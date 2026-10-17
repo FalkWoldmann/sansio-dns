@@ -215,6 +215,40 @@ struct Connection {
     tls: Option<Box<tls::Session>>,
 }
 
+/// What [`Connection::receive`] hands back besides the bytes it keeps:
+/// nothing without TLS.
+#[derive(Debug, Default)]
+struct Incoming {
+    /// The bytes to send back: the rest of the handshake, and then the
+    /// queries that waited for it.
+    to_send: Vec<u8>,
+    /// Whether the server's close_notify arrived: what followed it is
+    /// ignored (RFC 8446 §6.1).
+    closed: bool,
+}
+
+impl Connection {
+    /// Take in `data` read from it, through the TLS session if it has one,
+    /// or fail with the TLS error, keeping nothing.
+    #[cfg_attr(
+        not(feature = "tls"),
+        expect(clippy::unnecessary_wraps, reason = "only a TLS session can fail")
+    )]
+    fn receive(&mut self, data: &[u8]) -> Result<Incoming, Error> {
+        #[cfg(feature = "tls")]
+        if let Some(session) = &mut self.tls {
+            let received = session.receive(data).map_err(Error::Tls)?;
+            self.received.extend_from_slice(&received.plaintext);
+            return Ok(Incoming {
+                to_send: received.reply,
+                closed: received.closed,
+            });
+        }
+        self.received.extend_from_slice(data);
+        Ok(Incoming::default())
+    }
+}
+
 /// A query that left a connection before its answer came: it was
 /// cancelled, or timed out and moved on while the connection stayed open.
 /// The server may still answer it, so its message ID stays in use on the
@@ -650,35 +684,22 @@ impl Resolver {
         let Some(conn) = self.connections.get_mut(&connection) else {
             return;
         };
-        #[cfg(feature = "tls")]
-        let decrypted;
-        #[cfg(feature = "tls")]
-        let mut closed = false;
-        #[cfg(feature = "tls")]
-        let data = match &mut conn.tls {
-            None => data,
-            Some(session) => match session.receive(data) {
-                Ok(received) => {
-                    if !received.reply.is_empty() {
-                        self.transmits.push_back(Transmit {
-                            transport: Transport::TcpWrite(connection),
-                            destination: conn.server,
-                            payload: received.reply,
-                        });
-                    }
-                    closed = received.closed;
-                    // Answers that move a query on must not send it here.
-                    conn.closing = closed;
-                    decrypted = received.plaintext;
-                    &decrypted[..]
-                }
-                Err(error) => {
-                    self.close(connection, now, &Error::Tls(error));
-                    return;
-                }
-            },
+        let Incoming { to_send, closed } = match conn.receive(data) {
+            Ok(incoming) => incoming,
+            Err(error) => {
+                self.close(connection, now, &error);
+                return;
+            }
         };
-        conn.received.extend_from_slice(data);
+        // Answers that move a query on must not send it here.
+        conn.closing = closed;
+        if !to_send.is_empty() {
+            self.transmits.push_back(Transmit {
+                transport: Transport::TcpWrite(connection),
+                destination: conn.server,
+                payload: to_send,
+            });
+        }
         // One message at a time: acting on an answer may change this
         // connection too.
         while let Some(message) = self.next_message(connection) {
@@ -708,7 +729,6 @@ impl Resolver {
                 None => {}
             }
         }
-        #[cfg(feature = "tls")]
         if closed && let Some(conn) = self.shut(connection) {
             self.move_off(connection, conn.responses, now, &Error::ConnectionClosed);
         }
