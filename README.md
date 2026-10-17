@@ -75,7 +75,8 @@ before any DNS query, as glibc's `hosts: files dns` does.
 
 `Config::from_resolv_conf(&bytes)` reads the text of a `resolv.conf` (you read the file) with
 the [`resolv-conf`](https://crates.io/crates/resolv-conf) crate and applies glibc's rules:
-nameservers, `search`/`domain`, `ndots`, `timeout` and `attempts`. With search domains, a name
+the first three nameservers, `search`/`domain`, `ndots`, `timeout` and `attempts`, skipping
+lines it can't use instead of failing. With search domains, a name
 without a trailing dot is tried with each of them, before the name as given if it has fewer
 than `ndots` dots and after it otherwise; the search moves on only on NXDOMAIN.
 

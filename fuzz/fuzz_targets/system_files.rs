@@ -16,7 +16,7 @@ use sansio_dns::hickory_proto::op::{Message, ResponseCode};
 use sansio_dns::hickory_proto::rr::domain::usage::{INVALID, LOCALHOST, ONION};
 use sansio_dns::hickory_proto::rr::{Name, RecordType};
 use sansio_dns::{Config, Event, Hosts, Transport, addresses};
-use sansio_dns_fuzz::{Harness, S1, reply};
+use sansio_dns_fuzz::{Harness, reply};
 
 /// Labels for every generated name, so lookups often hit listed names and
 /// search domains.
@@ -202,8 +202,7 @@ fuzz_target!(|input: Input<'_>| {
             "{text} {address} missing from the hosts entries"
         );
     }
-    let mut config = Config::from_resolv_conf(&render_resolv_conf(&input.resolv_conf))
-        .unwrap_or_else(|_| Config::new(S1, []));
+    let mut config = Config::from_resolv_conf(&render_resolv_conf(&input.resolv_conf));
     config.hosts = hosts.clone();
     let (search, ndots) = (config.search.clone(), config.ndots);
     let mut harness = Harness::new(config, Vec::new(), None);

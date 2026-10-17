@@ -284,7 +284,7 @@ fn resolv_conf(c: &mut Criterion) {
                  search corp.example lab.example\n\
                  options ndots:2 timeout:3 attempts:2\n";
     c.bench_function("config/from_resolv_conf", |b| {
-        b.iter(|| black_box(Config::from_resolv_conf(black_box(text)).unwrap()));
+        b.iter(|| black_box(Config::from_resolv_conf(black_box(text))));
     });
 }
 

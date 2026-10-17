@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tcp: Option<(ConnectionId, TcpStream)> = None;
     let config = match args.next() {
         Some(server) => Config::new(server.parse()?, []),
-        None => Config::from_resolv_conf(&std::fs::read("/etc/resolv.conf")?)?,
+        None => Config::from_resolv_conf(&std::fs::read("/etc/resolv.conf")?),
     };
     let mut resolver = Resolver::new(config);
     let query = resolver.query(name, RecordType::A, Instant::now())?;

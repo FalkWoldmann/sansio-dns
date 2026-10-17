@@ -10,8 +10,8 @@ use std::assert_matches;
 
 /// Let one query time out on every attempt; return where each attempt went
 /// and how long the first one waited.
-fn attempts(conf: &str) -> (Vec<SocketAddr>, Duration) {
-    let mut resolver = Resolver::new(Config::from_resolv_conf(conf.as_bytes()).unwrap());
+fn attempts(conf: impl AsRef<[u8]>) -> (Vec<SocketAddr>, Duration) {
+    let mut resolver = Resolver::new(Config::from_resolv_conf(conf.as_ref()));
     let start_time = Instant::now();
     let first = start(&mut resolver, start_time);
     let wait = resolver.poll_timeout().unwrap() - start_time;
@@ -48,9 +48,51 @@ fn nameservers_in_order_two_attempts_each_by_default() {
 #[case::as_given("options timeout:7 attempts:3", 7, 3)]
 #[case::capped_like_glibc("options timeout:99 attempts:9", 30, 5)]
 fn timeout_and_attempts(#[case] options: &str, #[case] secs: u64, #[case] tries: usize) {
-    let (sent, wait) = attempts(&format!("nameserver 192.0.2.53\n{options}\n"));
+    let (sent, wait) = attempts(format!("nameserver 192.0.2.53\n{options}\n"));
     assert_eq!(sent.len(), tries);
     assert_eq!(wait, Duration::from_secs(secs));
+}
+
+/// glibc's MAXNS: a fourth server is never asked.
+#[test]
+fn at_most_three_nameservers() {
+    let (sent, _) = attempts(
+        "nameserver 192.0.2.1\n\
+         nameserver 192.0.2.2\n\
+         nameserver 192.0.2.3\n\
+         nameserver 192.0.2.4\n",
+    );
+    let servers = [
+        addr("192.0.2.1:53"),
+        addr("192.0.2.2:53"),
+        addr("192.0.2.3:53"),
+    ];
+    assert_eq!(sent, [servers, servers].concat());
+}
+
+/// Lines and options it can't use are skipped, as glibc skips them, and
+/// the rest still applies.
+#[test]
+fn unusable_lines_are_skipped() {
+    let (sent, wait) = attempts(
+        b"nameserver not-an-address\n\
+         nameserver\n\
+         nameserver 192.0.2.53 extra words\n\
+         unknown-directive value\n\
+         options unknown-option timeout:7 ndots:x\n\
+         \xff\xfe not UTF-8\n\
+         nameserver 192.0.2.54\n",
+    );
+    assert_eq!(
+        sent,
+        [
+            addr("192.0.2.53:53"),
+            addr("192.0.2.54:53"),
+            addr("192.0.2.53:53"),
+            addr("192.0.2.54:53"),
+        ]
+    );
+    assert_eq!(wait, Duration::from_secs(7));
 }
 
 #[test]
@@ -74,7 +116,7 @@ mod search {
     /// Query `name`, answer every candidate with `code`, and return the
     /// names asked for, in order, plus the final event.
     fn tried(conf: &str, name: &str, code: ResponseCode) -> (Vec<String>, Option<Event>) {
-        let mut resolver = Resolver::new(Config::from_resolv_conf(conf.as_bytes()).unwrap());
+        let mut resolver = Resolver::new(Config::from_resolv_conf(conf.as_bytes()));
         let now = Instant::now();
         resolver
             .query(Name::from_ascii(name).unwrap(), RecordType::A, now)
@@ -118,7 +160,7 @@ mod search {
     #[case::one_dot("db.x", &["db.x.", "db.x.a.example.", "db.x.b.example."])]
     fn default_ndots_is_one(#[case] name: &str, #[case] expected: &[&str]) {
         let conf = "nameserver 192.0.2.53\nsearch a.example b.example\n";
-        assert_eq!(Config::from_resolv_conf(conf.as_bytes()).unwrap().ndots, 1);
+        assert_eq!(Config::from_resolv_conf(conf.as_bytes()).ndots, 1);
 
         let (asked, _) = tried(conf, name, ResponseCode::NXDomain);
 

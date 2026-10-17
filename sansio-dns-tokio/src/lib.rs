@@ -109,11 +109,14 @@ impl Resolver {
 
     /// A resolver configured like the system's: name servers and search
     /// domains from `/etc/resolv.conf`, static entries from `/etc/hosts` if
-    /// it can be read.
+    /// it can be read. Without `/etc/resolv.conf`, the local host is asked,
+    /// as glibc does; any other error reading it is returned.
     pub fn from_system_conf() -> io::Result<Self> {
-        let resolv_conf = std::fs::read("/etc/resolv.conf")?;
-        let mut config = Config::from_resolv_conf(&resolv_conf)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let resolv_conf = match std::fs::read("/etc/resolv.conf") {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+            read => read?,
+        };
+        let mut config = Config::from_resolv_conf(&resolv_conf);
         if let Ok(hosts) = std::fs::read("/etc/hosts") {
             config.hosts = Hosts::parse(&hosts);
         }

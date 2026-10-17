@@ -94,26 +94,32 @@ impl Config {
     }
 
     /// Settings from the text of a `resolv.conf` file, read the way glibc
-    /// reads it: `nameserver` lines (port 53), `search` or `domain`,
-    /// `options ndots:` (default 1, at most 15), `options timeout:` in
-    /// seconds (default 5, at most 30) and `options attempts:` per server
-    /// (default 2, at most 5). Without usable `nameserver` lines, the local
-    /// host is asked (127.0.0.1).
+    /// reads it: the first three usable `nameserver` lines (port 53),
+    /// `search` or `domain`, `options ndots:` (default 1, at most 15),
+    /// `options timeout:` in seconds (default 5, at most 30) and
+    /// `options attempts:` per server (default 2, at most 5). Without usable
+    /// `nameserver` lines, the local host is asked (127.0.0.1).
     ///
-    /// A link-local server with a named scope (`fe80::1%eth0`) is skipped,
-    /// since mapping an interface name to its index needs a system call;
-    /// numeric scopes (`fe80::1%2`) work. Other options, such as `rotate`,
-    /// `use-vc` and `edns0` (EDNS is always on), are ignored.
-    pub fn from_resolv_conf(text: &[u8]) -> Result<Self, resolv_conf::ParseError> {
-        let parsed = resolv_conf::Config::parse(text)?;
-        let mut servers = parsed.nameservers.iter().filter_map(|ip| match ip {
-            resolv_conf::ScopedIp::V4(v4) => Some(SocketAddr::from((*v4, 53))),
-            resolv_conf::ScopedIp::V6(v6, None) => Some(SocketAddr::from((*v6, 53))),
-            resolv_conf::ScopedIp::V6(v6, Some(scope)) => scope
-                .parse()
-                .ok()
-                .map(|id| SocketAddr::V6(SocketAddrV6::new(*v6, 53, 0, id))),
-        });
+    /// Like glibc, it never fails: lines and options it can't use are
+    /// skipped, and so is a link-local server with a named scope
+    /// (`fe80::1%eth0`), since mapping an interface name to its index needs
+    /// a system call; numeric scopes (`fe80::1%2`) work. Other options, such
+    /// as `rotate`, `use-vc` and `edns0` (EDNS is always on), are ignored.
+    pub fn from_resolv_conf(text: &[u8]) -> Self {
+        let (parsed, _skipped) = resolv_conf::Config::parse_with_errors(text);
+        // glibc's MAXNS: later servers are ignored.
+        let mut servers = parsed
+            .nameservers
+            .iter()
+            .filter_map(|ip| match ip {
+                resolv_conf::ScopedIp::V4(v4) => Some(SocketAddr::from((*v4, 53))),
+                resolv_conf::ScopedIp::V6(v6, None) => Some(SocketAddr::from((*v6, 53))),
+                resolv_conf::ScopedIp::V6(v6, Some(scope)) => scope
+                    .parse()
+                    .ok()
+                    .map(|id| SocketAddr::V6(SocketAddrV6::new(*v6, 53, 0, id))),
+            })
+            .take(3);
         let first = servers
             .next()
             .unwrap_or_else(|| SocketAddr::from((Ipv4Addr::LOCALHOST, 53)));
@@ -131,7 +137,7 @@ impl Config {
             })
             .collect();
         config.ndots = u8::try_from(parsed.ndots.min(15)).unwrap_or(15);
-        Ok(config)
+        config
     }
 
     /// The names to try for `name`, in order, as glibc's `res_search` does.
