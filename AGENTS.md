@@ -98,8 +98,9 @@ outputs are drained with `poll_transmit`, `poll_event` and `poll_timeout`.
   `shut`, which sends the session's close_notify, or the alert of a TLS error, as a `TcpWrite`
   before the `TcpClose` (RFC 8446 §6); the server's close_notify retires the connection like
   `handle_stream_closed` (`shut`, then `move_off`), after the answers decrypted with it, which
-  can't send on it (`Connection::closing`, skipped by `emit` and `channel`). `shutdown` drops
-  every query and shuts every connection, for a driver that stops. Over TLS, `wire::protect` adds the EDNS
+  can't send on it (`Connection::closing`, skipped by `emit` and `channel` through
+  `Connection::is_open_to`). `shutdown` drops every query and shuts every connection, for a
+  driver that stops. Over TLS, `wire::protect` adds the EDNS
   Client Subnet privacy option (prefix 0, FAMILY of the server's address, RFC 8310 §11.1) and
   then the padding, last; `emit` runs it again when a query moves to a server of the other
   family. `Config::with_tls_names` holds an authentication name per server.
@@ -118,8 +119,9 @@ outputs are drained with `poll_transmit`, `poll_event` and `poll_timeout`.
   `forgive`) and `time_out_stream` (once, via the same `forgive`), `next_candidate` (next
   search name, fresh attempts, no exclusions), `give_up` and `finish`. `emit` counts every
   send in `Pending::sends`: a search candidate goes at most three times to a server over one
-  transport (RFC 9520 §3.1), so `advance` skips servers without room, and the free sends
-  and `switch_to_tcp` check `may_resend` first and move on instead. The crate docs' "How a
+  transport (RFC 9520 §3.1), so `advance` skips servers without room (in `step`), and the
+  free sends, a cancel hand-over's resend included, check `Pending::may_send` first (`cancel`
+  directly, the others through `may_resend`) and move on instead. The crate docs' "How a
   query moves on" table states the rules (at most `attempts + 3` sends per search
   candidate, not counting a cancel hand-over's resend or the resends after a lost connection
   that answered since, and at most three per server and transport, all of those included),

@@ -110,9 +110,15 @@ impl Pending {
         now.checked_add(config.wait(round)).unwrap_or(now)
     }
 
-    /// Whether this search candidate may be sent to `server` over `channel`
-    /// once more: RFC 9520 §3.1 allows three sends in all.
-    fn may_send(&self, server: SocketAddr, channel: Channel) -> bool {
+    /// Whether this search candidate may be sent to `server` once more,
+    /// over the channel `channel` picks for that send: RFC 9520 §3.1 allows
+    /// three sends in all.
+    fn may_send(
+        &self,
+        server: SocketAddr,
+        connections: &BTreeMap<ConnectionId, Connection>,
+    ) -> bool {
+        let channel = channel(connections, self, server);
         self.sends
             .iter()
             .find(|(s, c, _)| *s == server && *c == channel)
@@ -236,6 +242,12 @@ struct Incoming {
 }
 
 impl Connection {
+    /// Whether it takes queries to `server`: it goes to `server`, and the
+    /// server hasn't ended it (`closing`).
+    fn is_open_to(&self, server: SocketAddr) -> bool {
+        self.server == server && !self.closing
+    }
+
     /// Take in `data` read from it, through the TLS session if it has one,
     /// or fail with the TLS error, keeping nothing.
     #[cfg_attr(
@@ -296,17 +308,14 @@ enum Matched {
 }
 
 /// Which channel a send of `pending` to `server` takes: a stream if it
-/// must use one or a connection to `server` is open, UDP otherwise.
+/// must use one or a connection is open to `server`
+/// (`Connection::is_open_to`), UDP otherwise.
 fn channel(
     connections: &BTreeMap<ConnectionId, Connection>,
     pending: &Pending,
     server: SocketAddr,
 ) -> Channel {
-    if pending.stream_only
-        || connections
-            .values()
-            .any(|c| c.server == server && !c.closing)
-    {
+    if pending.stream_only || connections.values().any(|c| c.is_open_to(server)) {
         Channel::Stream
     } else {
         Channel::Udp
@@ -535,13 +544,8 @@ impl Resolver {
         };
         // Answers that move a query on must not send it here.
         conn.closing = closed;
-        if !to_send.is_empty() {
-            self.transmits.push_back(Transmit {
-                transport: Transport::TcpWrite(connection),
-                destination: conn.server,
-                payload: to_send,
-            });
-        }
+        let server = conn.server;
+        self.queue_write(connection, server, to_send);
         // One message at a time: acting on an answer may change this
         // connection too.
         while let Some(message) = self.next_message(connection) {
@@ -765,7 +769,7 @@ impl Resolver {
             }
             Route::Udp => {
                 let server = pending.server(&self.config);
-                if pending.may_send(server, channel(&self.connections, &pending, server)) {
+                if pending.may_send(server, &self.connections) {
                     pending.deadline = pending.deadline(&self.config, now);
                     self.pending.insert(heir, pending);
                     self.emit(heir, now);
@@ -1173,14 +1177,17 @@ impl Resolver {
     // `emit` picks the channel of every send (`channel`: the open
     // connection to the server if there is one, RFC 7766 §5) and counts it
     // in `Pending::sends`, and no search candidate goes to a server over a
-    // channel more than three times (RFC 9520 §3.1): `advance` skips
-    // servers without room, and `drop_edns`, `move_off`, `time_out_stream`
-    // and `cancel` check `may_resend` before a free send, and so does
+    // channel more than three times (RFC 9520 §3.1). `Pending::may_send`
+    // checks the room left on the channel `channel` picks for a send:
+    // `step` skips servers without room (for `advance`, and for `cancel`
+    // when it moves on), `cancel` checks it before a hand-over's resend,
+    // and `drop_edns`, `move_off` and `time_out_stream` check it through
+    // `may_resend` before a free send, and so does
     // `switch_to_tcp`, since earlier attempts may have gone to an open
     // connection. They move on as `retry` (`move_off`, `time_out_stream`),
-    // `advance` (`drop_edns`, `switch_to_tcp`) or `step` (`cancel`) instead. That
-    // check is all that bounds the resends after a lost connection that
-    // answered since.
+    // `advance` (`drop_edns`, `switch_to_tcp`) or `step` (`cancel`)
+    // instead. That check is all that bounds the resends after a lost
+    // connection that answered since.
 
     /// The server of `id`'s current attempt gave no answer: new queries
     /// start after it for a while (`Config::failure_memory`). It stays in
@@ -1232,8 +1239,7 @@ impl Resolver {
         let servers = config.servers().len();
         let next = (pending.position + 1..=pending.position + servers).find(|&p| {
             let server = config.server(p);
-            !pending.excluded.contains(&server)
-                && pending.may_send(server, channel(connections, pending, server))
+            !pending.excluded.contains(&server) && pending.may_send(server, connections)
         });
         let Some(position) = next.filter(|_| pending.attempt < config.attempts.get()) else {
             return false;
@@ -1377,7 +1383,7 @@ impl Resolver {
         let open = self
             .connections
             .iter_mut()
-            .find(|(_, c)| c.server == server && !c.closing);
+            .find(|(_, c)| c.is_open_to(server));
         let Some((&connection, conn)) = open else {
             if pending.stream_only {
                 pending.count_send(server, Channel::Stream);
@@ -1502,14 +1508,21 @@ impl Resolver {
         };
         #[cfg(not(feature = "tls"))]
         let payload = message.to_vec();
+        let server = conn.server;
+        self.queue_write(connection, server, payload);
+        Ok(())
+    }
+
+    /// Ask the driver to write `payload` to `connection`, whose server is
+    /// `server`. Nothing is queued if `payload` is empty.
+    fn queue_write(&mut self, connection: ConnectionId, server: SocketAddr, payload: Vec<u8>) {
         if !payload.is_empty() {
             self.transmits.push_back(Transmit {
                 transport: Transport::TcpWrite(connection),
-                destination: conn.server,
+                destination: server,
                 payload,
             });
         }
-        Ok(())
     }
 
     /// What the response `reply`, received on `connection`, answers: a
@@ -1616,10 +1629,9 @@ impl Resolver {
     /// Whether `id`'s current attempt may go to its server once more, over
     /// the channel that send would take (RFC 9520 §3.1).
     fn may_resend(&self, id: QueryId) -> bool {
-        self.pending.get(&id).is_some_and(|p| {
-            let server = p.server(&self.config);
-            p.may_send(server, channel(&self.connections, p, server))
-        })
+        self.pending
+            .get(&id)
+            .is_some_and(|p| p.may_send(p.server(&self.config), &self.connections))
     }
 
     /// Whether `id` may send its attempt again for free, which it may once.
@@ -1652,14 +1664,8 @@ impl Resolver {
         )]
         let mut conn = self.connections.remove(&connection)?;
         #[cfg(feature = "tls")]
-        if let Some(last) = conn.tls.as_mut().map(|session| session.close())
-            && !last.is_empty()
-        {
-            self.transmits.push_back(Transmit {
-                transport: Transport::TcpWrite(connection),
-                destination: conn.server,
-                payload: last,
-            });
+        if let Some(session) = &mut conn.tls {
+            self.queue_write(connection, conn.server, session.close());
         }
         self.transmits.push_back(Transmit {
             transport: Transport::TcpClose(connection),
