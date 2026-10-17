@@ -81,8 +81,12 @@ pub struct Harness {
     /// sender starting over because it took the query over after joining
     /// late.
     message_id: BTreeMap<Group, u16>,
-    /// The member that sent each group's first datagram, which never
-    /// starts over itself (with `max_sends`, so for absolute names).
+    /// The member that sent each group's first message, or started its
+    /// current budget over: it never starts over itself (with `max_sends`,
+    /// so for absolute names). Unknown after a start-over on a stream,
+    /// until the next one: the member that later sends a datagram with the
+    /// same message ID may be one that took the query over after joining
+    /// late, which does start over.
     began: BTreeMap<Group, QueryId>,
     pub recent: VecDeque<Sent>,
     events: Vec<Event>,
@@ -282,10 +286,8 @@ impl Harness {
                     let group = self.group_of[&q].clone();
                     let request = Message::from_vec(&t.payload).expect("the resolver sent garbage");
                     let id = request.metadata.id;
-                    let fresh = self
-                        .message_id
-                        .insert(group.clone(), id)
-                        .is_some_and(|previous| previous != id);
+                    let previous_id = self.message_id.insert(group.clone(), id);
+                    let fresh = previous_id.is_some_and(|previous| previous != id);
                     let handed_over = self.handed_over.remove(&group);
                     match self.sender.insert(group.clone(), q) {
                         Some(previous) if previous != q => {
@@ -302,7 +304,10 @@ impl Harness {
                         // per-server limit.
                         _ if handed_over => self.count_per_server(&group, t.destination, true),
                         _ => {
-                            self.began.entry(group.clone()).or_insert(q);
+                            if previous_id.is_none() {
+                                // The group's first send, from its leader.
+                                self.began.insert(group.clone(), q);
+                            }
                             self.count(&group, t.destination, true, free);
                         }
                     }

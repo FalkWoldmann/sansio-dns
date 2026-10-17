@@ -215,6 +215,26 @@ mod search {
         assert_matches!(event, Some(Event::Response { .. }));
     }
 
+    /// Service `db` in a namespace named `local`: every candidate under
+    /// `cluster.local` is tried, and only `db.local.` itself, link-local
+    /// (RFC 6762 §22.1), is left out.
+    #[test]
+    fn kubernetes_namespace_named_local_is_searched() {
+        let conf = "nameserver 10.96.0.10\n\
+                    search ns.svc.cluster.local svc.cluster.local cluster.local\n\
+                    options ndots:5\n";
+        let (asked, event) = tried(conf, "db.local", ResponseCode::NXDomain);
+        assert_eq!(
+            asked,
+            [
+                "db.local.ns.svc.cluster.local.",
+                "db.local.svc.cluster.local.",
+                "db.local.cluster.local.",
+            ]
+        );
+        assert_matches!(event, Some(Event::Response { .. }));
+    }
+
     #[test]
     fn localhost_is_not_searched() {
         let (asked, event) = tried(CONF, "localhost", ResponseCode::NXDomain);

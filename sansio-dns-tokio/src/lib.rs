@@ -52,6 +52,7 @@
 #[cfg(feature = "reqwest")]
 mod reqwest;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::io;
@@ -60,6 +61,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use idna::uts46::{AsciiDenyList, DnsLength, Hyphens, Uts46};
 use sansio_dns::hickory_proto::ProtoError;
 use sansio_dns::hickory_proto::rr::Name;
 use sansio_dns::{
@@ -135,27 +137,57 @@ impl Resolver {
 
     /// The addresses of `host`, which may also be an IP address itself, in
     /// the families and order of `Config::ip_strategy` (by default IPv6
-    /// first). A name with non-ASCII characters is converted to
-    /// its ASCII form first (IDNA, so `bücher.example` asks for
-    /// `xn--bcher-kva.example`); an ASCII name is used as given, so names
-    /// like `my_host.example` work too.
+    /// first).
+    ///
+    /// A name with non-ASCII characters is converted to its ASCII form as a
+    /// whole, by UTS 46 non-transitional processing, as browsers and the
+    /// WHATWG URL standard do: it is mapped (lowercased, normalized to NFC,
+    /// and the ideographic and full-width full stops become dots), checked
+    /// (combining marks, CONTEXTJ, the Bidi rule of RFC 5893 across the
+    /// whole name, DNS lengths) and its labels converted to A-labels, so
+    /// `bücher。example` asks for `xn--bcher-kva.example`. A U-label with
+    /// `--` in its third and fourth positions is rejected (RFC 5891 §5.4);
+    /// other hyphens and `_` are allowed. UTS 46 accepts some code points
+    /// that IDNA2008 marks DISALLOWED, such as symbols (`☃.example`), which
+    /// RFC 5891 §5.4 asks a lookup to reject; such names are looked up as
+    /// browsers look them up.
+    ///
+    /// An ASCII name is used as given, in its case (RFC 4343 §4), so names
+    /// like `my_host.example` and `r3---sn-abc.example` work too. If one of
+    /// its labels starts with `xn--`, the name must pass the same checks,
+    /// so each such label must be a valid A-label (RFC 5891 §5.3).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidName`] for a host that is neither an IP address nor
+    /// a valid name: empty or `.`; one to four dotted numbers that aren't
+    /// an IP address, the forms `inet_aton` reads as IPv4, such as
+    /// `127.1`, `01.2.3.4` or `0x7f.0.0.1`, or would but for a part out of
+    /// range, such as `1.2.3.256` (RFC 1123 §2.1: no host name has them,
+    /// since its top-level label is alphabetic); an absolute name whose
+    /// last label is all digits; a host with a `\`, which no host name has
+    /// and which would otherwise be read as a master-file escape; a name
+    /// that fails the IDNA checks above, or a label or name too long for
+    /// DNS. A relative name of five or more numbers, or one with a last
+    /// label of digits, is looked up, since a search domain may complete
+    /// it. IPv6 addresses with a zone (`fe80::1%eth0`) aren't accepted
+    /// either.
     pub async fn lookup_ip(&self, host: &str) -> Result<Vec<IpAddr>, Error> {
         if let Ok(ip) = host.parse() {
             return Ok(vec![ip]);
         }
+        let name = host_name(host).map_err(Error::InvalidName)?;
         // A task that stops with its runtime drops the lookup unanswered;
         // the second try runs on a task of this lookup's own runtime.
         let mut stopped = None;
         for _ in 0..2 {
-            let name = if host.is_ascii() {
-                Name::from_ascii(host)
-            } else {
-                Name::from_utf8(host)
-            }
-            .map_err(Error::InvalidName)?;
             let (reply, answer) = oneshot::channel();
             let id = self.shared.next_lookup.fetch_add(1, Ordering::Relaxed);
-            let request = Request::Lookup { id, name, reply };
+            let request = Request::Lookup {
+                id,
+                name: name.clone(),
+                reply,
+            };
             let requests = match &stopped {
                 None => self.shared.send(request),
                 Some(stale) => self.shared.restart(stale, request),
@@ -174,6 +206,87 @@ impl Resolver {
         }
         Err(Error::Stopped)
     }
+}
+
+/// `host`, which isn't an IP address, as the name to look up; see
+/// [`Resolver::lookup_ip`].
+fn host_name(host: &str) -> Result<Name, ProtoError> {
+    let labels = host.strip_suffix('.').unwrap_or(host);
+    if labels.is_empty() {
+        return Err(ProtoError::Message("empty host name"));
+    }
+    // `Name::from_ascii` reads `\` as a master-file escape, so the labels
+    // checked here wouldn't be the ones sent.
+    if host.contains('\\') {
+        return Err(ProtoError::Message("a backslash in a host name"));
+    }
+    let ascii = if host.is_ascii() {
+        if labels.split('.').any(|label| {
+            label
+                .get(..4)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("xn--"))
+        }) {
+            to_ascii(host)?;
+        }
+        Cow::Borrowed(host)
+    } else {
+        to_ascii(host)?
+    };
+    if is_numeric(&ascii) {
+        return Err(ProtoError::Message(
+            "dotted numbers that aren't an IP address, or a last label of digits",
+        ));
+    }
+    Name::from_ascii(&*ascii)
+}
+
+/// `host` converted by UTS 46 non-transitional processing, with no ASCII
+/// character denied and no hyphen rule of its own, then checked for the
+/// one hyphen rule of RFC 5891 §5.4: no `--` in the third and fourth
+/// positions of a U-label.
+fn to_ascii(host: &str) -> Result<Cow<'_, str>, ProtoError> {
+    let ascii = Uts46::new()
+        .to_ascii(
+            host.as_bytes(),
+            AsciiDenyList::EMPTY,
+            Hyphens::Allow,
+            DnsLength::VerifyAllowRootDot,
+        )
+        .map_err(|_| ProtoError::Message("not a valid internationalized domain name"))?;
+    let hyphens = ascii
+        .split('.')
+        .filter_map(|label| label.strip_prefix("xn--"))
+        .filter_map(idna::punycode::decode)
+        .any(|label| label.get(2..4) == Some(&['-', '-']));
+    if hyphens {
+        return Err(ProtoError::Message(
+            "a label has \"--\" in its third and fourth positions",
+        ));
+    }
+    Ok(ascii)
+}
+
+/// Whether `host` is one to four numbers, decimal or hexadecimal, the form
+/// of an IPv4 address to `inet_aton`, or is absolute with a last label of
+/// digits: no host name has either form, since its top-level label is
+/// alphabetic (RFC 1123 §2.1).
+fn is_numeric(host: &str) -> bool {
+    let trimmed = host.strip_suffix('.');
+    let absolute = trimmed.is_some();
+    let labels = trimmed.unwrap_or(host);
+    let digits = |label: &str| !label.is_empty() && label.bytes().all(|b| b.is_ascii_digit());
+    let number = |label: &str| {
+        let hex = label
+            .strip_prefix("0x")
+            .or_else(|| label.strip_prefix("0X"));
+        hex.map_or_else(
+            || digits(label),
+            |hex| hex.bytes().all(|b| b.is_ascii_hexdigit()),
+        )
+    };
+    let last = labels.rsplit('.').next().unwrap_or(labels);
+    let parts = labels.split('.').count();
+    ((1..=4).contains(&parts) && labels.split('.').all(number)) || (absolute && digits(last))
 }
 
 impl Shared {

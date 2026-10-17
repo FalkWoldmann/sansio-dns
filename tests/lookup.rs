@@ -5,8 +5,8 @@ use std::time::Instant;
 
 use crate::common::*;
 use hickory_proto::op::{Message, OpCode, Query, ResponseCode};
-use hickory_proto::rr::rdata::{A, CNAME};
-use hickory_proto::rr::{Name, RData, Record, RecordType};
+use hickory_proto::rr::rdata::{A, AAAA, CNAME};
+use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use rstest::rstest;
 use sansio_dns::{
     Config, Error, Event, IpLookup, IpStrategy, Progress, Resolver, Transmit, addresses,
@@ -30,10 +30,29 @@ fn cname(owner: &str, target: &str) -> Record {
 
 /// A response to `www.example.com. A` with the given answer section.
 fn response(answers: Vec<Record>) -> Message {
+    response_to(RecordType::A, answers)
+}
+
+/// A response to `www.example.com.` of type `record_type` with the given
+/// answer section.
+fn response_to(record_type: RecordType, answers: Vec<Record>) -> Message {
     let mut m = Message::response(0, OpCode::Query);
-    m.add_query(Query::query(name("www.example.com."), RecordType::A));
+    m.add_query(Query::query(name("www.example.com."), record_type));
     m.answers = answers;
     m
+}
+
+fn aaaa(owner: &str, last: u16) -> Record {
+    let address = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, last);
+    Record::from_rdata(name(owner), 300, RData::AAAA(AAAA(address)))
+}
+
+fn v4(last_octet: u8) -> IpAddr {
+    IpAddr::V4(Ipv4Addr::new(192, 0, 2, last_octet))
+}
+
+fn v6(last: u16) -> IpAddr {
+    IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, last))
 }
 
 /// RFC 1034 §3.6.2: addresses belong to the end of the CNAME chain.
@@ -49,16 +68,110 @@ mod rfc1034_section_3_6_2 {
             a("www.example.com.", 8),
             a("edge.example.org.", 1),
         ]);
-        assert_eq!(addresses(&m), [IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))]);
+        assert_eq!(addresses(&m), Ok(vec![v4(1)]));
+    }
+
+    /// "CNAME loops signalled as an error" (§3.6.2, §5.2.2), even when a
+    /// name on the loop also has an address.
+    #[rstest]
+    #[case::two_names(vec![
+        cname("www.example.com.", "a.example."),
+        cname("a.example.", "www.example.com."),
+    ])]
+    #[case::to_itself(vec![cname("www.example.com.", "WWW.example.com.")])]
+    #[case::loop_with_an_address(vec![
+        cname("www.example.com.", "a.example."),
+        cname("a.example.", "www.example.com."),
+        a("a.example.", 1),
+    ])]
+    #[case::loop_further_down(vec![
+        cname("www.example.com.", "a.example."),
+        cname("a.example.", "b.example."),
+        cname("b.example.", "a.example."),
+    ])]
+    fn cname_loop_is_an_error(#[case] answers: Vec<Record>) {
+        assert_eq!(addresses(&response(answers)), Err(Error::CnameLoop));
+    }
+
+    /// A chain that ends without address records isn't a loop.
+    #[test]
+    fn chain_without_addresses_is_empty() {
+        let m = response(vec![
+            cname("www.example.com.", "a.example."),
+            cname("a.example.", "b.example."),
+        ]);
+        assert_eq!(addresses(&m), Ok(vec![]));
+    }
+}
+
+/// RFC 3596 §2.3 and RFC 1035 §7.4: only records of the type and class
+/// asked for count, at the end of the chain.
+mod rfc3596_section_2_3 {
+    use super::*;
+
+    #[rstest]
+    #[case::a(RecordType::A, vec![v4(1)])]
+    #[case::aaaa(RecordType::AAAA, vec![v6(1)])]
+    #[case::any(RecordType::ANY, vec![v4(1), v6(1)])]
+    #[case::other_type(RecordType::MX, vec![])]
+    fn only_the_type_asked_for(#[case] record_type: RecordType, #[case] expected: Vec<IpAddr>) {
+        let m = response_to(
+            record_type,
+            vec![a("www.example.com.", 1), aaaa("www.example.com.", 1)],
+        );
+        assert_eq!(addresses(&m), Ok(expected));
     }
 
     #[test]
-    fn cname_loop_ends_without_addresses() {
+    fn records_of_another_class_are_ignored() {
+        let mut chaos_alias = cname("www.example.com.", "other.example.");
+        chaos_alias.dns_class = DNSClass::CH;
+        let mut chaos_address = a("www.example.com.", 2);
+        chaos_address.dns_class = DNSClass::CH;
         let m = response(vec![
-            cname("www.example.com.", "a.example."),
-            cname("a.example.", "www.example.com."),
+            chaos_alias,
+            chaos_address,
+            a("www.example.com.", 1),
+            a("other.example.", 3),
         ]);
-        assert!(addresses(&m).is_empty());
+        assert_eq!(addresses(&m), Ok(vec![v4(1)]));
+    }
+}
+
+/// RFC 6761 §6.3, §6.4 and RFC 7686 §2: a chain ends at a special-use name,
+/// which has no aliases; a `localhost` name has the loopback address, the
+/// others no address.
+mod rfc6761_chain_into_special_use {
+    use super::*;
+
+    #[rstest]
+    #[case::a(RecordType::A, IpAddr::V4(Ipv4Addr::LOCALHOST))]
+    #[case::aaaa(RecordType::AAAA, IpAddr::V6(Ipv6Addr::LOCALHOST))]
+    fn localhost_target_gives_loopback(#[case] record_type: RecordType, #[case] loopback: IpAddr) {
+        let m = response_to(
+            record_type,
+            vec![
+                cname("www.example.com.", "app.localhost."),
+                a("app.localhost.", 7),
+                aaaa("app.localhost.", 7),
+                cname("app.localhost.", "elsewhere.example."),
+                a("elsewhere.example.", 8),
+            ],
+        );
+        assert_eq!(addresses(&m), Ok(vec![loopback]));
+    }
+
+    #[rstest]
+    #[case::invalid("x.invalid.")]
+    #[case::onion("x.onion.")]
+    fn nxdomain_target_gives_no_address(#[case] target: &str) {
+        let m = response(vec![
+            cname("www.example.com.", target),
+            a(target, 7),
+            cname(target, "elsewhere.example."),
+            a("elsewhere.example.", 8),
+        ]);
+        assert_eq!(addresses(&m), Ok(vec![]));
     }
 }
 
@@ -162,6 +275,33 @@ mod ip_lookup {
         let progress = feed(lookup, &mut resolver, events);
 
         assert_eq!(progress, Progress::Done(Ok(expected.to_vec())));
+    }
+
+    /// RFC 1034 §5.2.2: a CNAME loop is passed back as an error, merged
+    /// with the other family's outcome like a failure.
+    #[rstest]
+    #[case::other_family_has_an_address(false, Ok(vec![V4]))]
+    #[case::both_loop(true, Err(Error::CnameLoop))]
+    fn cname_loop_fails_the_family(
+        #[case] a_loops: bool,
+        #[case] expected: Result<Vec<IpAddr>, Error>,
+    ) {
+        let mut resolver = single_attempt_resolver(IpStrategy::default());
+        let lookup = IpLookup::start(&mut resolver, name("example.com."), Instant::now()).unwrap();
+        let sent: Vec<_> = std::iter::from_fn(|| resolver.poll_transmit()).collect();
+        for t in &sent {
+            let mut response = reply(t);
+            let is_a = decode(t).queries[0].query_type() == RecordType::A;
+            if !is_a || a_loops {
+                response.answers = vec![cname("example.com.", "example.com.")];
+            }
+            resolver.handle_datagram(udp(t), S1, &encode(&response), Instant::now());
+        }
+
+        let events = events(&mut resolver);
+        let progress = feed(lookup, &mut resolver, events);
+
+        assert_eq!(progress, Progress::Done(expected));
     }
 
     #[test]
@@ -326,6 +466,80 @@ mod ip_lookup {
                 progress,
                 Progress::Done(Ok(vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9))]))
             );
+        }
+
+        /// RFC 6762 §3, §22.1 item 3: a link-local name is judged per
+        /// search candidate, as `Resolver::query` does.
+        mod link_local {
+            use super::*;
+
+            fn searching(search: &[&str]) -> Resolver {
+                let mut config = Config::new(S1, []);
+                config.search = search.iter().map(|domain| name(domain)).collect();
+                Resolver::new(config)
+            }
+
+            fn start(resolver: &mut Resolver, host: &str) -> IpLookup {
+                IpLookup::start(resolver, name(host), Instant::now()).unwrap()
+            }
+
+            /// Kubernetes service `db` in a namespace named `local`: the
+            /// lookup walks the candidates under `cluster.local.` itself,
+            /// so an address of one family ends the search for both.
+            #[test]
+            fn walks_the_candidates_under_a_search_domain() {
+                let mut resolver = searching(&["svc.cluster.local.", "cluster.local."]);
+                let lookup = start(&mut resolver, "db.local");
+
+                let progress = step(
+                    lookup,
+                    &mut resolver,
+                    "db.local.svc.cluster.local.",
+                    |t, r| {
+                        if t == RecordType::A {
+                            r
+                        } else {
+                            with_code(r, NX)
+                        }
+                    },
+                );
+
+                assert!(resolver.poll_transmit().is_none());
+                assert_eq!(progress, Progress::Done(Ok(vec![V4])));
+            }
+
+            /// The name as given, `printer.local.`, is left out, but the
+            /// searched candidate isn't link-local and is sent.
+            #[test]
+            fn tries_the_searched_candidates_only() {
+                let mut resolver = searching(&["corp.example."]);
+                let lookup = start(&mut resolver, "printer.local");
+
+                let progress = step(
+                    lookup,
+                    &mut resolver,
+                    "printer.local.corp.example.",
+                    |_, r| with_code(r, NX),
+                );
+
+                assert!(resolver.poll_transmit().is_none());
+                assert_eq!(progress, Progress::Done(Ok(vec![])));
+            }
+
+            #[rstest]
+            #[case::absolute(&["cluster.local."], "printer.local.")]
+            #[case::no_candidate_left(&["local."], "printer.local")]
+            #[case::reverse_zone(&[], "34.12.254.169.in-addr.arpa")]
+            fn is_answered_locally(#[case] search: &[&str], #[case] host: &str) {
+                let mut resolver = searching(search);
+                let lookup = start(&mut resolver, host);
+
+                let events = events(&mut resolver);
+                let progress = feed(lookup, &mut resolver, events);
+
+                assert!(resolver.poll_transmit().is_none());
+                assert_eq!(progress, Progress::Done(Ok(vec![])));
+            }
         }
     }
 

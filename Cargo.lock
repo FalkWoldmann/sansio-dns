@@ -2126,6 +2126,7 @@ dependencies = [
 name = "sansio-dns-tokio"
 version = "0.1.0"
 dependencies = [
+ "idna",
  "rcgen",
  "reqwest",
  "rstest",

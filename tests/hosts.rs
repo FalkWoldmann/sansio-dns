@@ -63,7 +63,7 @@ fn listed_names_are_answered_locally(
         panic!("expected a local answer");
     };
     assert_eq!(response.metadata.response_code, ResponseCode::NoError);
-    assert_eq!(addresses(&response), expected);
+    assert_eq!(addresses(&response), Ok(expected));
 }
 
 /// Hosts files only hold addresses: other record types, and names the file

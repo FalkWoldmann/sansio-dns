@@ -15,8 +15,11 @@
 //!
 //! Queries go over UDP, or over the connection to their server if one is
 //! open (RFC 7766 §5). A truncated response switches that query to TCP (RFC
-//! 1123 §6.1.3.2, RFC 9210 §3). Special-use names never reach the network;
-//! see [`Resolver::query`].
+//! 1123 §6.1.3.2, RFC 9210 §3). Names under `localhost.`, `invalid.` and
+//! `onion.` never reach the network, and neither do names under `local.`
+//! and the link-local reverse zones unless the configuration says the name
+//! servers serve them; other special-use names, such as `test.` or
+//! `home.arpa.`, are sent like any other. See [`Resolver::query`].
 //!
 //! For hostnames, [`IpLookup`] runs the A and AAAA queries and collects the
 //! addresses, following CNAMEs; [`Config::ip_strategy`] picks the families
@@ -85,7 +88,7 @@
 //! | Its connection is closed because another query on it timed out with no response on it since being written, or because it holds too many unanswered requests (see below) | is sent again, once per query, shared with the row above | same | no | kept |
 //! | Either of the two rows above, a second time | sends its next attempt | next | yes | fresh |
 //! | A connection that never answered is lost, or TLS rejects bytes received on any connection or refuses a write to it | sends its next attempt | next | yes | fresh |
-//! | `NXDOMAIN`, or NODATA (`NOERROR` without records of the type asked for), with search candidates left | starts over with the next candidate: new message ID, with EDNS, over UDP unless a connection is open or over TLS, no server skipped, a new free resend | first that hasn't failed | fresh attempts | fresh |
+//! | `NXDOMAIN`, or NODATA (`NOERROR` without records of the type and class asked for), with search candidates left | starts over with the next candidate: new message ID, with EDNS, over UDP unless a connection is open or over TLS, no server skipped, a new free resend | first that hasn't failed | fresh attempts | fresh |
 //! | It was the first to join a query that is cancelled (see below) | takes the query over; over UDP the current attempt is sent again, from its own socket | same | no | fresh over UDP, kept on a stream |
 //! | Out of attempts, or every server skipped | fails with the last error, or [`Error::Timeout`] when a query has no server left after it took over a cancelled one or got a truncated answer; a query that joined after the search candidate started starts over instead (see below) | | | |
 //!
@@ -109,13 +112,14 @@
 //! their message IDs; its other queries move as when one times out.
 //!
 //! If a TLS session can't be started, the query fails at once with
-//! [`Error::Tls`]. A `NOERROR` answer with records of the type asked
-//! for ends the query. So does `NXDOMAIN` or NODATA with no candidate left:
+//! [`Error::Tls`]. A `NOERROR` answer with records of the type and class
+//! asked for ends the query. So does `NXDOMAIN` or NODATA with no candidate left:
 //! the outcome is then the first NODATA answer if a candidate gave one,
 //! else the last `NXDOMAIN` (see [`Resolver::query`]). A query that fails
 //! on a candidate ends the search with that error. [`IpLookup`] walks the
 //! candidates itself, with an A and an AAAA query per candidate, and moves
-//! on when neither has an address.
+//! on when neither has an address; a failure, or an answer whose CNAME
+//! chain loops ([`Error::CnameLoop`]), ends its search.
 //!
 //! Each search candidate is sent at most three times to each server over
 //! each transport, UDP and TCP, or TLS (RFC 9520 §3.1). Every send counts:
@@ -351,4 +355,10 @@ pub enum Error {
     /// which a stub resolver can't follow (RFC 1034 §4.3.1, §5.3.1).
     #[error("name server doesn't offer recursion")]
     NoRecursion,
+    /// The answer's CNAME chain comes back to a name on it, which RFC 1034
+    /// §3.6.2 and §5.2.2 ask to report as an error. Only from
+    /// [`addresses`] and [`IpLookup`]; [`Resolver::query`] passes the
+    /// answer on as it is.
+    #[error("CNAME chain loops")]
+    CnameLoop,
 }

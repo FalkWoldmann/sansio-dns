@@ -12,7 +12,7 @@ use hickory_proto::rr::{Name, RecordType};
 use crate::Hosts;
 #[cfg(feature = "tls")]
 use crate::tls::{self, TlsConfigError};
-use crate::wire::is_special_use;
+use crate::wire::{is_link_local, is_special_use, is_under_link_local};
 
 /// Which address families an [`IpLookup`](crate::IpLookup) asks for, and the
 /// order of its addresses.
@@ -28,8 +28,11 @@ pub enum IpStrategy {
     Ipv6Only,
     /// Both; the IPv4 addresses first.
     Ipv4First,
-    /// Both; the IPv6 addresses first, as RFC 6724's default policy orders
-    /// them on a host with global IPv6.
+    /// Both; the IPv6 addresses first. RFC 6724's default policy table
+    /// orders them so only for global unicast IPv6 destinations, on a host
+    /// with a global IPv6 source address: it puts IPv4 before ULA, 6to4
+    /// and Teredo destinations (§2.1), and its rules also weigh scope and
+    /// prefix length (§6), which this order ignores.
     #[default]
     Ipv6First,
 }
@@ -94,8 +97,30 @@ pub struct Config {
     /// three fails early.
     pub attempts: NonZeroUsize,
     /// Domains to try appending to names without a trailing dot, in order.
-    /// Empty means every name is used as given.
+    /// Empty means every name is used as given. A candidate that wouldn't
+    /// be sent, under `localhost.`, `invalid.` or `onion.`, or a
+    /// link-local name not served over unicast (see
+    /// `unicast_local_zones`), is left out, the name as given among them.
+    ///
+    /// A search domain under `local.`, such as Kubernetes' `cluster.local.`
+    /// or an Active Directory domain `corp.local.`, shows that the name
+    /// servers serve it, so names under it are sent to them.
     pub search: Vec<Name>,
+    /// Zones under `local.`, or under the link-local reverse zones, that the
+    /// name servers serve, in addition to those under a search domain. Empty
+    /// by default, and [`Config::from_resolv_conf`] leaves it empty.
+    ///
+    /// RFC 6762 reserves `local.`, `254.169.in-addr.arpa.` and
+    /// `8.e.f.ip6.arpa.` to `b.e.f.ip6.arpa.` for multicast DNS (§3, §4),
+    /// and asks libraries not to send their names to unicast servers
+    /// (§22.1 item 3). So a name in them, as given or as a search
+    /// candidate, is sent only when it is under one of these zones or
+    /// under a search domain that is itself under one of the six (not
+    /// `local.` itself); any other gets NXDOMAIN without a transmit, the
+    /// answer §22.1 item 4 asks of caching servers. Multicast DNS itself is
+    /// up to the caller. Listing `local.` here sends every `local.` name to
+    /// the servers.
+    pub unicast_local_zones: Vec<Name>,
     /// A name with at least this many dots is tried as given before the
     /// search domains; one with fewer, after them. `db` has no dots and
     /// `db.x` has one.
@@ -140,6 +165,7 @@ impl Config {
             timeout: Duration::from_secs(5),
             attempts,
             search: Vec::new(),
+            unicast_local_zones: Vec::new(),
             ndots: 1,
             idle_timeout: Duration::from_secs(10),
             failure_memory: Duration::from_secs(60),
@@ -285,8 +311,9 @@ impl Config {
     }
 
     /// The names to try for `name`, in order, as glibc's `res_search` does.
-    /// Candidates under special-use zones are left out. Empty when the name
-    /// is only tried as given, which needs no list.
+    /// Candidates that wouldn't be sent ([`Config::never_sent`]), the name
+    /// as given among them, are left out. Empty when the name is only tried
+    /// as given, which needs no list, or when no candidate is left.
     pub(crate) fn candidates(&self, name: &Name) -> VecDeque<Name> {
         if name.is_fqdn() || self.search.is_empty() {
             return VecDeque::new();
@@ -296,15 +323,54 @@ impl Config {
         let searched = self
             .search
             .iter()
-            .filter_map(|domain| name.clone().append_domain(domain).ok())
-            .filter(|candidate| !is_special_use(candidate));
+            .filter_map(|domain| name.clone().append_domain(domain).ok());
         // `num_labels` doesn't count the root label.
         let dots = usize::from(name.num_labels()).saturating_sub(1);
-        if dots >= usize::from(self.ndots) {
+        let all: VecDeque<Name> = if dots >= usize::from(self.ndots) {
             std::iter::once(absolute).chain(searched).collect()
         } else {
             searched.chain(std::iter::once(absolute)).collect()
+        };
+        all.into_iter()
+            .filter(|candidate| !self.never_sent(candidate))
+            .collect()
+    }
+
+    /// Whether `name`, as given, gets a link-local NXDOMAIN without a
+    /// transmit: an absolute name, or one tried only as given, that is
+    /// never sent, or a relative name none of whose search candidates is
+    /// sent. RFC 6762 §3 makes no difference between a `.local.` suffix
+    /// typed and one appended from the search list, so a relative name is
+    /// judged by the names actually queried.
+    pub(crate) fn never_sent_as_given(&self, name: &Name) -> bool {
+        if name.is_fqdn() || self.search.is_empty() {
+            let mut absolute = name.clone();
+            absolute.set_fqdn(true);
+            self.never_sent(&absolute)
+        } else {
+            self.candidates(name).is_empty()
         }
+    }
+
+    /// Whether `name` must not reach the name servers: it is under
+    /// `localhost.`, `invalid.` or `onion.` (RFC 6761 §6.3, §6.4, RFC 7686
+    /// §2), or a link-local name (RFC 6762 §3, §4) that isn't under
+    /// `unicast_local_zones` or a search domain under a link-local zone
+    /// (§22.1 item 3).
+    pub(crate) fn never_sent(&self, name: &Name) -> bool {
+        is_special_use(name) || (is_link_local(name) && !self.served_over_unicast(name))
+    }
+
+    /// Whether the link-local name `name` is under a zone the name servers
+    /// serve: one in `unicast_local_zones`, or a search domain strictly
+    /// under a link-local zone.
+    fn served_over_unicast(&self, name: &Name) -> bool {
+        let listed = self.unicast_local_zones.iter();
+        let searched = self
+            .search
+            .iter()
+            .filter(|domain| is_under_link_local(domain));
+        listed.chain(searched).any(|zone| zone.zone_of(name))
     }
 
     /// How long an attempt in `round` waits for an answer: `timeout`,

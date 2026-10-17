@@ -1,33 +1,73 @@
 //! Address lookups: A and AAAA for one name, merged in the configured order.
 
 use std::collections::VecDeque;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Instant;
 
 use hickory_proto::ProtoError;
 use hickory_proto::op::Message;
 use hickory_proto::rr::{Name, RData, RecordType};
 
-use crate::wire::chain;
+use crate::wire::{chain, in_class, is_localhost, is_special_use};
 use crate::{Error, Event, QueryId, Resolver};
 
-/// The addresses `response` gives for its question's name, following the
-/// CNAME chain from that name (RFC 1034 §3.6.2). Records owned by any other
-/// name are ignored.
-pub fn addresses(response: &Message) -> Vec<IpAddr> {
-    let Some(canonical) = chain(response).last() else {
-        return Vec::new();
+/// The addresses `response` gives for its question, following the CNAME
+/// chain from the question name (RFC 1034 §3.6.2): the records at the end
+/// of the chain of the type and class asked for, A for A, AAAA for AAAA
+/// and both for ANY (RFC 3596 §2.3). Records owned by any other name, or
+/// of another type or class, are ignored (RFC 1035 §7.4).
+///
+/// The chain ends at the first `localhost`, `invalid.` or `onion.` name,
+/// which can't be an alias: a `localhost` name gives the loopback address
+/// of the type asked for, whatever the server sent with it (RFC 6761
+/// §6.3), and the others give none (RFC 6761 §6.4, RFC 7686 §2).
+///
+/// # Errors
+///
+/// [`Error::CnameLoop`] if the chain comes back to a name on it (RFC 1034
+/// §3.6.2, §5.2.2).
+pub fn addresses(response: &Message) -> Result<Vec<IpAddr>, Error> {
+    let Some(question) = response.queries.first() else {
+        return Ok(Vec::new());
     };
-    response
+    let mut names: Vec<Name> = Vec::new();
+    for name in chain(response) {
+        if names.contains(&name) {
+            return Err(Error::CnameLoop);
+        }
+        let special = is_special_use(&name);
+        names.push(name);
+        if special {
+            break;
+        }
+    }
+    let Some(canonical) = names.last() else {
+        return Ok(Vec::new());
+    };
+    let (v4, v6) = match question.query_type() {
+        RecordType::A => (true, false),
+        RecordType::AAAA => (false, true),
+        RecordType::ANY => (true, true),
+        _ => (false, false),
+    };
+    if is_special_use(canonical) {
+        let loopback = [
+            v4.then_some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            v6.then_some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+        ];
+        let loopback = loopback.into_iter().flatten();
+        return Ok(loopback.filter(|_| is_localhost(canonical)).collect());
+    }
+    let found = response
         .answers
         .iter()
-        .filter(|r| r.name == canonical)
+        .filter(|r| r.name == *canonical && in_class(question, r))
         .filter_map(|r| match r.data {
-            RData::A(a) => Some(IpAddr::V4(a.0)),
-            RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
+            RData::A(a) if v4 => Some(IpAddr::V4(a.0)),
+            RData::AAAA(aaaa) if v6 => Some(IpAddr::V6(aaaa.0)),
             _ => None,
-        })
-        .collect()
+        });
+    Ok(found.collect())
 }
 
 /// The A and AAAA queries for the same name, as [`Config::ip_strategy`]
@@ -38,10 +78,14 @@ pub fn addresses(response: &Message) -> Vec<IpAddr> {
 /// moves on when neither query found an address, after NXDOMAIN or NODATA
 /// (RFC 1123 §6.1.4.3, RFC 2308 §2.2), and ends on the first candidate
 /// where one did, with the addresses of both families for that name. So
-/// they are those of one host (RFC 1123 §6.1.4.3 (b)). A query that fails
-/// ends the search, and when the candidates run out the outcome is an
-/// empty list. Names listed in [`Config::hosts`] and special-use names are
-/// answered locally, as given, before any search domain.
+/// they are those of one host (RFC 1123 §6.1.4.3 (b)). A query that fails,
+/// or gets an answer whose CNAME chain loops, ends the search, and when the
+/// candidates run out the outcome is an empty list. Names that
+/// [`Resolver::query`] answers locally are answered that way, before any
+/// search domain: `localhost`, `invalid.` and `onion.` names and
+/// [`Config::hosts`] entries as given, and link-local names not served
+/// over unicast when none of their search candidates is sent. Search
+/// candidates that wouldn't be sent are left out.
 ///
 /// Pass every [`Event`] to [`IpLookup::handle_event`], which hands the
 /// lookup back until it is done, and then the outcome instead. Moving on
@@ -74,8 +118,9 @@ pub enum Progress {
     /// The lookup is done. The addresses of one family followed by those of
     /// the other, in the order of [`Config::ip_strategy`], each in the
     /// server's order. An error only if no address was found and a query
-    /// failed; no address and no failure (NXDOMAIN, or no records) is an
-    /// empty list.
+    /// failed or got an answer whose CNAME chain loops
+    /// ([`Error::CnameLoop`]); no address and no failure (NXDOMAIN, or no
+    /// records) is an empty list.
     ///
     /// [`Config::ip_strategy`]: crate::Config::ip_strategy
     Done(Result<Vec<IpAddr>, Error>),
@@ -140,7 +185,7 @@ impl IpLookup {
         now: Instant,
     ) -> Progress {
         let (query, result) = match event {
-            Event::Response { query, response } => (query, Ok(addresses(response))),
+            Event::Response { query, response } => (query, addresses(response)),
             Event::Failed { query, error } => (query, Err(error.clone())),
         };
         let slot = self

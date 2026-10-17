@@ -132,12 +132,22 @@ drained with `poll_transmit`, `poll_event` and `poll_timeout`.
   (`give_up`); `cancel(id, now)` hands a query with followers to the first of them,
   re-sending a UDP attempt from the follower's own socket. The heir's join time goes into
   `Pending::joined`, so `give_up` starts it over too if it joined late.
-- Special-use names (`localhost.`, `invalid.`, `onion.`) and `Config::hosts` entries are answered
-  without a transmit. `IpLookup` (`src/lookup.rs`) walks the search candidates itself: per
-  candidate it starts an A and an AAAA query for the absolute name
-  (`Resolver::query_candidate`, which skips `Config::hosts`; the lookup checks the name as
-  given with `Resolver::is_local` first), merges the addresses from the events it is fed, and
-  moves on when neither has one, so `handle_event` takes the resolver.
+- Some names are answered without a transmit, in this order: `localhost.`, `invalid.` and
+  `onion.` names as given (`wire::is_special_use`), then `Config::hosts` entries as given,
+  then names under `local.` and the link-local reverse zones (RFC 6762 §22.1) unless they are
+  under a search domain below one of those zones or under `Config::unicast_local_zones`
+  (`Config::never_sent`, which filters every search candidate, the name as given included;
+  `Config::never_sent_as_given` answers a relative name locally only when no candidate is
+  left, since RFC 6762 §3 judges the name actually queried). `IpLookup`
+  (`src/lookup.rs`) walks the search candidates itself: per candidate it starts an A and an
+  AAAA query for the absolute name (`Resolver::query_candidate`, which skips `Config::hosts`;
+  the lookup checks the name as given with `Resolver::is_local` first), merges the addresses
+  from the events it is fed, and moves on when neither has one, so `handle_event` takes the
+  resolver. `addresses` follows the CNAME chain, stops at a special-use name, keeps only the
+  question's type and class, and reports a loop as `Error::CnameLoop`.
+- The Tokio driver's `lookup_ip` turns a host into a `Name` itself (`host_name`): UTS 46 over
+  the whole name for non-ASCII input (the `idna` crate), A-label checks for ASCII input, which
+  is otherwise used as given, and RFC 1123 §2.1 rejections of empty and numeric hosts.
 - Driver obligations (also in the README): bind a fresh UDP socket per query (RFC 5452 §9.2),
   connected to its server, with a new one for each server (§9.1), and pass that query with
   each datagram; report a failed bind, connect, send or receive (ICMP errors) with

@@ -13,6 +13,7 @@ categories = ["network-programming", "asynchronous"]
 autotests = false
 
 [dependencies]
+idna = "1"
 sansio-dns.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "time", "rt", "macros", "io-util", "sync"] }

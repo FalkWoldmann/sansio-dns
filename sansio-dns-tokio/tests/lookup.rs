@@ -30,14 +30,114 @@ async fn finds_both_families(#[case] truncate_udp: bool) {
     assert_eq!(addresses, [IpAddr::V6(V6), IpAddr::V4(V4)]);
 }
 
+/// The whole name goes through UTS 46 processing: the ideographic and
+/// full-width full stops separate labels (RFC 5895 §2, RFC 3490 §3.1), and
+/// `_` stays allowed in a name with non-ASCII labels.
+#[rstest]
+#[case::plain("bücher.example", "xn--bcher-kva.example.")]
+#[case::absolute("bücher.example.", "xn--bcher-kva.example.")]
+#[case::upper_case("BÜCHER.example", "xn--bcher-kva.example.")]
+#[case::ideographic_full_stop("bücher。example", "xn--bcher-kva.example.")]
+#[case::full_width_full_stop("bücher．example", "xn--bcher-kva.example.")]
+#[case::half_width_full_stop("bücher｡example", "xn--bcher-kva.example.")]
+#[case::underscore("my_host.bücher.example", "my_host.xn--bcher-kva.example.")]
+#[case::a_label("xn--bcher-kva.example", "xn--bcher-kva.example.")]
+#[case::a_label_upper_case("XN--BCHER-KVA.example", "xn--bcher-kva.example.")]
+#[case::disallowed_in_idna2008("☃.example", "xn--n3h.example.")]
 #[tokio::test]
-async fn non_ascii_name_is_looked_up_in_its_ascii_form() {
-    let server = name_server("xn--bcher-kva.example.", false).await;
+async fn non_ascii_name_is_looked_up_in_its_ascii_form(#[case] host: &str, #[case] ascii: &str) {
+    let server = name_server(ascii, false).await;
     let resolver = Resolver::new(Config::new(server, []));
 
-    let addresses = resolver.lookup_ip("bücher.example").await.unwrap();
+    let addresses = resolver.lookup_ip(host).await.unwrap();
 
     assert_eq!(addresses, [IpAddr::V6(V6), IpAddr::V4(V4)]);
+}
+
+/// The name a lookup of `host` asks for, as the server sees it.
+async fn asked_name(host: &str) -> String {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut config = Config::new(server.local_addr().unwrap(), []);
+    config.ip_strategy = sansio_dns::IpStrategy::Ipv4Only;
+    let resolver = Resolver::new(config);
+    let lookup = tokio::spawn({
+        let host = host.to_owned();
+        async move { resolver.lookup_ip(&host).await }
+    });
+    let mut buf = [0; 512];
+    let n = server.recv(&mut buf).await.unwrap();
+    lookup.abort();
+    let query = Message::from_vec(&buf[..n]).unwrap();
+    query.queries[0].name().to_ascii()
+}
+
+/// RFC 4343 §4: an ASCII name keeps its case on the wire, A-labels too.
+#[rstest]
+#[case::plain("App.Example", "App.Example.")]
+#[case::a_label("XN--BCHER-KVA.Example", "XN--BCHER-KVA.Example.")]
+#[tokio::test]
+async fn ascii_name_keeps_its_case(#[case] host: &str, #[case] expected: &str) {
+    assert_eq!(asked_name(host).await, expected);
+}
+
+/// RFC 1123 §2.1: labels may start with a digit, and names of up to 255
+/// octets work: 63 characters per label, 253 without the trailing dot.
+#[rstest]
+#[case::digit_first("3com.example".to_owned())]
+#[case::digits_then_a_letter_last("1.2.3.4a".to_owned())]
+#[case::longest_label(format!("{}.example", "a".repeat(63)))]
+#[case::longest_name(format!("{0}.{0}.{0}.{1}", "a".repeat(63), "b".repeat(61)))]
+#[tokio::test]
+async fn host_names_are_looked_up(#[case] host: String) {
+    assert_eq!(asked_name(&host).await, host + ".");
+}
+
+/// Hosts that are no valid name, rejected before anything is sent: the
+/// server here doesn't exist.
+#[rstest]
+#[case::empty("")]
+#[case::root(".")]
+#[case::empty_label("a..example")]
+#[case::short_ipv4_form("127.1")]
+#[case::leading_zero("01.2.3.4")]
+#[case::hexadecimal("0x7f.0.0.1")]
+#[case::octet_too_large("1.2.3.256")]
+#[case::single_number("2130706433")]
+#[case::ipv4_with_trailing_dot("192.0.2.7.")]
+#[case::numeric_last_label("host.123.")]
+#[case::five_numbers_absolute("1.2.3.4.5.")]
+#[case::escaped_dot("127\\.0.0.1")]
+#[case::escaped_dot_in_a_label("a\\.b.example")]
+#[case::escape_in_non_ascii_name("a\\.b.bücher.example")]
+#[case::escaped_a_label_prefix("\\120n--abc.example")]
+#[case::label_too_long(format!("{}.example", "a".repeat(64)))]
+#[case::name_too_long(format!("{0}.{0}.{0}.{1}", "a".repeat(63), "b".repeat(62)))]
+#[case::non_ascii_label_too_long(format!("ü{}.example", "a".repeat(56)))]
+#[case::hyphens_in_third_and_fourth_positions("ab--ü.example")]
+#[case::a_label_with_those_hyphens("xn--ab---3ra.example")]
+#[case::invalid_a_label("xn--zz.example")]
+#[case::combining_mark_first("\u{301}ü.example")]
+#[case::bidi_rule_across_labels("1abc.אב.example")]
+#[case::zone_id("fe80::1%eth0")]
+#[tokio::test]
+async fn invalid_hosts_are_rejected(#[case] host: impl AsRef<str>) {
+    let nowhere = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9);
+    let resolver = Resolver::new(Config::new(nowhere, []));
+
+    let result = resolver.lookup_ip(host.as_ref()).await;
+
+    assert!(matches!(result, Err(Error::InvalidName(_))), "{result:?}");
+}
+
+/// A relative name with a numeric last label, or of more numbers than
+/// `inet_aton` reads, may still be completed by a search domain, so it is
+/// sent.
+#[rstest]
+#[case::numeric_last_label("host.123")]
+#[case::five_numbers("1.2.3.4.5")]
+#[tokio::test]
+async fn relative_numeric_name_is_looked_up(#[case] host: &str) {
+    assert_eq!(asked_name(host).await, format!("{host}."));
 }
 
 #[tokio::test]

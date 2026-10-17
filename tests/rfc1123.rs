@@ -8,7 +8,7 @@ use crate::common::*;
 use hickory_proto::ProtoError;
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::rdata::CNAME;
-use hickory_proto::rr::{Name, RData, Record, RecordType};
+use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use insta::assert_snapshot;
 use rstest::rstest;
 use sansio_dns::{Config, Event, Resolver};
@@ -288,6 +288,27 @@ mod section_6_1_4_3 {
         let alias = response.queries[0].name().clone();
         let target = Name::from_ascii("elsewhere.example.").unwrap();
         response.answers = vec![Record::from_rdata(alias, 300, RData::CNAME(CNAME(target)))];
+        trace.answer(&sent, &response);
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 db A
+          -> S1 udp q0: db.corp.example. A
+          next t=2s
+        t=0s <- S1 udp q0: db.corp.example. A: NoError, 1 answer
+          -> S1 udp q0: db.lab.example. A
+          next t=2s
+        ");
+    }
+
+    /// Records of another class than the one asked for aren't data (RFC
+    /// 1035 §7.4), so an answer that holds only those is NODATA.
+    #[test]
+    fn records_of_another_class_are_nodata() {
+        let mut trace = searching();
+        trace.query("db", RecordType::A);
+        let sent = trace.last();
+        let mut response = reply(&sent);
+        response.answers[0].dns_class = DNSClass::CH;
         trace.answer(&sent, &response);
 
         assert_snapshot!(trace, @"

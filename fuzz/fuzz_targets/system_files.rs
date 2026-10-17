@@ -1,11 +1,12 @@
 //! `Hosts::parse` and `Config::from_resolv_conf` on generated files, mostly
 //! well-formed lines with names from a small set and now and then raw
 //! bytes, then lookups of listed names, short names and special-use names.
-//! Hosts and special-use names must be answered locally with the right
-//! addresses; other names walk the search candidates in glibc's order,
-//! each answered NXDOMAIN, or NODATA for one of them, until the one chosen
-//! to have data. When none has, the walk ends on the NODATA answer if there
-//! was one.
+//! Hosts and special-use names, and link-local names none of whose search
+//! candidates is sent, must be answered locally with the right addresses;
+//! other names walk the search candidates in glibc's order, link-local ones
+//! left out, each answered NXDOMAIN, or NODATA for one of them, until the
+//! one chosen to have data. When none has, the walk ends on the NODATA
+//! answer if there was one.
 
 #![no_main]
 
@@ -33,13 +34,18 @@ const LABELS: [&str; 8] = [
     "onion",
 ];
 
-const SPECIAL: [&str; 6] = [
+const SPECIAL: [&str; 11] = [
     "localhost.",
     "db.localhost",
     "LocalHost.",
     "foo.invalid.",
     "invalid",
     "x.onion.",
+    "printer.local.",
+    "a.corp.local",
+    "db.local",
+    "34.12.254.169.in-addr.arpa.",
+    "1.0.a.e.f.ip6.arpa.",
 ];
 
 #[derive(Arbitrary, Debug)]
@@ -153,8 +159,39 @@ fn is_special_use(name: &Name) -> bool {
         .any(|zone| zone.name().zone_of(name))
 }
 
+/// The zones RFC 6762 reserves for multicast DNS.
+fn link_local_zones() -> Vec<Name> {
+    [
+        "local.",
+        "254.169.in-addr.arpa.",
+        "8.e.f.ip6.arpa.",
+        "9.e.f.ip6.arpa.",
+        "a.e.f.ip6.arpa.",
+        "b.e.f.ip6.arpa.",
+    ]
+    .iter()
+    .map(|zone| Name::from_ascii(zone).expect("a valid fixed name"))
+    .collect()
+}
+
+/// Whether `name` doesn't go to the servers: special-use, or link-local
+/// and not under a search domain strictly under a link-local zone (no
+/// `unicast_local_zones` here).
+fn never_sent(name: &Name, search: &[Name]) -> bool {
+    let zones = link_local_zones();
+    let link_local = zones.iter().any(|zone| zone.zone_of(name));
+    let served = search.iter().any(|domain| {
+        let under = zones
+            .iter()
+            .any(|zone| zone.zone_of(domain) && zone.num_labels() < domain.num_labels());
+        under && domain.zone_of(name)
+    });
+    is_special_use(name) || (link_local && !served)
+}
+
 /// The names glibc's `res_search` tries for `name`, in order, leaving out
-/// those under special-use zones.
+/// those that are never sent, the name as given among them. A name tried
+/// only as given is kept: the local answer covers it.
 fn candidates(name: &Name, search: &[Name], ndots: u8) -> Vec<Name> {
     let mut absolute = name.clone();
     absolute.set_fqdn(true);
@@ -163,23 +200,34 @@ fn candidates(name: &Name, search: &[Name], ndots: u8) -> Vec<Name> {
     }
     let searched = search
         .iter()
-        .filter_map(|domain| name.clone().append_domain(domain).ok())
-        .filter(|candidate| !is_special_use(candidate));
+        .filter_map(|domain| name.clone().append_domain(domain).ok());
     let dots = usize::from(name.num_labels()).saturating_sub(1);
-    if dots >= usize::from(ndots) {
+    let all: Vec<Name> = if dots >= usize::from(ndots) {
         std::iter::once(absolute).chain(searched).collect()
     } else {
         searched.chain(std::iter::once(absolute)).collect()
-    }
+    };
+    all.into_iter()
+        .filter(|candidate| !never_sent(candidate, search))
+        .collect()
 }
 
-/// The local answer for `name`, if any: its response code and addresses.
+/// The local answer for `name`, as given, if any: its response code and
+/// addresses. Special-use names and the hosts file are checked as given;
+/// a link-local name gets NXDOMAIN when it is never sent and tried only as
+/// given, or when none of its `candidates` is left.
 fn local_answer(
     name: &Name,
     record_type: RecordType,
     hosts: &Hosts,
+    search: &[Name],
+    candidates: &[Name],
 ) -> Option<(ResponseCode, Vec<IpAddr>)> {
     let v4 = record_type == RecordType::A;
+    let mut absolute = name.clone();
+    absolute.set_fqdn(true);
+    let as_given = name.is_fqdn() || search.is_empty();
+    let name = &absolute;
     if is_special_use(name) {
         let loopback = if v4 {
             IpAddr::V4(Ipv4Addr::LOCALHOST)
@@ -192,9 +240,16 @@ fn local_answer(
             (ResponseCode::NXDomain, Vec::new())
         });
     }
-    let listed = hosts.lookup(name)?;
-    let family = listed.into_iter().filter(|a| a.is_ipv4() == v4).collect();
-    Some((ResponseCode::NoError, family))
+    if let Some(listed) = hosts.lookup(name) {
+        let family = listed.into_iter().filter(|a| a.is_ipv4() == v4).collect();
+        return Some((ResponseCode::NoError, family));
+    }
+    let unsent = if as_given {
+        never_sent(name, search)
+    } else {
+        candidates.is_empty()
+    };
+    unsent.then(|| (ResponseCode::NXDomain, Vec::new()))
 }
 
 fuzz_target!(|input: Input<'_>| {
@@ -230,10 +285,8 @@ fuzz_target!(|input: Input<'_>| {
         } else {
             RecordType::A
         };
-        let mut absolute = name.clone();
-        absolute.set_fqdn(true);
-        let local = local_answer(&absolute, record_type, &hosts);
         let expected = candidates(&name, &search, ndots);
+        let local = local_answer(&name, record_type, &hosts, &search, &expected);
         let found = step.found.map(usize::from);
         let nodata = step.nodata.map(usize::from).filter(|n| found != Some(*n));
         let Some(query) = harness.query(name, record_type) else {
@@ -291,7 +344,11 @@ fuzz_target!(|input: Input<'_>| {
         match &local {
             Some((local_code, local_addresses)) => {
                 assert_eq!(code, *local_code, "wrong local response code");
-                assert_eq!(&addresses(response), local_addresses, "wrong local answer");
+                assert_eq!(
+                    addresses(response).as_ref(),
+                    Ok(local_addresses),
+                    "wrong local answer"
+                );
             }
             None => {
                 let last = found.filter(|f| *f < expected.len());
@@ -309,7 +366,7 @@ fuzz_target!(|input: Input<'_>| {
                     "search walk ended on the wrong candidate"
                 );
                 assert_eq!(
-                    addresses(response).is_empty(),
+                    addresses(response).is_ok_and(|found| found.is_empty()),
                     last.is_none(),
                     "addresses only from the candidate with data"
                 );

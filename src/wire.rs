@@ -4,6 +4,7 @@
 #[cfg(feature = "tls")]
 use std::net::{IpAddr, SocketAddr};
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::LazyLock;
 
 #[cfg(feature = "tls")]
 use hickory_proto::ProtoError;
@@ -12,7 +13,7 @@ use hickory_proto::rr::domain::usage::{INVALID, LOCALHOST, ONION};
 #[cfg(feature = "tls")]
 use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
 use hickory_proto::rr::rdata::{A, AAAA};
-use hickory_proto::rr::{Name, RData, Record, RecordType};
+use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
 
 /// EDNS UDP payload size recommended by DNS Flag Day 2020.
@@ -78,19 +79,54 @@ pub(crate) fn pad(request: &mut Message) -> Result<(), ProtoError> {
     Ok(())
 }
 
-/// Whether `name` is under a zone that must not reach a unicast server.
+/// Whether `name` is under `localhost.`, `invalid.` or `onion.`, whose
+/// names are answered locally whatever the configuration: loopback for
+/// `localhost` names (RFC 6761 §6.3), NXDOMAIN for the others (RFC 6761
+/// §6.4, RFC 7686 §2).
 pub(crate) fn is_special_use(name: &Name) -> bool {
     [&LOCALHOST, &INVALID, &ONION]
         .iter()
         .any(|z| z.name().zone_of(name))
 }
 
-/// The local answer for a special-use name, or `None` for any other name.
-pub(crate) fn special_use(name: &Name, record_type: RecordType) -> Option<Message> {
-    if !is_special_use(name) {
-        return None;
-    }
-    let localhost = LOCALHOST.name().zone_of(name);
+/// The zones that RFC 6762 reserves for multicast DNS: `local.` (§3) and
+/// the reverse zones of the IPv4 and IPv6 link-local addresses (§4).
+static LINK_LOCAL_ZONES: LazyLock<Vec<Name>> = LazyLock::new(|| {
+    [
+        "local.",
+        "254.169.in-addr.arpa.",
+        "8.e.f.ip6.arpa.",
+        "9.e.f.ip6.arpa.",
+        "a.e.f.ip6.arpa.",
+        "b.e.f.ip6.arpa.",
+    ]
+    .iter()
+    .filter_map(|zone| Name::from_ascii(zone).ok())
+    .collect()
+});
+
+/// Whether `name` is in one of the six zones RFC 6762 reserves for
+/// multicast DNS, which a library should not send to its unicast servers
+/// (§22.1 item 3).
+pub(crate) fn is_link_local(name: &Name) -> bool {
+    LINK_LOCAL_ZONES.iter().any(|zone| zone.zone_of(name))
+}
+
+/// Whether `name` is strictly under one of the zones of [`is_link_local`],
+/// not the zone itself: a domain such as `cluster.local.` that unicast
+/// servers serve.
+pub(crate) fn is_under_link_local(name: &Name) -> bool {
+    LINK_LOCAL_ZONES
+        .iter()
+        .any(|zone| zone.zone_of(name) && zone.num_labels() < name.num_labels())
+}
+
+/// The local answer for a name that isn't sent: for a `localhost` name the
+/// loopback address of the type asked for and a negative answer (NODATA)
+/// for every other type (RFC 6761 §6.3), and NXDOMAIN for any other name
+/// (RFC 6761 §6.4, RFC 7686 §2, RFC 6762 §22.1 item 4).
+pub(crate) fn local_answer(name: &Name, record_type: RecordType) -> Message {
+    let localhost = is_localhost(name);
     let mut response = Message::response(0, OpCode::Query);
     response.add_query(Query::query(name.clone(), record_type));
     response.metadata.response_code = if localhost {
@@ -106,7 +142,12 @@ pub(crate) fn special_use(name: &Name, record_type: RecordType) -> Option<Messag
     response
         .answers
         .extend(loopback.map(|data| Record::from_rdata(name.clone(), 0, data)));
-    Some(response)
+    response
+}
+
+/// Whether `name` is a `localhost` name (RFC 6761 §6.3).
+pub(crate) fn is_localhost(name: &Name) -> bool {
+    LOCALHOST.name().zone_of(name)
 }
 
 /// A message from a server, decoded as far as it goes.
@@ -195,31 +236,43 @@ impl Reply {
 }
 
 /// The names from `response`'s question name along its CNAME chain, in
-/// order (RFC 1034 §3.6.2). A chain can't be longer than the answer
-/// section; this also ends loops.
+/// order (RFC 1034 §3.6.2), following only CNAME records of the question's
+/// class (RFC 1035 §7.4). A chain can't be longer than the answer section;
+/// this also ends loops.
 pub(crate) fn chain(response: &Message) -> impl Iterator<Item = Name> {
-    let target = |name: &Name| {
+    let question = response.queries.first();
+    let target = move |name: &Name| {
         response.answers.iter().find_map(|r| match &r.data {
-            RData::CNAME(target) if r.name == *name => Some(target.0.clone()),
+            RData::CNAME(target) if r.name == *name && question.is_some_and(|q| in_class(q, r)) => {
+                Some(target.0.clone())
+            }
             _ => None,
         })
     };
-    let first = response.queries.first().map(|q| q.name().clone());
+    let first = question.map(|q| q.name().clone());
     std::iter::successors(first, target).take(response.answers.len() + 1)
 }
 
-/// Whether `response` has records of the type asked for, owned by the
-/// question name or a name on its CNAME chain; any type for ANY. A
+/// Whether `record` is of the class `question` asks for, any class for
+/// ANY.
+pub(crate) fn in_class(question: &Query, record: &Record) -> bool {
+    question.query_class() == DNSClass::ANY || record.dns_class == question.query_class()
+}
+
+/// Whether `response` has records of the type and class asked for, owned
+/// by the question name or a name on its CNAME chain; any type for ANY. A
 /// `NOERROR` answer without them is NODATA (RFC 2308 §2.2).
 pub(crate) fn has_data(response: &Message) -> bool {
-    let Some(asked) = response.queries.first().map(Query::query_type) else {
+    let Some(question) = response.queries.first() else {
         return false;
     };
+    let asked = question.query_type();
     let names: Vec<Name> = chain(response).collect();
-    response
-        .answers
-        .iter()
-        .any(|r| (asked == RecordType::ANY || r.record_type() == asked) && names.contains(&r.name))
+    response.answers.iter().any(|r| {
+        (asked == RecordType::ANY || r.record_type() == asked)
+            && in_class(question, r)
+            && names.contains(&r.name)
+    })
 }
 
 /// Whether `response` is an empty answer from a server that neither

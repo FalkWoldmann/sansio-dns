@@ -15,7 +15,7 @@ use crate::config::MAX_SENDS_PER_SERVER;
 use crate::tls;
 use crate::wire::{
     EDNS_PAYLOAD, Reply, clamp_ttls, frame, has_data, is_meta_type, is_referral, is_special_use,
-    special_use,
+    local_answer,
 };
 #[cfg(feature = "tls")]
 use crate::wire::{is_protected_for, protect};
@@ -278,7 +278,8 @@ impl Resolver {
     /// the [`Config::search`] domains, ordered by [`Config::ndots`], until
     /// one has data of `record_type` (RFC 1123 §6.1.4.3): the next candidate
     /// is tried after NXDOMAIN and after NODATA, a `NOERROR` answer without
-    /// records of that type at the end of the CNAME chain (RFC 2308 §2.2).
+    /// records of that type and class at the end of the CNAME chain (RFC
+    /// 2308 §2.2, RFC 1035 §7.4).
     /// glibc's `res_search` moves on after NODATA only when the answer
     /// section is empty, and stops at a CNAME whose target has no data.
     /// When the candidates run out, the event carries the first NODATA
@@ -289,18 +290,34 @@ impl Resolver {
     /// name as given (trailing dot included, case ignored) joins one in
     /// flight.
     ///
-    /// Special-use names are answered at once, without a transmit:
-    /// `localhost` gets the loopback address (RFC 6761 §6.3), and names
-    /// under `invalid.` and `onion.` get NXDOMAIN (RFC 6761 §6.4, RFC 7686
-    /// §2). Names under `local.` go to the name servers like any other:
-    /// RFC 6762 §3 reserves them for mDNS, but Kubernetes (`cluster.local`)
-    /// and many corporate networks serve them over unicast DNS, which is
-    /// what glibc does without nss-mdns. mDNS is up to the caller.
+    /// Some names are answered at once, without a transmit, in this order:
     ///
-    /// Names listed in [`Config::hosts`] are answered from there for A and
-    /// AAAA queries, with the addresses of that family (possibly none), as
-    /// glibc's `hosts: files dns` does. The name is matched as given, before
-    /// any search domain.
+    /// - `localhost` names get the loopback address for A and AAAA and
+    ///   NODATA for other types (RFC 6761 §6.3), and names under
+    ///   `invalid.` and `onion.` get NXDOMAIN (RFC 6761 §6.4, RFC 7686 §2),
+    ///   whatever [`Config::hosts`] says, checked for the name as given,
+    ///   before any search domain.
+    /// - Names listed in [`Config::hosts`] are answered from there for A
+    ///   and AAAA queries, with the addresses of that family (possibly
+    ///   none), as glibc's `hosts: files dns` does. Only the name as given
+    ///   is looked up there.
+    /// - Names under `local.` and the link-local reverse zones, which RFC
+    ///   6762 reserves for multicast DNS (§3, §4), get NXDOMAIN (§22.1
+    ///   items 3 and 4), unless they are under a search domain that is
+    ///   itself under one of these zones, such as Kubernetes'
+    ///   `cluster.local.`, or under [`Config::unicast_local_zones`]. Those
+    ///   go to the name servers. Multicast DNS is up to the caller. RFC
+    ///   6762 §3 makes no difference between a `.local.` suffix typed and
+    ///   one added from the search list, so this rule applies to each
+    ///   search candidate, the name as given among them: a relative name
+    ///   gets NXDOMAIN at once only when none of its candidates is left.
+    ///   With search domain `cluster.local.`, `db.local` is sent as
+    ///   `db.local.cluster.local.`.
+    ///
+    /// Other names under special-use zones, such as `test.`, `example.`,
+    /// `home.arpa.` or `alt.`, are sent like any other (RFC 6761 §6.2,
+    /// §6.5, RFC 8375 §4, RFC 9476 §3.2). Search candidates that the first
+    /// or the last rule would answer are left out.
     ///
     /// A query for the same name and type as one still in flight (compared
     /// as given, before search domains) joins it: nothing is sent for it,
@@ -337,12 +354,14 @@ impl Resolver {
         self.start(name, record_type, false, now)
     }
 
-    /// Whether `name`, as given, is answered without the network: a
-    /// special-use name, or one listed in [`Config::hosts`].
+    /// Whether `name`, as given, is answered without the network: see
+    /// [`Resolver::query`].
     pub(crate) fn is_local(&self, name: &Name) -> bool {
         let mut absolute = name.clone();
         absolute.set_fqdn(true);
-        is_special_use(&absolute) || self.config.hosts.lookup(&absolute).is_some()
+        is_special_use(&absolute)
+            || self.config.hosts.lookup(&absolute).is_some()
+            || self.config.never_sent_as_given(name)
     }
 
     /// [`Resolver::query`], with `hosts` deciding whether
@@ -359,16 +378,23 @@ impl Resolver {
                 "zone transfer and meta query types aren't supported",
             ));
         }
-        let asked = (name.clone(), record_type);
-        let mut absolute = name;
+        let mut absolute = name.clone();
         absolute.set_fqdn(true);
         let id = QueryId(self.next_query);
         self.next_query += 1;
-        let local = special_use(&absolute, record_type).or_else(|| {
+        let local = if is_special_use(&absolute) {
+            Some(local_answer(&absolute, record_type))
+        } else {
             hosts
                 .then(|| self.config.hosts.answer(&absolute, record_type))
                 .flatten()
-        });
+                .or_else(|| {
+                    self.config
+                        .never_sent_as_given(&name)
+                        .then(|| local_answer(&absolute, record_type))
+                })
+        };
+        let asked = (name, record_type);
         if let Some(response) = local {
             self.events.push_back(Event::Response {
                 query: id,
@@ -788,9 +814,9 @@ impl Resolver {
         }
     }
 
-    /// The current search candidate has no data of the type asked for: it
-    /// doesn't exist (`NXDOMAIN`), or `response` is NODATA. Try the next
-    /// candidate; when there is none, the first NODATA answer is the
+    /// The current search candidate has no data of the type and class asked
+    /// for: it doesn't exist (`NXDOMAIN`), or `response` is NODATA. Try the
+    /// next candidate; when there is none, the first NODATA answer is the
     /// outcome, as glibc reports NO_DATA over HOST_NOT_FOUND, and otherwise
     /// `response`.
     fn search_on(&mut self, id: QueryId, response: Message, now: Instant) {
