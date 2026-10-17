@@ -126,7 +126,8 @@ impl Session {
 
     /// Feed bytes read from the connection, or fail with the TLS error (a
     /// bad certificate, say). After an error, [`Session::close`] returns
-    /// the alert that tells the server.
+    /// the alert that tells the server, if rustls queued one, and otherwise
+    /// close_notify.
     pub(crate) fn receive(&mut self, mut data: &[u8]) -> Result<Received, String> {
         let mut plaintext = Vec::new();
         let mut closed = false;
@@ -166,9 +167,10 @@ impl Session {
         })
     }
 
-    /// The last bytes to send before closing the connection: the
-    /// close_notify alert (RFC 8446 §6.1), or after a TLS error the alert
-    /// rustls queued for it, which already ends the session (§6.2).
+    /// The last bytes to send before closing the connection: the alert
+    /// rustls queued for a TLS error, which already ends the session (RFC
+    /// 8446 §6.2), or, if it queued none, the close_notify alert (§6.1).
+    /// Empty if rustls can't produce them.
     pub(crate) fn close(&mut self) -> Vec<u8> {
         self.connection.send_close_notify();
         let mut out = Vec::new();

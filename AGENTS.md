@@ -95,15 +95,17 @@ outputs are drained with `poll_transmit`, `poll_event` and `poll_timeout`.
   `src/tls.rs`; the driver only moves bytes. Queries written during the handshake wait in the
   session's own queue, not rustls' 64 KiB buffer, and `Session::receive` drains the plaintext
   after every record batch (rustls holds 16 KiB). Every close the resolver starts goes through
-  `shut`, which sends the session's close_notify, or the alert of a TLS error, as a `TcpWrite`
-  before the `TcpClose` (RFC 8446 §6); the server's close_notify retires the connection like
-  `handle_stream_closed` (`shut`, then `move_off`), after the answers decrypted with it, which
-  can't send on it (`Connection::closing`, skipped by `emit` and `channel` through
-  `Connection::is_open_to`). `shutdown` drops every query and shuts every connection, for a
-  driver that stops. Over TLS, `wire::protect` adds the EDNS
-  Client Subnet privacy option (prefix 0, FAMILY of the server's address, RFC 8310 §11.1) and
-  then the padding, last; `emit` runs it again when a query moves to a server of the other
-  family. `Config::with_tls_names` holds an authentication name per server.
+  `shut`, which sends the alert rustls queued for a TLS error, or else the session's
+  close_notify, as a `TcpWrite` before the `TcpClose` (RFC 8446 §6). A TLS error on received
+  bytes or a refused write aborts the connection: `abort` calls `shut`, then `retry` for each
+  query on it. The server's close_notify retires the connection like `handle_stream_closed`
+  (`shut`, then `move_off`), after the answers decrypted with it, which can't send on it
+  (`Connection::closing`, skipped by `emit` and `channel` through `Connection::is_open_to`).
+  `shutdown` drops every query and shuts every connection, for a driver that stops. Over TLS,
+  `wire::protect` adds the EDNS Client Subnet privacy option (prefix 0, FAMILY of the
+  server's address, RFC 8310 §11.1) and then the padding, last; `emit` runs it again when a
+  query moves to a server of the other family. `Config::with_tls_names` holds an
+  authentication name per server.
 - Replies go through `handle_reply`. A truncated one over UDP switches the query to TCP
   (`switch_to_tcp`), even if its records don't decode. Any other reply whose header and
   question match but whose records don't decode (`wire::Reply::Broken`) is a server error
@@ -118,29 +120,28 @@ outputs are drained with `poll_transmit`, `poll_event` and `poll_timeout`.
   both through `advance`, which gives up once out of attempts or servers; `switch_to_tcp`
   and `drop_edns` (same server, free), the resends in `move_off` (same server, free every time
   if the connection answered after the query was written, else once per query via
-  `forgive`) and `time_out_stream` (once, via the same `forgive`), `next_candidate` (next
-  search name, fresh attempts, no exclusions), `give_up` and `finish`. `emit` counts every
-  send in `Pending::sends`: a search candidate goes at most three times to a server over one
-  transport (RFC 9520 §3.1), so `advance` skips servers without room (in `step`), and the
-  free sends, a cancel hand-over's resend included, check `Pending::may_send` first (`cancel`
-  directly, the others through `may_resend`) and move on instead. Only `emit` sets a query's
-  deadline (`Config::deadline`; `new_pending` leaves a placeholder): every caller passes
-  `Deadline::Fresh` except `time_out_stream`'s free resend, which passes `Deadline::Kept`.
-  The crate docs' "How a
-  query moves on" table states the rules (at most `attempts + 3` sends per search
-  candidate, not counting a cancel hand-over's resend or the resends after a lost connection
-  that answered since, and at most three per server and transport, all of those included),
-  and a comment above `retry` maps each row to its function: change these functions
-  together and keep the table in sync.
+  `use_free_resend`) and `time_out_stream` (once, via the same `use_free_resend`),
+  `next_candidate` (next search name, fresh attempts, no exclusions), `give_up` and
+  `finish`. `emit` counts every send in `Pending::sends`: a search candidate goes at most
+  three times to a server over one transport (RFC 9520 §3.1), so `advance` skips servers
+  without room (in `try_advance`), and the free sends, a cancel hand-over's resend included,
+  check `Pending::may_send` first (`cancel` directly, the others through `may_resend`) and
+  move on instead. Only `emit` sets a query's deadline (`Config::deadline`; `new_pending`
+  leaves a placeholder): every caller passes `Deadline::Fresh` except `time_out_stream`'s
+  free resend, which passes `Deadline::Kept`. The crate docs' "How a query moves on" table
+  states the rules (at most `attempts + 3` sends per search candidate, not counting a cancel
+  hand-over's resend or the resends after a lost connection that answered since, and at most
+  three per server and transport, all of those included), and a comment above `retry` maps
+  each row to its function: change these functions together and keep the table in sync.
 - Every wait is bounded (RFC 1123 §6.1.3.3): `Config::wait` keeps a deadline between 1 s
   and 300 s after backoff, and `Config::failed_for` caps the failure memory at 5
   minutes (RFC 9520 §3.2). Deadlines are plain `Instant`s; nothing waits forever.
 - A query for the same name (as given) and type as a pending one joins it as a
   follower (`Pending::followers`) and gets its outcome, failures included however late it
   joined; `cancel(id, now)` hands a query with followers to the first of them, re-sending a
-  UDP attempt from the follower's own socket. An heir with no room left moves on by `step`
-  (`advance` without `give_up`), and with no server left fails without caching the
-  `Timeout`: the server may have answered the cancelled queries' sockets.
+  UDP attempt from the follower's own socket. An heir with no room left moves on by
+  `try_advance` (`advance` without `give_up`), and with no server left fails without caching
+  the `Timeout`: the server may have answered the cancelled queries' sockets.
 - `src/cache.rs` caches resolution failures (RFC 9520 §3.2) and negative answers (RFC 2308
   §5) in a `BTreeMap` keyed by the question as sent: the lowercased absolute candidate, the
   class, and the type, or `None` for an NXDOMAIN, which holds for every type. `Entry` is

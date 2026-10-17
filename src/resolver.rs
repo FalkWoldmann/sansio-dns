@@ -72,14 +72,17 @@ struct Pending {
     /// The first NODATA answer of an earlier search candidate: the outcome
     /// if no later one has data.
     nodata: Option<Message>,
-    /// Whether its attempt was already sent again for free, after losing a
-    /// connection that had answered only before it was written, or being
-    /// moved off a closed one (`Resolver::time_out_stream`). The two share
-    /// it: after one free resend, from either, the next one from either
-    /// uses up an attempt. Reset for each search candidate; see
-    /// `Resolver::forgive`. A connection lost after any response arrived on
-    /// it since this query was written gives a free resend without it.
-    forgiven: bool,
+    /// Whether its attempt was already sent again for free, after its
+    /// connection, which had answered only before the attempt was written
+    /// or took its request back, was lost or ended by the server's
+    /// close_notify (`Resolver::move_off`), or after being moved off a
+    /// connection the resolver shut (`Resolver::time_out_stream`). The two
+    /// share it: after one free resend, from either, the next one from
+    /// either uses up an attempt. Reset for each search candidate; set by
+    /// `Resolver::use_free_resend`. A connection lost or ended by
+    /// close_notify after a response arrived on it since then gives a free
+    /// resend without it.
+    free_resend_used: bool,
     /// The name and type as asked, before search domains. A later query
     /// for the same two joins this one instead of being sent. hickory's
     /// `Name` equality ignores case but not the trailing dot.
@@ -537,7 +540,8 @@ impl Resolver {
     /// the session first, which may queue a [`Transport::TcpWrite`]: the
     /// rest of the handshake, and then the queries that waited for it. A
     /// TLS error closes the connection, after the alert rustls queued for
-    /// it (RFC 8446 §6.2), and moves its queries on to their next attempt.
+    /// it (RFC 8446 §6.2), or its close_notify if it queued none, and moves
+    /// its queries on to their next attempt.
     /// When the server's close_notify arrives, the answers before it count
     /// and anything after it is ignored (RFC 8446 §6.1): the resolver
     /// sends its own close_notify, closes the connection and moves its
@@ -553,7 +557,7 @@ impl Resolver {
         let Incoming { to_send, closed } = match conn.receive(data) {
             Ok(incoming) => incoming,
             Err(error) => {
-                self.close(connection, now, &error);
+                self.abort(connection, now, &error);
                 return;
             }
         };
@@ -753,7 +757,7 @@ impl Resolver {
                 self.pending.insert(heir, pending);
                 if room {
                     self.emit(heir, now, Deadline::Fresh);
-                } else if !self.step(heir, now) {
+                } else if !self.try_advance(heir, now) {
                     // Not a resolution failure (RFC 9520 §2): the server may
                     // well have answered, to the cancelled queries' sockets.
                     self.finish(heir, Err(Error::Timeout));
@@ -946,7 +950,7 @@ impl Resolver {
             sends: Vec::new(),
             rest,
             nodata: None,
-            forgiven: false,
+            free_resend_used: false,
             asked,
             started: now,
             followers: Vec::new(),
@@ -1130,22 +1134,23 @@ impl Resolver {
     // - connection lost after it answered, or closed by the server's
     //   close_notify (`handle_stream_data`): `move_off`, by way of `lost`
     //   or `shut`, then `emit` again, for free every time if it answered
-    //   after the query was written (`written_after` in `Route::Stream`),
-    //   else once by way of `forgive`
+    //   after the query was written or took its request back
+    //   (`written_after` in `Route::Stream`), else once by way of
+    //   `use_free_resend`
     // - neighbour timed out on the connection, or it was closed for holding
-    //   too many orphans: `time_out_stream`, then `forgive` and `emit` (the
-    //   same `forgiven` flag), else `retry`
+    //   too many orphans: `time_out_stream`, then `use_free_resend` and
+    //   `emit` (the same `free_resend_used` flag), else `retry`
     // - connection that never answered lost, TLS error on received bytes,
-    //   TLS write refused (`emit`): `move_off` or `close`, then `retry`
+    //   TLS write refused (`emit`): `move_off` or `abort`, then `retry`
     // - NXDOMAIN or NODATA, with candidates left: `search_on`, then
     //   `next_candidate`, which resets all of the above with a new
     //   `Pending`
     // - joined query cancelled: `cancel`, limited only by the rule below
     //   (each hand-over over UDP sends again; the crate docs' `attempts + 3`
-    //   bound leaves it out); an heir without room moves on by `step`, and
-    //   with no server left fails through `finish`, not cached
-    //   (`give_up`), since the server may have answered the cancelled
-    //   queries' sockets
+    //   bound leaves it out); an heir without room moves on by
+    //   `try_advance`, and with no server left fails through `finish`, not
+    //   cached (`give_up`), since the server may have answered the
+    //   cancelled queries' sockets
     // - out of attempts, or every server excluded or without room: `advance`
     //   calls `give_up`, which caches the failure for the search candidate
     //   (`Cache::failed`, RFC 9520 §3.2) and fails the query and every
@@ -1165,13 +1170,13 @@ impl Resolver {
     // in `Pending::sends`, and no search candidate goes to a server over a
     // channel more than three times (RFC 9520 §3.1). `Pending::may_send`
     // checks the room left on the channel `channel` picks for a send:
-    // `step` skips servers without room (for `advance`, and for `cancel`
-    // when it moves on), `cancel` checks it before a hand-over's resend,
-    // and `drop_edns`, `move_off` and `time_out_stream` check it through
-    // `may_resend` before a free send, and so does
+    // `try_advance` skips servers without room (for `advance`, and for
+    // `cancel` when it moves on), `cancel` checks it before a hand-over's
+    // resend, and `drop_edns`, `move_off` and `time_out_stream` check it
+    // through `may_resend` before a free send, and so does
     // `switch_to_tcp`, since earlier attempts may have gone to an open
     // connection. They move on as `retry` (`move_off`, `time_out_stream`),
-    // `advance` (`drop_edns`, `switch_to_tcp`) or `step` (`cancel`)
+    // `advance` (`drop_edns`, `switch_to_tcp`) or `try_advance` (`cancel`)
     // instead. That check is all that bounds the resends after a lost
     // connection that answered since.
 
@@ -1209,14 +1214,15 @@ impl Resolver {
     /// attempt stays off UDP (RFC 7858 §3): `emit` opens or reuses a
     /// connection to the new server.
     fn advance(&mut self, id: QueryId, now: Instant, error: Error) {
-        if !self.step(id, now) {
+        if !self.try_advance(id, now) {
             self.give_up(id, error, now);
         }
     }
 
     /// Send `id`'s next attempt as `advance` does, or return false, leaving
-    /// it in place, if it is out of attempts or no server is left.
-    fn step(&mut self, id: QueryId, now: Instant) -> bool {
+    /// it pending for the caller to fail, if it is out of attempts or no
+    /// server is left.
+    fn try_advance(&mut self, id: QueryId, now: Instant) -> bool {
         let (config, connections) = (&self.config, &self.connections);
         let Some(pending) = self.pending.get_mut(&id) else {
             return true;
@@ -1362,8 +1368,8 @@ impl Resolver {
     /// open at the last timeout. Over TLS, the query is first prepared for
     /// the server's address family (`protect`). Fails the query if a TLS
     /// session can't be started. If a TLS session refuses the write, the
-    /// connection is closed as after a TLS error, and the query moves on
-    /// with the others on it.
+    /// connection is aborted as after a TLS error on received bytes
+    /// (`abort`), and the query moves on with the others on it.
     ///
     /// With `Deadline::Fresh` the query's deadline starts over, also for an
     /// attempt that takes its request back, though nothing is then written
@@ -1439,7 +1445,7 @@ impl Resolver {
         let written = self.write(connection, &message, now);
         self.written(id, connection);
         if let Err(error) = written {
-            self.close(connection, now, &error);
+            self.abort(connection, now, &error);
         }
     }
 
@@ -1597,14 +1603,20 @@ impl Resolver {
         }
     }
 
-    /// Move the queries on `connection`, which the server closed after
-    /// `responses` responses, as [`Resolver::handle_stream_closed`] says.
+    /// Move the queries on `connection`, which was lost (`lost`) or ended
+    /// by the server's close_notify after `responses` responses, as
+    /// [`Resolver::handle_stream_closed`] says: a query with room to go to
+    /// its server again (`may_resend`) is sent again for free if a
+    /// response arrived since it was written or took its request back
+    /// (`written_after`), or, if one arrived only before, by using up its
+    /// free resend (`use_free_resend`); any other query moves on (`retry`)
+    /// with `error`.
     fn move_off(&mut self, connection: ConnectionId, responses: u64, now: Instant, error: &Error) {
         for id in self.queries_on(connection) {
             let progress = self.pending.get(&id).is_some_and(|p| {
                 matches!(p.route, Route::Stream { written_after, .. } if responses > written_after)
             });
-            if self.may_resend(id) && (progress || (responses > 0 && self.forgive(id))) {
+            if self.may_resend(id) && (progress || (responses > 0 && self.use_free_resend(id))) {
                 self.emit(id, now, Deadline::Fresh);
             } else {
                 self.retry(id, now, error.clone());
@@ -1630,15 +1642,18 @@ impl Resolver {
     /// their attempt, since another lookup's slow answer is no fault of
     /// theirs. They keep their deadline too: they have been waiting on the
     /// same unresponsive server, and a free move must not stretch how long
-    /// it can hold them. Only once per query, so a server that stops
-    /// answering costs each query a bounded number of sends.
+    /// it can hold them. The move uses up their free resend
+    /// (`use_free_resend`), and one that has used it already, or has no
+    /// room to go to its server again (`may_resend`), moves on instead, so
+    /// a server that stops answering costs each query a bounded number of
+    /// sends.
     fn time_out_stream(&mut self, connection: ConnectionId, now: Instant) {
         if self.shut(connection).is_none() {
             return;
         }
         for id in self.queries_on(connection) {
             let expired = self.pending.get(&id).is_some_and(|p| p.deadline <= now);
-            if !expired && self.may_resend(id) && self.forgive(id) {
+            if !expired && self.may_resend(id) && self.use_free_resend(id) {
                 self.emit(id, now, Deadline::Kept);
             } else {
                 self.retry(id, now, Error::Timeout);
@@ -1654,16 +1669,22 @@ impl Resolver {
             .is_some_and(|p| p.may_send(p.server(&self.config), &self.connections))
     }
 
-    /// Whether `id` may send its attempt again for free, which it may once.
-    fn forgive(&mut self, id: QueryId) -> bool {
+    /// Use up `id`'s free resend (`Pending::free_resend_used`), which it
+    /// has once per search candidate: true if it still had it, false if it
+    /// had used it already or `id` isn't pending.
+    fn use_free_resend(&mut self, id: QueryId) -> bool {
         self.pending
             .get_mut(&id)
-            .is_some_and(|p| !std::mem::replace(&mut p.forgiven, true))
+            .is_some_and(|p| !std::mem::replace(&mut p.free_resend_used, true))
     }
 
-    /// Ask the driver to close `connection`, after a TLS error, and move
-    /// its queries on to their next attempt.
-    fn close(&mut self, connection: ConnectionId, now: Instant, error: &Error) {
+    /// Abort `connection`, whose TLS session failed with `error` while
+    /// taking in bytes read from it (`handle_stream_data`) or on a write
+    /// (`emit`): shut it (`shut`), then `retry` every query on it, which
+    /// fails one that is out of attempts or servers with `error`. Not a TCP
+    /// reset: the driver gets the same [`Transport::TcpClose`] as for any
+    /// other close.
+    fn abort(&mut self, connection: ConnectionId, now: Instant, error: &Error) {
         if self.shut(connection).is_none() {
             return;
         }
@@ -1672,11 +1693,12 @@ impl Resolver {
         }
     }
 
-    /// Forget `connection` and ask the driver to close it. A TLS session
-    /// first sends its close_notify alert (RFC 8446 §6.1), or after a TLS
-    /// error the alert for that error, which ends the session instead
-    /// (§6.2), as a [`Transport::TcpWrite`] the driver writes before
-    /// closing.
+    /// Forget `connection` and ask the driver to close it. With TLS, the
+    /// session's last bytes, if it has any, go first, as a
+    /// [`Transport::TcpWrite`] the driver writes before closing. They end
+    /// with the alert rustls queued for a TLS error, which ends the session
+    /// (RFC 8446 §6.2), or, if it queued none, with its close_notify alert
+    /// (§6.1).
     fn shut(&mut self, connection: ConnectionId) -> Option<Connection> {
         #[cfg_attr(
             not(feature = "tls"),
