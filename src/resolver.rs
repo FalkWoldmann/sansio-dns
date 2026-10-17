@@ -689,44 +689,9 @@ impl Resolver {
             .map(|(id, _)| *id)
             .collect();
         for id in expired {
-            // An earlier close may already have moved this query on.
-            let Some(pending) = self.pending.get(&id) else {
-                continue;
-            };
-            if pending.deadline > now {
-                continue;
-            }
-            let Route::Stream {
-                connection,
-                written_after,
-            } = pending.route
-            else {
-                self.retry(id, now, Error::Timeout);
-                continue;
-            };
-            match self.connections.get_mut(&connection) {
-                Some(conn)
-                    if conn.responses > written_after && conn.orphans.len() < MAX_ORPHANS =>
-                {
-                    conn.orphans.push(Orphan::of(pending));
-                    self.retry(id, now, Error::Timeout);
-                }
-                Some(_) => self.time_out_stream(connection, now),
-                // Can't happen: every path that removes a connection moves
-                // its queries on first. Treated as a plain timeout to be
-                // safe.
-                None => self.retry(id, now, Error::Timeout),
-            }
+            self.time_out(id, now);
         }
-        let idle: Vec<ConnectionId> = self
-            .connections
-            .keys()
-            .filter(|c| self.idle_deadline(**c).is_some_and(|d| d <= now))
-            .copied()
-            .collect();
-        for connection in idle {
-            self.shut(connection);
-        }
+        self.close_idle_connections(now);
     }
 
     /// Stop tracking a query. No event is queued for it from now on (one
@@ -851,7 +816,7 @@ impl Resolver {
     }
 
     // A query's transitions: starting a search candidate, acting on its
-    // replies, moving on, and sending.
+    // replies, moving on, timing out, and sending.
 
     /// [`Resolver::query`], with `hosts` deciding whether
     /// [`Config::hosts`] is consulted.
@@ -1065,33 +1030,36 @@ impl Resolver {
         message
     }
 
-    /// Act on a reply already matched to `id`.
+    /// Act on a reply already matched to `id`. A truncated reply over UDP
+    /// switches the query to TCP (`switch_to_tcp`), even one whose records
+    /// don't decode (RFC 2181 §9). Any other reply whose records decode
+    /// goes to `handle_response`, and one whose records don't is a server
+    /// error (`reject`).
     fn handle_reply(&mut self, id: QueryId, reply: Reply, now: Instant) {
+        // Both callers pass a pending query.
+        let Some(pending) = self.pending.get(&id) else {
+            return;
+        };
         // Any answer, even an error code, shows the server is reachable.
-        if let Some(pending) = self.pending.get(&id) {
-            self.failed.remove(&pending.server(&self.config));
+        self.failed.remove(&pending.server(&self.config));
+        if reply.is_truncated() && pending.route == Route::Udp {
+            self.switch_to_tcp(id, now);
+            return;
         }
         match reply {
             Reply::Whole(response) => self.handle_response(id, response, now),
-            Reply::Broken {
-                metadata, error, ..
-            } => {
-                if !(metadata.truncation && self.switch_to_tcp(id, now)) {
-                    self.reject(id, now, Error::Malformed(error));
-                }
-            }
+            Reply::Broken { error, .. } => self.reject(id, now, Error::Malformed(error)),
         }
     }
 
-    /// Act on a decoded response already matched to `id`. Only `NOERROR`
-    /// and `NXDOMAIN` say something about the name; any other code means
-    /// this server couldn't answer (RFC 1035 §4.1.1 and §7.2), including
-    /// codes 6 to 15, BADVERS (RFC 6891 §6.1.3) and BADCOOKIE, which can't
-    /// be about a cookie since none is sent (RFC 7873 §5.3).
+    /// Act on a decoded response already matched to `id`. A truncated one
+    /// gets here only on a stream, where it is used as it is (RFC 2181
+    /// §9). Only `NOERROR` and `NXDOMAIN` say something about the name;
+    /// any other code means this server couldn't answer (RFC 1035 §4.1.1
+    /// and §7.2), including codes 6 to 15, BADVERS (RFC 6891 §6.1.3) and
+    /// BADCOOKIE, which can't be about a cookie since none is sent (RFC
+    /// 7873 §5.3).
     fn handle_response(&mut self, id: QueryId, response: Message, now: Instant) {
-        if response.metadata.truncation && self.switch_to_tcp(id, now) {
-            return;
-        }
         match response.metadata.response_code {
             // RFC 6891 §7: a server without EDNS answers FORMERR and no OPT;
             // §6.2.2 lets us ask the same server again without EDNS. Not over
@@ -1146,17 +1114,17 @@ impl Resolver {
     // How a query moves on, row by row of the crate docs' table, and the
     // state that keeps each free step bounded per search candidate:
     //
-    // - no answer by its deadline, datagram not sent (`handle_udp_error`):
-    //   `retry`; on a stream, `handle_timeout` closes the connection through
-    //   `time_out_stream` only if no response arrived on it since the query
-    //   was written (or since `emit` took the request back), or it holds
-    //   `MAX_ORPHANS` orphans, and otherwise leaves an `Orphan` there,
-    //   which `emit` takes back if a later attempt returns to that
-    //   connection
+    // - no answer by its deadline (`time_out`), datagram not sent
+    //   (`handle_udp_error`): `retry`; on a stream, `time_out` closes the
+    //   connection through `time_out_stream` only if no response arrived
+    //   on it since the query was written (or since `emit` took the
+    //   request back), or it holds `MAX_ORPHANS` orphans, and otherwise
+    //   leaves an `Orphan` there, which `emit` takes back if a later
+    //   attempt returns to that connection
     // - error code, FORMERR with OPT or a second one without, undecodable
     //   reply, referral: `reject`, which adds the server to `excluded`
-    // - truncated over UDP: `switch_to_tcp`, once because `stream_only`
-    //   keeps every later send off UDP
+    // - truncated over UDP (`handle_reply`): `switch_to_tcp`, once because
+    //   `stream_only` keeps every later send off UDP
     // - FORMERR without OPT: `drop_edns`, once because `request.edns` is
     //   taken
     // - connection lost after it answered, or closed by the server's
@@ -1268,27 +1236,23 @@ impl Resolver {
     }
 
     /// Re-send `id` to the same server over TCP, as RFC 1123 §6.1.3.2 asks
-    /// after a truncated answer, and keep every later send of this search
-    /// candidate on a stream. Doesn't consume an attempt. Returns `false`
-    /// if the attempt already went over a stream, in which case the
-    /// response is used as it is. If the server may not be sent the query
-    /// over a stream again (RFC 9520 §3.1), which can happen after earlier
-    /// attempts went to an open connection, the query sends its next
-    /// attempt over TCP to the next server instead.
-    fn switch_to_tcp(&mut self, id: QueryId, now: Instant) -> bool {
+    /// after a truncated answer over UDP, and keep every later send of this
+    /// search candidate on a stream. The resend doesn't consume an attempt.
+    /// If the server may not be sent the query over a stream again (RFC
+    /// 9520 §3.1), which can happen after earlier attempts went to an open
+    /// connection, the query moves on as `advance` does, over TCP: it uses
+    /// an attempt on the next server, or gives up (`give_up`) with
+    /// `Error::Timeout` if it is out of attempts or no server is left.
+    fn switch_to_tcp(&mut self, id: QueryId, now: Instant) {
         let Some(pending) = self.pending.get_mut(&id) else {
-            return false;
+            return;
         };
-        if pending.route != Route::Udp {
-            return false;
-        }
         pending.stream_only = true;
         if !self.may_resend(id) {
             self.advance(id, now, Error::Timeout);
-            return true;
+            return;
         }
         self.emit(id, now, Deadline::Fresh);
-        true
     }
 
     /// Re-send `id` to the same server without an OPT record. Doesn't consume
@@ -1347,6 +1311,44 @@ impl Resolver {
             .collect();
         self.events.push_back(event(id, outcome));
         self.events.extend(copies);
+    }
+
+    /// `id`'s deadline has passed: it moves on to its next attempt
+    /// (`retry`), leaving its request as an `Orphan` on the connection it
+    /// waits on if a response has arrived there since the attempt was
+    /// written or took its request back (`written_after`) and the
+    /// connection holds fewer than `MAX_ORPHANS` orphans. A connection
+    /// with no response since, or with that many orphans, is closed
+    /// instead (`time_out_stream`), which moves this query on (see there
+    /// for the other queries on it). Does nothing if `id` is no longer pending or its
+    /// deadline is after `now`: a close earlier in the same
+    /// `handle_timeout` may have moved it on.
+    fn time_out(&mut self, id: QueryId, now: Instant) {
+        let Some(pending) = self.pending.get(&id) else {
+            return;
+        };
+        if pending.deadline > now {
+            return;
+        }
+        let Route::Stream {
+            connection,
+            written_after,
+        } = pending.route
+        else {
+            self.retry(id, now, Error::Timeout);
+            return;
+        };
+        match self.connections.get_mut(&connection) {
+            Some(conn) if conn.responses > written_after && conn.orphans.len() < MAX_ORPHANS => {
+                conn.orphans.push(Orphan::of(pending));
+                self.retry(id, now, Error::Timeout);
+            }
+            Some(_) => self.time_out_stream(connection, now),
+            // Can't happen: every path that removes a connection moves
+            // its queries on first. Treated as a plain timeout to be
+            // safe.
+            None => self.retry(id, now, Error::Timeout),
+        }
     }
 
     /// Send `id`'s current attempt and count the send: on the open
@@ -1691,6 +1693,20 @@ impl Resolver {
             payload: Vec::new(),
         });
         Some(conn)
+    }
+
+    /// Shut every connection whose idle deadline (`idle_deadline`) is at or
+    /// before `now`.
+    fn close_idle_connections(&mut self, now: Instant) {
+        let idle: Vec<ConnectionId> = self
+            .connections
+            .keys()
+            .filter(|c| self.idle_deadline(**c).is_some_and(|d| d <= now))
+            .copied()
+            .collect();
+        for connection in idle {
+            self.shut(connection);
+        }
     }
 
     /// When `connection` should close for being idle: `None` while a query

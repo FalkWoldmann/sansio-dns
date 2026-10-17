@@ -104,12 +104,14 @@ outputs are drained with `poll_transmit`, `poll_event` and `poll_timeout`.
   Client Subnet privacy option (prefix 0, FAMILY of the server's address, RFC 8310 §11.1) and
   then the padding, last; `emit` runs it again when a query moves to a server of the other
   family. `Config::with_tls_names` holds an authentication name per server.
-- Replies go through `handle_reply`: one whose header and question match but whose records
-  don't decode (`wire::Reply::Broken`) switches to TCP if TC is set over UDP and is a server
-  error otherwise. `NOERROR` with data finishes a query; `NXDOMAIN` and NODATA go to
+- Replies go through `handle_reply`. A truncated one over UDP switches the query to TCP
+  (`switch_to_tcp`), even if its records don't decode. Any other reply whose header and
+  question match but whose records don't decode (`wire::Reply::Broken`) is a server error
+  and goes to `reject`; one whose records decode goes to `handle_response`, even a truncated
+  one on a stream. There `NOERROR` with data finishes a query; `NXDOMAIN` and NODATA go to
   `search_on`, which tries the next candidate and finishes the query once none is left;
-  every other code, an empty `NOERROR` without AA and RA (`wire::is_referral`) and a
-  broken reply go to `reject`.
+  every other code and an empty `NOERROR` without AA and RA (`wire::is_referral`) go to
+  `reject`.
 - How a query moves on is spread over several functions with different accounting: `retry`
   (no answer: next server, uses an attempt, marks the server failed for new queries),
   `reject` (error answer: excludes the server for this search candidate, then the same),

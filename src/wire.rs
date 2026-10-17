@@ -210,6 +210,11 @@ impl Reply {
         self.header().0.message_type == MessageType::Response
     }
 
+    /// Whether TC is set: the server cut it short (RFC 1035 §4.1.1).
+    pub(crate) fn is_truncated(&self) -> bool {
+        self.header().0.truncation
+    }
+
     /// Whether it has a question section.
     pub(crate) fn has_question(&self) -> bool {
         !self.header().1.is_empty()
