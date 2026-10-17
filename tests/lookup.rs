@@ -433,6 +433,45 @@ mod ip_lookup {
             assert_eq!(progress, Progress::Done(Err(Error::Server(FAIL))));
         }
 
+        /// A later lookup skips, for both families and without a transmit,
+        /// the candidate the cache knows doesn't exist (RFC 2308 §5, RFC
+        /// 1123 §6.1.4.3 (a)).
+        #[test]
+        fn cached_nxdomain_moves_on_without_a_transmit() {
+            let mut resolver = searching();
+            let lookup = start(&mut resolver);
+            let lookup = waiting(step(lookup, &mut resolver, CANDIDATES[0], |_, r| {
+                with_soa(with_code(r, NX))
+            }));
+            step(lookup, &mut resolver, CANDIDATES[1], |_, r| r);
+
+            let lookup = start(&mut resolver);
+            assert!(resolver.poll_transmit().is_none());
+            let events = events(&mut resolver);
+            let lookup = waiting(feed(lookup, &mut resolver, events));
+            let progress = step(lookup, &mut resolver, CANDIDATES[1], |_, r| r);
+
+            assert_eq!(progress, Progress::Done(Ok(vec![V6, V4])));
+        }
+
+        /// A cached failure ends a later lookup as the failure ended the
+        /// first, without a transmit for that candidate.
+        #[test]
+        fn cached_failure_ends_the_search() {
+            let mut resolver = searching();
+            let lookup = start(&mut resolver);
+            step(lookup, &mut resolver, CANDIDATES[0], |_, r| {
+                with_code(r, FAIL)
+            });
+
+            let lookup = start(&mut resolver);
+            assert!(resolver.poll_transmit().is_none());
+            let events = events(&mut resolver);
+            let progress = feed(lookup, &mut resolver, events);
+
+            assert_eq!(progress, Progress::Done(Err(Error::Server(FAIL))));
+        }
+
         /// The lookup asks for each candidate by its absolute name, so a
         /// plain query for that name joins it.
         #[test]

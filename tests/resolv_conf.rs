@@ -187,6 +187,48 @@ mod search {
         assert_eq!(asked, expected);
     }
 
+    /// `options no-tld-query`, as in glibc: with search domains, a name of
+    /// one label isn't tried as given, which would ask for a top-level
+    /// domain (a weaker form of RFC 1123 §6.1.4.3 (b)). Names with a dot
+    /// still are, and without search domains every name is.
+    #[rstest]
+    #[case::one_label("search a.example b.example\n", "db", &["db.a.example.", "db.b.example."])]
+    #[case::one_dot("search a.example\n", "db.x", &["db.x.", "db.x.a.example."])]
+    #[case::absolute("search a.example\n", "db.", &["db."])]
+    #[case::no_search_domains("", "db", &["db."])]
+    fn no_tld_query_keeps_single_labels_from_the_name_servers(
+        #[case] search: &str,
+        #[case] name: &str,
+        #[case] expected: &[&str],
+    ) {
+        let conf = format!("nameserver 192.0.2.53\n{search}options no-tld-query\n");
+        assert!(!Config::from_resolv_conf(conf.as_bytes()).tld_query);
+
+        let (asked, _) = tried(&conf, name, ResponseCode::NXDomain);
+
+        assert_eq!(asked, expected);
+    }
+
+    /// Unless every candidate is left out: then the name gets NXDOMAIN at
+    /// once.
+    #[test]
+    fn no_tld_query_without_a_candidate_left() {
+        let conf = "nameserver 192.0.2.53\nsearch local\noptions no-tld-query\n";
+        let (asked, event) = tried(conf, "printer", ResponseCode::NoError);
+        assert!(asked.is_empty());
+        let Some(Event::Response { response, .. }) = event else {
+            panic!("expected a local answer");
+        };
+        assert_eq!(response.metadata.response_code, ResponseCode::NXDomain);
+    }
+
+    #[test]
+    fn tld_query_is_on_by_default() {
+        let conf = "nameserver 192.0.2.53\nsearch a.example\n";
+        assert!(Config::from_resolv_conf(conf.as_bytes()).tld_query);
+        assert!(Config::new(addr("192.0.2.53:53"), []).tld_query);
+    }
+
     /// A record of the type asked for ends the search. NODATA doesn't; see
     /// `rfc1123::section_6_1_4_3`.
     #[test]

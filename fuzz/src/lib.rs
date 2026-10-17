@@ -11,6 +11,14 @@
 //! - a query causes a bounded number of sends, not counting the resends
 //!   after a lost connection or a cancel hand-over, and at most three to
 //!   one server over one transport, those included (RFC 9520 §3.1);
+//! - queries for an absolute name never start over: their messages keep
+//!   one message ID, and only the first of them, or its heir after a
+//!   cancel, sends;
+//! - nothing is sent for a question within `Config::failure_cache_min` of
+//!   the failure that ended its queries (RFC 9520 §3.2), unless they failed
+//!   when a cancel handed them over with no server left. The targets never
+//!   have two groups of queries ask the same question at once, so a group
+//!   that fails sent its question itself;
 //! - there is a timer exactly while queries are pending or connections open,
 //!   and `handle_timeout(now)` leaves no deadline at or before `now`.
 
@@ -21,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use arbitrary::Arbitrary;
 use sansio_dns::hickory_proto::op::{Message, ResponseCode};
-use sansio_dns::hickory_proto::rr::rdata::{A, AAAA, NS};
+use sansio_dns::hickory_proto::rr::rdata::{A, AAAA, NS, SOA};
 use sansio_dns::hickory_proto::rr::{Name, RData, Record, RecordType};
 use sansio_dns::{Config, ConnectionId, Event, QueryId, Resolver, Transmit, Transport};
 
@@ -66,9 +74,7 @@ pub struct Harness {
     groups: BTreeMap<Group, Vec<QueryId>>,
     group_of: BTreeMap<QueryId, Group>,
     /// The member a group's datagrams last came from, or that took the
-    /// query over when that one was cancelled. Another member may only
-    /// send after that one failed in the same step (it starts over on its
-    /// own).
+    /// query over when that one was cancelled. No other member sends.
     sender: BTreeMap<Group, QueryId>,
     /// Groups whose sender was cancelled in the current step.
     handed_over: BTreeSet<Group>,
@@ -76,18 +82,16 @@ pub struct Harness {
     /// Sends of each group to each server, over UDP (`true`) or a stream.
     per_server: BTreeMap<(Group, SocketAddr, bool), usize>,
     by_message_id: BTreeMap<u16, Group>,
-    /// The message ID of each group's last datagram. A new one from the
-    /// same sender starts a new budget: a new search candidate, or the
-    /// sender starting over because it took the query over after joining
-    /// late.
+    /// The message ID of each group's last message. A new one starts a new
+    /// budget: a new search candidate, which only a relative name has.
     message_id: BTreeMap<Group, u16>,
-    /// The member that sent each group's first message, or started its
-    /// current budget over: it never starts over itself (with `max_sends`,
-    /// so for absolute names). Unknown after a start-over on a stream,
-    /// until the next one: the member that later sends a datagram with the
-    /// same message ID may be one that took the query over after joining
-    /// late, which does start over.
-    began: BTreeMap<Group, QueryId>,
+    /// The question of each group's last message.
+    question: BTreeMap<Group, Question>,
+    /// When the queries of a group whose last message asked this question
+    /// failed: the failure is cached for at least `failure_cache`.
+    failed: BTreeMap<Question, Instant>,
+    /// The shortest time the resolver caches a failure.
+    failure_cache: Duration,
     pub recent: VecDeque<Sent>,
     events: Vec<Event>,
 }
@@ -100,6 +104,9 @@ impl Harness {
     /// absolute names.
     #[expect(clippy::disallowed_methods, reason = "the driver owns the clock")]
     pub fn new(config: Config, servers: Vec<SocketAddr>, max_sends: Option<usize>) -> Self {
+        let failure_cache = config
+            .failure_cache_min
+            .clamp(Duration::from_secs(1), Duration::from_secs(300));
         Self {
             resolver: Resolver::new(config),
             now: Instant::now(),
@@ -119,7 +126,9 @@ impl Harness {
             handed_over: BTreeSet::new(),
             by_message_id: BTreeMap::new(),
             message_id: BTreeMap::new(),
-            began: BTreeMap::new(),
+            question: BTreeMap::new(),
+            failed: BTreeMap::new(),
+            failure_cache,
             recent: VecDeque::new(),
             events: Vec::new(),
         }
@@ -157,7 +166,7 @@ impl Harness {
             self.per_server.retain(|(g, _, _), _| *g != group);
             self.by_message_id.retain(|_, g| *g != group);
             self.message_id.remove(&group);
-            self.began.remove(&group);
+            self.question.remove(&group);
         }
     }
 
@@ -190,6 +199,12 @@ impl Harness {
                 self.handed_over.insert(group);
             }
         }
+    }
+
+    /// Empty the resolver's cache, as after a network change.
+    pub fn flush(&mut self) {
+        self.resolver.flush_cache();
+        self.failed.clear();
     }
 
     /// The driver stops: every query is over without an event.
@@ -257,7 +272,6 @@ impl Harness {
     /// transmits.
     pub fn check(&mut self) -> Vec<Transmit> {
         let mut out = Vec::new();
-        let mut started_over = Vec::new();
         let transmits: Vec<Transmit> =
             std::iter::from_fn(|| self.resolver.poll_transmit()).collect();
         let following: Vec<Option<Transport>> = transmits
@@ -286,30 +300,26 @@ impl Harness {
                     let group = self.group_of[&q].clone();
                     let request = Message::from_vec(&t.payload).expect("the resolver sent garbage");
                     let id = request.metadata.id;
+                    self.asks(&group, &request);
                     let previous_id = self.message_id.insert(group.clone(), id);
                     let fresh = previous_id.is_some_and(|previous| previous != id);
                     let handed_over = self.handed_over.remove(&group);
-                    match self.sender.insert(group.clone(), q) {
-                        Some(previous) if previous != q => {
-                            // A late joiner starting over with a budget of
-                            // its own: `previous` must fail now.
-                            started_over.push(previous);
-                            self.restart(&group, q, t.destination);
-                        }
-                        // A new search candidate, or the heir of a cancelled
-                        // sender that joined late starting over.
-                        _ if fresh => self.restart(&group, q, t.destination),
+                    let previous = self.sender.insert(group.clone(), q);
+                    assert!(
+                        previous.is_none_or(|previous| previous == q) || handed_over,
+                        "{q:?} sent for {group:?}, whose sender is {previous:?}"
+                    );
+                    if fresh {
+                        // A new search candidate.
+                        self.restart(&group);
+                        self.count(&group, t.destination, true, false);
+                    } else if handed_over {
                         // The heir sends the attempt again, or its next one:
                         // outside `max_sends`, but not outside the
                         // per-server limit.
-                        _ if handed_over => self.count_per_server(&group, t.destination, true),
-                        _ => {
-                            if previous_id.is_none() {
-                                // The group's first send, from its leader.
-                                self.began.insert(group.clone(), q);
-                            }
-                            self.count(&group, t.destination, true, free);
-                        }
+                        self.count_per_server(&group, t.destination, true);
+                    } else {
+                        self.count(&group, t.destination, true, free);
                     }
                     self.by_message_id.insert(id, group);
                     self.remember(&t, request);
@@ -345,6 +355,7 @@ impl Harness {
             out.push(t);
         }
 
+        let mut failed = Vec::new();
         while let Some(event) = self.resolver.poll_event() {
             let id = match event {
                 Event::Response { query, .. } | Event::Failed { query, .. } => query,
@@ -354,14 +365,28 @@ impl Harness {
                 "second event for {id:?}, or one after cancel"
             );
             assert!(self.live.remove(&id), "event for unknown {id:?}");
+            // Not when a cancel handed the group over with no server left
+            // to send to, which isn't a resolution failure.
+            if matches!(event, Event::Failed { .. })
+                && let Some(group) = self.group_of.get(&id)
+                && !self.handed_over.contains(group)
+                && let Some(question) = self.question.get(group)
+            {
+                failed.push((group.clone(), question.clone()));
+            }
             self.leave(id);
             self.events.push(event);
         }
-        for previous in started_over {
-            assert!(
-                !self.live.contains(&previous),
-                "another query of {previous:?}'s group sent while it is live"
-            );
+        for (group, question) in failed {
+            // The whole group failed, after sending its question: unless
+            // the failure was cached already, it is now.
+            let cached = self
+                .failed
+                .get(&question)
+                .is_some_and(|at| self.now < *at + self.failure_cache);
+            if !self.groups.contains_key(&group) && !cached {
+                self.failed.insert(question, self.now);
+            }
         }
         self.handed_over.clear();
         self.lost = None;
@@ -407,20 +432,16 @@ impl Harness {
             self.groups.contains_key(&group),
             "stream query for {group:?}, which has no live query"
         );
+        self.asks(&group, &request);
         let previous = self.message_id.insert(group.clone(), id);
         let leader = self.groups.get(&group).and_then(|m| m.first()).copied();
         if let (None, Some(leader)) = (previous, leader) {
             // The group's first send, from its leader: its earliest query.
             self.sender.entry(group.clone()).or_insert(leader);
-            self.began.entry(group.clone()).or_insert(leader);
         }
         if previous.is_some_and(|previous| previous != id) {
-            // A late joiner starting over, on an open connection; which one
-            // isn't known.
-            self.sender.remove(&group);
-            self.began.remove(&group);
-            self.sends.remove(&group);
-            self.per_server.retain(|(g, _, _), _| *g != group);
+            // A new search candidate, on an open connection.
+            self.restart(&group);
             self.count(&group, t.destination, false, false);
         } else if self.handed_over.remove(&group) {
             // The heir of a sender cancelled in this step sends the attempt
@@ -434,20 +455,36 @@ impl Harness {
         self.remember(t, request);
     }
 
-    /// `q` sent a datagram with a new message ID: a new budget for
-    /// `group`. With absolute names (`max_sends`) only a query that joined
-    /// late does that.
-    fn restart(&mut self, group: &Group, q: QueryId, to: SocketAddr) {
-        if self.max_sends.is_some() {
-            assert!(
-                self.began.get(group) != Some(&q),
-                "{q:?} started over, but it didn't join late"
-            );
-        }
-        self.began.insert(group.clone(), q);
+    /// `group` sent a message with a new message ID: a new budget, for a
+    /// new search candidate. Queries for absolute names (`max_sends`) have
+    /// only one, and never start over.
+    fn restart(&mut self, group: &Group) {
+        assert!(
+            self.max_sends.is_none(),
+            "{group:?} started over with a new message ID"
+        );
         self.sends.remove(group);
         self.per_server.retain(|(g, _, _), _| g != group);
-        self.count(group, to, true, false);
+    }
+
+    /// `group` sends `request`: nothing may be sent for its question while
+    /// a failure is cached for it.
+    fn asks(&mut self, group: &Group, request: &Message) {
+        let Some(question) = request.queries.first() else {
+            return;
+        };
+        let question = (
+            question.name().to_ascii().to_ascii_lowercase(),
+            u16::from(question.query_type()),
+        );
+        if let Some(at) = self.failed.get(&question) {
+            assert!(
+                self.now >= *at + self.failure_cache,
+                "{question:?} sent {:?} after it failed",
+                self.now - *at
+            );
+        }
+        self.question.insert(group.clone(), question);
     }
 
     /// Count a send, towards `max_sends` too unless it is `free`.
@@ -490,6 +527,9 @@ impl Harness {
 
 /// The name, as given and lowercased, and record type of a query.
 type Group = (String, u16);
+
+/// The name, as sent and lowercased, and record type of a message.
+type Question = (String, u16);
 
 fn pick<T: Copy>(set: &BTreeSet<T>, which: u8) -> Option<T> {
     set.iter()
@@ -544,6 +584,17 @@ pub fn reply(request: &Message, code: ResponseCode) -> Message {
         response.set_edns(edns.clone());
     }
     response
+}
+
+/// Add an SOA record with `ttl` as its TTL and MINIMUM to `response`'s
+/// authority section, as in a negative answer the resolver caches (RFC
+/// 2308 §5).
+pub fn add_soa(response: &mut Message, ttl: u32) {
+    let zone = Name::root();
+    let mname = Name::from_ascii("a.root-servers.net.").unwrap_or_else(|_| Name::root());
+    let rname = Name::from_ascii("nstld.verisign-grs.com.").unwrap_or_else(|_| Name::root());
+    let soa = SOA::new(mname, rname, 1, 1800, 900, 604_800, ttl);
+    response.add_authority(Record::from_rdata(zone, ttl, RData::SOA(soa)));
 }
 
 /// Add an NS record to `response`'s authority section, as in a referral

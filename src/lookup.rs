@@ -85,7 +85,10 @@ pub fn addresses(response: &Message) -> Result<Vec<IpAddr>, Error> {
 /// search domain: `localhost`, `invalid.` and `onion.` names and
 /// [`Config::hosts`] entries as given, and link-local names not served
 /// over unicast when none of their search candidates is sent. Search
-/// candidates that wouldn't be sent are left out.
+/// candidates that wouldn't be sent are left out. Each query goes through
+/// the resolver's cache, as any query does: a candidate whose NXDOMAIN is
+/// cached gets it at once and the search moves on without a transmit, and
+/// one whose failure is cached ends the search with it.
 ///
 /// Pass every [`Event`] to [`IpLookup::handle_event`], which hands the
 /// lookup back until it is done, and then the outcome instead. Moving on

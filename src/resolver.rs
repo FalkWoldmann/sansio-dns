@@ -10,6 +10,7 @@ use hickory_proto::ProtoError;
 use hickory_proto::op::{Edns, Message, Query, ResponseCode};
 use hickory_proto::rr::{Name, RecordType};
 
+use crate::cache::{Cache, Hit};
 use crate::config::MAX_SENDS_PER_SERVER;
 #[cfg(feature = "tls")]
 use crate::tls;
@@ -82,18 +83,14 @@ struct Pending {
     /// for the same two joins this one instead of being sent. hickory's
     /// `Name` equality ignores case but not the trailing dot.
     asked: Asked,
-    /// When this query's current search candidate started; joiners from
-    /// after this instant don't share its failure (`Resolver::give_up`).
+    /// When this query's current search candidate was first sent, which
+    /// decides whether its failure backs off from a cached one
+    /// (`Cache::failed`).
     started: Instant,
-    /// When the query it is filed under was issued, or joined if it took
-    /// over from a cancelled one (`Resolver::cancel`). One that joined after
-    /// `started` starts over rather than share the failure, as a follower
-    /// would.
-    joined: Instant,
-    /// Queries that joined this one, and when; each gets its outcome too.
-    /// Every `QueryId` in flight is in exactly one place: a key of
-    /// `Resolver::pending`, or one leader's followers.
-    followers: Vec<(QueryId, Instant)>,
+    /// Queries that joined this one, in the order they joined; each gets
+    /// its outcome too. Every `QueryId` in flight is in exactly one place:
+    /// a key of `Resolver::pending`, or one leader's followers.
+    followers: Vec<QueryId>,
 }
 
 impl Pending {
@@ -138,6 +135,43 @@ impl Pending {
 /// What a query asks for: the name as given, before search domains, and
 /// the type.
 type Asked = (Name, RecordType);
+
+/// The answers a search has had so far: the first NODATA, the outcome if no
+/// later candidate has data, and else the last NXDOMAIN.
+#[derive(Debug, Default)]
+struct Outcome {
+    nodata: Option<Message>,
+    last: Option<Message>,
+}
+
+impl Outcome {
+    /// Take in the NXDOMAIN or NODATA answer `response`.
+    fn add(&mut self, response: Message) {
+        if response.metadata.response_code == ResponseCode::NoError && self.nodata.is_none() {
+            self.nodata = Some(response);
+        } else {
+            self.last = Some(response);
+        }
+    }
+
+    /// The answer a search that ran out of candidates ends with, as glibc
+    /// reports NO_DATA over HOST_NOT_FOUND.
+    fn into_response(self) -> Option<Message> {
+        self.nodata.or(self.last)
+    }
+}
+
+/// Where a search goes after looking its next candidates up in the cache.
+#[derive(Debug)]
+enum Next {
+    /// Send this candidate: the cache holds nothing for it.
+    Send(Name),
+    /// The cache holds a failure for the next candidate, which ends the
+    /// search, as a failure does when it happens.
+    Failed(Error),
+    /// The cache answered every candidate left with NXDOMAIN or NODATA.
+    Done,
+}
 
 /// How a query's current attempt went out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -248,6 +282,8 @@ pub struct Resolver {
     /// Servers whose last attempt failed without an answer, and until when
     /// new queries start after them (`Config::failure_memory`).
     failed: BTreeMap<SocketAddr, Instant>,
+    /// Resolution failures and negative answers, by question.
+    cache: Cache,
     transmits: VecDeque<Transmit>,
     events: VecDeque<Event>,
 }
@@ -262,6 +298,7 @@ impl Resolver {
             next_connection: 0,
             connections: BTreeMap::new(),
             failed: BTreeMap::new(),
+            cache: Cache::default(),
             transmits: VecDeque::new(),
             events: VecDeque::new(),
         }
@@ -289,6 +326,12 @@ impl Resolver {
     /// `example.com.` send the same question, but only a query for the same
     /// name as given (trailing dot included, case ignored) joins one in
     /// flight.
+    ///
+    /// Each candidate is looked up in the cache first (see the crate docs):
+    /// a cached NXDOMAIN or NODATA moves the search on without a transmit,
+    /// and a cached failure ends it with the cached error. So a query
+    /// answered from the cache alone gets its event at once, as a name
+    /// answered locally does.
     ///
     /// Some names are answered at once, without a transmit, in this order:
     ///
@@ -320,11 +363,9 @@ impl Resolver {
     /// or the last rule would answer are left out.
     ///
     /// A query for the same name and type as one still in flight (compared
-    /// as given, before search domains) joins it: nothing is sent for it,
-    /// and it gets the same response or error as its own event. If the
-    /// first one runs out of attempts or servers, a query that joined it
-    /// after its current search candidate started starts over with
-    /// attempts of its own instead of sharing the failure.
+    /// as given, before search domains) joins it, unless the cache answers
+    /// it: nothing is sent for it, and it gets the same response or error
+    /// as its own event, however late it joined.
     ///
     /// # Errors
     ///
@@ -394,7 +435,6 @@ impl Resolver {
                         .then(|| local_answer(&absolute, record_type))
                 })
         };
-        let asked = (name, record_type);
         if let Some(response) = local {
             self.events.push_back(Event::Response {
                 query: id,
@@ -402,26 +442,60 @@ impl Resolver {
             });
             return Ok(id);
         }
+        let mut rest = self.config.candidates(&name);
+        if rest.is_empty() {
+            rest.push_back(absolute);
+        }
+        let mut outcome = Outcome::default();
+        let candidate = match self.walk(&mut rest, record_type, &mut outcome, now) {
+            Next::Send(candidate) => candidate,
+            Next::Failed(error) => {
+                self.events.push_back(Event::Failed { query: id, error });
+                return Ok(id);
+            }
+            Next::Done => {
+                if let Some(response) = outcome.into_response() {
+                    self.events.push_back(Event::Response {
+                        query: id,
+                        response,
+                    });
+                }
+                return Ok(id);
+            }
+        };
+        let asked = (name, record_type);
         if let Some(leader) = self.pending.values_mut().find(|p| p.asked == asked) {
-            leader.followers.push((id, now));
+            leader.followers.push(id);
             return Ok(id);
         }
-        let pending = self.begin(asked, now)?;
+        let mut pending = self.new_pending(candidate, record_type, rest, asked, now)?;
+        pending.nodata = outcome.nodata;
         self.pending.insert(id, pending);
         self.emit(id, now);
         Ok(id)
     }
 
-    /// A new query for `asked`, at its first search candidate.
-    fn begin(&self, asked: Asked, now: Instant) -> Result<Pending, ProtoError> {
-        let (name, record_type) = &asked;
-        let mut candidates = self.config.candidates(name);
-        let first = candidates.pop_front().unwrap_or_else(|| {
-            let mut absolute = name.clone();
-            absolute.set_fqdn(true);
-            absolute
-        });
-        self.new_pending(first, *record_type, candidates, asked, now)
+    /// Look the search candidates in `rest` up in the cache, in order,
+    /// taking each one off, until one has to be sent: one the cache holds
+    /// nothing for. A cached NXDOMAIN or NODATA goes into `outcome` and the
+    /// search moves on without a transmit (RFC 2308 §5, which meets RFC
+    /// 1123 §6.1.4.3 (a) here); a cached failure ends the search.
+    fn walk(
+        &mut self,
+        rest: &mut VecDeque<Name>,
+        record_type: RecordType,
+        outcome: &mut Outcome,
+        now: Instant,
+    ) -> Next {
+        while let Some(name) = rest.pop_front() {
+            let question = Query::query(name, record_type);
+            match self.cache.get(&question, now) {
+                None => return Next::Send(question.name().clone()),
+                Some(Hit::Failed(error)) => return Next::Failed(error),
+                Some(Hit::Response(response)) => outcome.add(response),
+            }
+        }
+        Next::Done
     }
 
     /// A fresh first attempt for `name`, with its own message ID.
@@ -462,7 +536,6 @@ impl Resolver {
             forgiven: false,
             asked,
             started: now,
-            joined: now,
             followers: Vec::new(),
         })
     }
@@ -478,33 +551,34 @@ impl Resolver {
             .unwrap_or(0)
     }
 
-    /// Replace `id`'s attempt with one for its next search candidate, with
-    /// fresh attempts and no servers excluded. Returns `false` if there is
-    /// none, so the current answer stands.
-    fn next_candidate(&mut self, id: QueryId, now: Instant) -> bool {
-        let Some((name, rest, record_type, asked)) = self.pending.get_mut(&id).and_then(|p| {
-            let record_type = p.request.queries.first()?.query_type();
-            let name = p.rest.pop_front()?;
-            Some((
-                name,
-                std::mem::take(&mut p.rest),
-                record_type,
-                p.asked.clone(),
-            ))
-        }) else {
-            return false;
+    /// Replace `id`'s attempt with one for the search candidate `name`,
+    /// with fresh attempts and no servers excluded, `rest` to try after it
+    /// and `outcome` so far. If it can't be encoded, the answers so far
+    /// stand.
+    fn next_candidate(
+        &mut self,
+        id: QueryId,
+        name: Name,
+        rest: VecDeque<Name>,
+        outcome: Outcome,
+        now: Instant,
+    ) {
+        let Some(asked) = self.pending.get(&id).map(|p| p.asked.clone()) else {
+            return;
         };
-        let Ok(mut next) = self.new_pending(name, record_type, rest, asked, now) else {
-            return false;
+        let Ok(mut next) = self.new_pending(name, asked.1, rest, asked, now) else {
+            // Can't fail for a name that was encoded once.
+            if let Some(response) = outcome.into_response() {
+                self.finish(id, response);
+            }
+            return;
         };
         if let Some(previous) = self.pending.get_mut(&id) {
             next.followers = std::mem::take(&mut previous.followers);
-            next.nodata = previous.nodata.take();
-            next.joined = previous.joined;
         }
+        next.nodata = outcome.nodata;
         self.pending.insert(id, next);
         self.emit(id, now);
-        true
     }
 
     /// Process a datagram received from `from` on the socket of `query`,
@@ -808,32 +882,44 @@ impl Resolver {
             ResponseCode::NoError if is_referral(&response) => {
                 self.reject(id, now, Error::NoRecursion);
             }
-            ResponseCode::NoError if has_data(&response) => self.finish(id, response),
-            ResponseCode::NoError | ResponseCode::NXDomain => self.search_on(id, response, now),
+            ResponseCode::NoError if has_data(&response) => {
+                if let Some(question) = response.queries.first() {
+                    self.cache.answered(question);
+                }
+                self.finish(id, response);
+            }
+            ResponseCode::NoError | ResponseCode::NXDomain => {
+                self.cache.negative(&response, &self.config, now);
+                self.search_on(id, response, now);
+            }
             code => self.reject(id, now, Error::Server(code)),
         }
     }
 
     /// The current search candidate has no data of the type and class asked
     /// for: it doesn't exist (`NXDOMAIN`), or `response` is NODATA. Try the
-    /// next candidate; when there is none, the first NODATA answer is the
-    /// outcome, as glibc reports NO_DATA over HOST_NOT_FOUND, and otherwise
-    /// `response`.
+    /// next candidate, past those the cache answers; when there is none,
+    /// the first NODATA answer is the outcome, as glibc reports NO_DATA over
+    /// HOST_NOT_FOUND, and otherwise the last NXDOMAIN.
     fn search_on(&mut self, id: QueryId, response: Message, now: Instant) {
         let Some(pending) = self.pending.get_mut(&id) else {
             return;
         };
-        let nodata = response.metadata.response_code == ResponseCode::NoError;
-        let mut current = Some(response);
-        if nodata && pending.nodata.is_none() {
-            pending.nodata = current.take();
-        }
-        if self.next_candidate(id, now) {
-            return;
-        }
-        let first_nodata = self.pending.get_mut(&id).and_then(|p| p.nodata.take());
-        if let Some(outcome) = first_nodata.or(current) {
-            self.finish(id, outcome);
+        let record_type = pending.asked.1;
+        let mut rest = std::mem::take(&mut pending.rest);
+        let mut outcome = Outcome {
+            nodata: pending.nodata.take(),
+            last: None,
+        };
+        outcome.add(response);
+        match self.walk(&mut rest, record_type, &mut outcome, now) {
+            Next::Send(name) => self.next_candidate(id, name, rest, outcome, now),
+            Next::Failed(error) => self.fail(id, error),
+            Next::Done => {
+                if let Some(response) = outcome.into_response() {
+                    self.finish(id, response);
+                }
+            }
         }
     }
 
@@ -844,7 +930,7 @@ impl Resolver {
         let copies: Vec<Event> = followers
             .into_iter()
             .flatten()
-            .map(|(query, _)| Event::Response {
+            .map(|query| Event::Response {
                 query,
                 response: response.clone(),
             })
@@ -981,11 +1067,13 @@ impl Resolver {
     /// opened since. If that would be the fourth send of the search
     /// candidate to that server over that transport, the heir sends its
     /// next attempt to the next server instead (RFC 9520 §3.1). If it has
-    /// none left, it fails with [`Error::Timeout`], unless it joined after
-    /// the current search candidate started: then it starts over with
-    /// attempts of its own, as [`Resolver::query`] promises. Over a stream
-    /// nothing is sent; the answer still arrives on the same connection,
-    /// and the heir keeps the deadline.
+    /// none left, it fails with [`Error::Timeout`] at once, along with the
+    /// queries that joined it. That failure isn't cached: no server failed
+    /// to answer (RFC 9520 §2), since its answers may have gone to the
+    /// sockets of the cancelled queries, so the next query for the name is
+    /// sent as usual. Over a stream nothing is sent; the answer
+    /// still arrives on the same connection, and the heir keeps the
+    /// deadline.
     ///
     /// A query cancelled with no one to take it over after its request was
     /// written to a connection keeps its message ID in use there until the
@@ -997,7 +1085,7 @@ impl Resolver {
     pub fn cancel(&mut self, id: QueryId, now: Instant) {
         let Some(mut pending) = self.pending.remove(&id) else {
             for p in self.pending.values_mut() {
-                p.followers.retain(|&(follower, _)| follower != id);
+                p.followers.retain(|&follower| follower != id);
             }
             return;
         };
@@ -1014,8 +1102,7 @@ impl Resolver {
             }
             return;
         }
-        let (heir, joined) = pending.followers.remove(0);
-        pending.joined = joined;
+        let heir = pending.followers.remove(0);
         let udp = pending.route == Route::Udp;
         let server = pending.server(&self.config);
         let room = pending.may_send(server, channel(&self.connections, &pending, server));
@@ -1025,9 +1112,27 @@ impl Resolver {
         self.pending.insert(heir, pending);
         match (udp, room) {
             (true, true) => self.emit(heir, now),
-            (true, false) => self.advance(heir, now, Error::Timeout),
+            (true, false) => {
+                // Not a resolution failure (RFC 9520 §2): the server may
+                // well have answered, to the cancelled queries' sockets.
+                if !self.step(heir, now) {
+                    self.fail(heir, Error::Timeout);
+                }
+            }
             (false, _) => {}
         }
+    }
+
+    /// Forget every cached failure and negative answer (see the crate docs),
+    /// and which servers recently failed to answer
+    /// ([`Config::failure_memory`]), as a driver should when the host's
+    /// network changes: what failed or didn't exist on the old network may
+    /// work on the new one, where the servers may be reachable again, and
+    /// a failure stays cached for up to five minutes. Queries in flight go
+    /// on as they are.
+    pub fn flush_cache(&mut self) {
+        self.cache.flush();
+        self.failed.clear();
     }
 
     /// Stop: forget every query in flight, as [`Resolver::cancel`] does but
@@ -1076,11 +1181,18 @@ impl Resolver {
     //   `Pending`
     // - joined query cancelled: `cancel`, limited only by the rule below
     //   (each hand-over over UDP sends again; the crate docs' `attempts + 3`
-    //   bound leaves it out)
+    //   bound leaves it out); an heir without room moves on by `step`, and
+    //   with no server left fails through `fail`, not cached
+    //   (`give_up`), since the server may have answered the cancelled
+    //   queries' sockets
     // - out of attempts, or every server excluded or without room: `advance`
-    //   calls `give_up`, then `fail`; `give_up` starts the late joiners
-    //   over, the query itself too if it took over from a cancelled one
-    //   after the search candidate started (`Pending::joined`)
+    //   calls `give_up`, which caches the failure for the search candidate
+    //   (`Cache::failed`, RFC 9520 §3.2) and fails the query and every
+    //   query that joined it (`fail`)
+    // - a search candidate with a cached failure: `emit` fails the query
+    //   with it instead of sending, whichever path it came by; one with a
+    //   cached NXDOMAIN or NODATA: `walk`, from `start` or `search_on`,
+    //   moves on past it without sending
     //
     // `emit` picks the channel of every send (`channel`: the open
     // connection to the server if there is one, RFC 7766 §5) and counts it
@@ -1089,8 +1201,8 @@ impl Resolver {
     // servers without room, and `drop_edns`, `move_off`, `time_out_stream`
     // and `cancel` check `may_resend` before a free send, and so does
     // `switch_to_tcp`, since earlier attempts may have gone to an open
-    // connection. They move on as `retry` (`move_off`, `time_out_stream`) or
-    // `advance` (`drop_edns`, `cancel`, `switch_to_tcp`) instead. That
+    // connection. They move on as `retry` (`move_off`, `time_out_stream`),
+    // `advance` (`drop_edns`, `switch_to_tcp`) or `step` (`cancel`) instead. That
     // check is all that bounds the resends after a lost connection that
     // answered since.
 
@@ -1128,9 +1240,17 @@ impl Resolver {
     /// attempt stays off UDP (RFC 7858 §3): `emit` opens or reuses a
     /// connection to the new server.
     fn advance(&mut self, id: QueryId, now: Instant, error: Error) {
+        if !self.step(id, now) {
+            self.give_up(id, error, now);
+        }
+    }
+
+    /// Send `id`'s next attempt as `advance` does, or return false, leaving
+    /// it in place, if it is out of attempts or no server is left.
+    fn step(&mut self, id: QueryId, now: Instant) -> bool {
         let (config, connections) = (&self.config, &self.connections);
         let Some(pending) = self.pending.get_mut(&id) else {
-            return;
+            return true;
         };
         pending.attempt += 1;
         let servers = config.servers().len();
@@ -1140,12 +1260,12 @@ impl Resolver {
                 && pending.may_send(server, channel(connections, pending, server))
         });
         let Some(position) = next.filter(|_| pending.attempt < config.attempts.get()) else {
-            self.give_up(id, error, now);
-            return;
+            return false;
         };
         pending.position = position;
         pending.deadline = pending.deadline(config, now);
         self.emit(id, now);
+        true
     }
 
     /// The queries whose current attempt was written to `connection`.
@@ -1284,7 +1404,7 @@ impl Resolver {
         }
         pending.request.edns = None;
         let Ok(payload) = pending.request.to_vec() else {
-            self.fail(id, Error::Server(ResponseCode::FormErr));
+            self.give_up(id, Error::Server(ResponseCode::FormErr), now);
             return;
         };
         pending.payload = payload;
@@ -1305,10 +1425,25 @@ impl Resolver {
     /// session can't be started. If a TLS session refuses the write, the
     /// connection is closed as after a TLS error, and the query moves on
     /// with the others on it.
+    ///
+    /// Nothing is sent for a question while a failure is cached for it (RFC
+    /// 9520 §3.2): the query fails with the cached error instead. That
+    /// stops a query that was in flight when another query for the same
+    /// question failed, such as one for the name with a trailing dot while
+    /// the other was without.
     fn emit(&mut self, id: QueryId, now: Instant) {
         let Some(pending) = self.pending.get_mut(&id) else {
             return;
         };
+        if let Some(error) = pending
+            .request
+            .queries
+            .first()
+            .and_then(|question| self.cache.failure(question, now))
+        {
+            self.fail(id, error);
+            return;
+        }
         let server = pending.server(&self.config);
         // The Client Subnet option names the transport's address family.
         // Encoding can't fail for a message that was encoded once; if it
@@ -1331,7 +1466,7 @@ impl Resolver {
                 let message = frame(&pending.payload);
                 match self.connect(server, &message, now) {
                     Ok(connection) => self.written(id, connection),
-                    Err(error) => self.fail(id, error),
+                    Err(error) => self.give_up(id, error, now),
                 }
             } else {
                 pending.route = Route::Udp;
@@ -1452,65 +1587,29 @@ impl Resolver {
         Ok(())
     }
 
-    /// `id` is out of attempts, or every server is excluded. Queries that
-    /// joined it after its current search candidate started haven't had
-    /// attempts of their own yet: instead of sharing the failure they start
-    /// over, the first as a new query that the others join. That includes
-    /// `id` itself when it took over from a cancelled query it joined late
-    /// (`Pending::joined`). The comparison is strict on purpose: a query
-    /// that joined at the very instant the candidate started, such as a
-    /// duplicate issued in the same tick, shares its failure.
+    /// `id` is out of attempts, every server is excluded, or its TLS
+    /// session can't start: its search candidate failed to resolve (RFC
+    /// 9520 §2). The failure is cached for the candidate's question, so
+    /// nothing is sent for it for a while (§3.2), and `id` and every query
+    /// that joined it fail with `error`, however late they joined: a query
+    /// issued now would get the cached failure too.
     fn give_up(&mut self, id: QueryId, error: Error, now: Instant) {
-        let Some(pending) = self.pending.get_mut(&id) else {
-            return;
-        };
-        let started = pending.started;
-        let (mut late, early): (Vec<_>, Vec<_>) = std::mem::take(&mut pending.followers)
-            .into_iter()
-            .partition(|&(_, joined)| joined > started);
-        if pending.joined > started {
-            late.insert(0, (id, pending.joined));
+        if let Some(pending) = self.pending.get(&id)
+            && let Some(question) = pending.request.queries.first()
+        {
+            self.cache
+                .failed(question, error.clone(), pending.started, &self.config, now);
         }
-        pending.followers = early;
-        let asked = pending.asked.clone();
-        let Some((&(heir, _), others)) = late.split_first() else {
-            self.fail(id, error);
-            return;
-        };
-        // Can't fail for a name that was already encoded once; if it did,
-        // the late queries would share the failure.
-        let Ok(mut fresh) = self.begin(asked, now) else {
-            if let Some(pending) = self.pending.get_mut(&id) {
-                pending
-                    .followers
-                    .extend(late.into_iter().filter(|&(query, _)| query != id));
-            }
-            self.fail(id, error);
-            return;
-        };
-        if heir == id {
-            // `id` starts over itself: only the queries that joined early
-            // fail.
-            let early = self.pending.remove(&id).map(|p| p.followers);
-            self.events
-                .extend(early.into_iter().flatten().map(|(query, _)| Event::Failed {
-                    query,
-                    error: error.clone(),
-                }));
-        } else {
-            self.fail(id, error);
-        }
-        fresh.followers = others.to_vec();
-        self.pending.insert(heir, fresh);
-        self.emit(heir, now);
+        self.fail(id, error);
     }
 
+    /// End `id`, and the queries that joined it, with `error`.
     fn fail(&mut self, id: QueryId, error: Error) {
         let followers = self.pending.remove(&id).map(|p| p.followers);
         let copies: Vec<Event> = followers
             .into_iter()
             .flatten()
-            .map(|(query, _)| Event::Failed {
+            .map(|query| Event::Failed {
                 query,
                 error: error.clone(),
             })

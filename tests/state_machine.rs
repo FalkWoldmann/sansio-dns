@@ -21,6 +21,16 @@
 //! the crate docs), so the names come from a small pool and the harness
 //! tracks the queries in flight for each name as one group, as the fuzz
 //! harness does.
+//!
+//! The harness also models the cache (see "Cache" in the crate docs) from
+//! the outcomes it sees: a name whose queries failed has a failure cached
+//! for one to four seconds, depending on the backoff, unless they failed
+//! when a cancel handed them over with no server left, and one whose answer was
+//! NXDOMAIN or NODATA with an SOA record, which some replies carry, has it
+//! cached for that record's three seconds. Nothing may be sent for a name
+//! while either is cached (RFC 9520 §3.2), a query for it is answered from
+//! the cache at once, with the SOA's TTL counted down (RFC 2308 §6), and a
+//! query for a name with nothing cached is sent.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::ErrorKind;
@@ -54,11 +64,20 @@ const MAX_DATAGRAMS: usize = 2 * MAX_SENDS_PER_SERVER;
 
 /// Datagrams and stream writes one search candidate may cause: one per
 /// attempt, plus switching to TCP, dropping EDNS and one free resend. A
-/// cancel hand-over's resend, the resends after a lost connection and a
-/// late joiner's fresh start don't count (see `Group`): a connection that
-/// answered since a query was written gives it a free resend each time it
-/// is lost, bounded only by `MAX_SENDS_PER_SERVER`.
+/// cancel hand-over's resend and the resends after a lost connection don't
+/// count (see `Group`): a connection that answered since a query was
+/// written gives it a free resend each time it is lost, bounded only by
+/// `MAX_SENDS_PER_SERVER`.
 const MAX_SENDS: usize = ATTEMPTS + 3;
+
+/// The TTL and MINIMUM of the SOA record in the replies that carry one, so
+/// the negative answer is cached for that many seconds (RFC 2308 §5).
+const NEGATIVE_TTL: u32 = 3;
+
+/// How long a failure is cached at least and at most: the default
+/// `Config::failure_cache_min`, and a `failure_cache_max` short enough for
+/// the backoff to reach it.
+const FAILURE_CACHED: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(4));
 
 /// Transmits kept for replies, so late replies to old ones still happen.
 const RECENT: usize = 16;
@@ -70,6 +89,10 @@ enum Reply {
     FormErrWithoutOpt,
     /// `NOERROR` without an answer.
     NoData,
+    /// NXDOMAIN or NODATA with an SOA record, which the resolver caches.
+    Negative {
+        nxdomain: bool,
+    },
     /// `NOERROR` without an answer, AA or RA, with NS records in authority.
     Referral,
     Truncated,
@@ -110,6 +133,8 @@ enum Op {
     Cancel {
         query: Index,
     },
+    /// Empty the cache, as after a network change.
+    Flush,
     StreamClosed {
         which: usize,
         failed: bool,
@@ -138,6 +163,7 @@ fn reply_strategy() -> impl Strategy<Value = Reply> {
         .prop_map(Reply::Code),
         1 => Just(Reply::FormErrWithoutOpt),
         1 => prop_oneof![Just(Reply::NoData), Just(Reply::Referral)],
+        1 => any::<bool>().prop_map(|nxdomain| Reply::Negative { nxdomain }),
         1 => Just(Reply::Truncated),
         1 => any::<bool>().prop_map(|truncated| Reply::Cut { truncated }),
         1 => Just(Reply::WrongId),
@@ -159,6 +185,14 @@ fn datagram(sent: &Transmit, kind: &Reply) -> (SocketAddr, Vec<u8>) {
             encode(&m)
         }
         Reply::NoData => encode(&no_data(answer)),
+        Reply::Negative { nxdomain } => {
+            let negative = if *nxdomain {
+                with_code(answer, ResponseCode::NXDomain)
+            } else {
+                no_data(answer)
+            };
+            encode(&with_soa_ttls(negative, NEGATIVE_TTL, NEGATIVE_TTL))
+        }
         Reply::Referral => encode(&referral(answer)),
         Reply::Cut { truncated } => {
             let mut m = answer;
@@ -227,6 +261,7 @@ impl ReferenceStateMachine for Model {
             ),
             (1, Just(Op::Timeout).boxed()),
             (1, Just(Op::Shutdown).boxed()),
+            (1, Just(Op::Flush).boxed()),
         ];
         if model.queries > 0 {
             ops.push((
@@ -263,7 +298,7 @@ impl ReferenceStateMachine for Model {
     fn preconditions(model: &Self, op: &Op) -> bool {
         match op {
             Op::Query { name } => *name < NAMES,
-            Op::Elapse { .. } | Op::Timeout | Op::Shutdown => true,
+            Op::Elapse { .. } | Op::Timeout | Op::Shutdown | Op::Flush => true,
             Op::Reply { .. } | Op::UdpError { .. } | Op::Cancel { .. } | Op::Garbage { .. } => {
                 model.queries > 0
             }
@@ -285,30 +320,25 @@ impl ReferenceStateMachine for Model {
             | Op::Cancel { .. }
             | Op::StreamClosed { .. }
             | Op::Garbage { .. }
-            | Op::Shutdown => {}
+            | Op::Shutdown
+            | Op::Flush => {}
         }
         model
     }
 }
 
 /// What one name's queries in flight have sent since the first of them
-/// started, or since they started over.
+/// started. They never start over: when the first one fails, they all do.
 #[derive(Debug, Default)]
 struct Group {
-    /// The query whose socket the group's datagrams come from: the one that
-    /// last sent, or its heir once it was cancelled. Another one may only
-    /// take over after the sender failed in the same step (a query that
-    /// joined later then starts over).
+    /// The query whose socket the group's datagrams come from: the first
+    /// one, or its heir once it was cancelled.
     sender: Option<QueryId>,
     /// Whether the sender was cancelled in this step, so that its heir may
     /// send the attempt again for free.
     handed_over: bool,
-    /// The message ID of its datagrams. A new one means a new query: the
-    /// sender, or its heir, starting over because it joined late.
+    /// The message ID of every message the group sends.
     message_id: Option<u16>,
-    /// The query that sent its first datagram. It can't have joined late,
-    /// so it never starts over itself.
-    began: Option<QueryId>,
     datagrams: usize,
     sends: usize,
     /// Sends to each server, over UDP (`true`) or TCP.
@@ -342,6 +372,16 @@ impl Group {
     }
 }
 
+/// What the cache holds for a name, as the outcomes seen so far imply.
+#[derive(Clone, Copy, Debug)]
+enum Cached {
+    /// Its queries failed at this instant.
+    Failed(Instant),
+    /// Its answer was a negative one with an SOA record, stored at this
+    /// instant.
+    Negative(Instant),
+}
+
 /// Driver state plus everything observed so far.
 struct Harness {
     resolver: Resolver,
@@ -371,6 +411,15 @@ struct Harness {
     /// The server of a connection lost in this step: the sends to it are
     /// resends, which `MAX_SENDS` leaves out.
     lost: Option<SocketAddr>,
+    /// By name, what the cache holds.
+    cached: BTreeMap<usize, Cached>,
+    /// The query started in this step, its name, and whether it found the
+    /// name's queries in flight and joined them.
+    asked: Option<(QueryId, usize, bool)>,
+    /// The name of a query this step cancelled and handed over: its heir
+    /// fails in this step only with no server left to send to, which isn't
+    /// cached.
+    handed_over: Option<usize>,
 }
 
 impl Harness {
@@ -379,6 +428,7 @@ impl Harness {
             resolver: {
                 let mut config = config();
                 config.attempts = NonZeroUsize::new(ATTEMPTS).unwrap();
+                config.failure_cache_max = FAILURE_CACHED.1;
                 Resolver::new(config)
             },
             now: Instant::now(),
@@ -394,6 +444,9 @@ impl Harness {
             truncated: None,
             switched: BTreeMap::new(),
             lost: None,
+            cached: BTreeMap::new(),
+            asked: None,
+            handed_over: None,
         }
     }
 
@@ -401,10 +454,12 @@ impl Harness {
         match op {
             Op::Query { name } => {
                 let text = format!("q{name}.example.");
+                let joined = self.has_live(name);
                 let id = self
                     .resolver
                     .query(Name::from_ascii(text).unwrap(), RecordType::A, self.now)
                     .unwrap();
+                self.asked = Some((id, name, joined));
                 self.started.push(id);
                 self.name_of.insert(id, name);
                 self.live.insert(id);
@@ -450,6 +505,10 @@ impl Harness {
                 }
             }
             Op::Cancel { query } => self.cancel(self.pick(query)),
+            Op::Flush => {
+                self.resolver.flush_cache();
+                self.cached.clear();
+            }
             Op::StreamClosed { which, failed } => {
                 if let Some(&c) = self.open.keys().nth(which % self.open.len().max(1)) {
                     self.lost = self.open.remove(&c);
@@ -466,7 +525,7 @@ impl Harness {
                 self.resolver.handle_datagram(id, S1, &bytes, self.now);
             }
             // Every query is over without an event, and every connection
-            // closes.
+            // closes. The cache stays.
             Op::Shutdown => {
                 self.resolver.shutdown();
                 self.done.append(&mut self.live);
@@ -488,6 +547,9 @@ impl Harness {
             {
                 group.sender = heir;
                 group.handed_over = true;
+                if heir.is_some() {
+                    self.handed_over = Some(name);
+                }
             }
             self.leave(name);
         }
@@ -534,9 +596,8 @@ impl Harness {
 
     /// Drain the resolver's transmits and events, checking each.
     fn observe(&mut self) {
-        // Names whose queries started over, and the sender before that if
-        // another query took over.
-        let mut started_over = Vec::new();
+        // Names something was sent for in this step.
+        let mut sent = BTreeSet::new();
         while let Some(t) = self.resolver.poll_transmit() {
             assert!(t.destination == S1 || t.destination == S2, "unknown server");
             let free = self.lost == Some(t.destination);
@@ -549,38 +610,26 @@ impl Harness {
                     );
                     let id = decode(&t).metadata.id;
                     let name = self.name_of[&q];
+                    sent.insert(name);
                     let group = self.groups.entry(name).or_default();
                     let previous = group.sender.replace(q);
-                    let other = previous.filter(|&p| p != q);
-                    let fresh = group.message_id.is_some_and(|m| m != id);
                     assert!(
-                        !fresh || other.is_some() || group.began != Some(q),
-                        "a query started over that didn't join late"
+                        previous.is_none_or(|p| p == q) || group.handed_over,
+                        "another query sent for a name in flight"
                     );
-                    if other.is_some() || fresh {
-                        // A late joiner starting over with a budget of its
-                        // own: a new query with a new message ID, whose old
-                        // IDs may come up again for any query. Another
-                        // query that sent before must fail now.
-                        started_over.push((name, other));
-                        self.switched.retain(|_, n| *n != name);
-                        self.datagrams.remove(&q);
-                        *group = Group {
-                            sender: Some(q),
-                            began: Some(q),
-                            ..Group::default()
-                        };
-                        group.count(t.destination, true, false);
-                    } else if group.handed_over {
+                    assert!(
+                        group.message_id.is_none_or(|m| m == id),
+                        "a query for a name in flight started over"
+                    );
+                    if group.handed_over {
                         // The heir of a sender cancelled in this step sends
-                        // the attempt again for free.
+                        // the attempt again for free, or its next one.
                         group.handed_over = false;
                         group.count_per_server(t.destination, true);
                     } else {
                         group.count(t.destination, true, free);
                     }
                     group.message_id = Some(id);
-                    group.began.get_or_insert(q);
                     let count = self.datagrams.entry(q).or_default();
                     *count += 1;
                     assert!(*count <= MAX_DATAGRAMS, "too many datagrams for one query");
@@ -605,6 +654,7 @@ impl Harness {
                     let request = decode(&t);
                     let id = request.metadata.id;
                     let name = name_of(&request);
+                    sent.insert(name);
                     assert!(self.has_live(name), "stream write for no query in flight");
                     if self.truncated == Some(id) {
                         self.switched.insert(id, name);
@@ -615,18 +665,12 @@ impl Harness {
                         // The group's first send: from its leader, the
                         // earliest of its queries in flight.
                         group.sender = group.sender.or(leader);
-                        group.began = group.began.or(leader);
                     }
-                    if group.message_id.is_some_and(|m| m != id) {
-                        // A late joiner starting over, on an open
-                        // connection.
-                        started_over.push((name, None));
-                        self.switched.retain(|_, n| *n != name);
-                        let name_of = &self.name_of;
-                        self.datagrams.retain(|q, _| name_of[q] != name);
-                        *group = Group::default();
-                        group.count(t.destination, false, false);
-                    } else if group.handed_over {
+                    assert!(
+                        group.message_id.is_none_or(|m| m == id),
+                        "a query for a name in flight started over"
+                    );
+                    if group.handed_over {
                         // The heir of a sender cancelled in this step sends
                         // the attempt again on a connection opened since.
                         group.handed_over = false;
@@ -653,33 +697,122 @@ impl Harness {
         self.truncated = None;
         self.lost = None;
 
-        let mut finished = BTreeSet::new();
+        for name in &sent {
+            assert!(
+                self.cached_at(*name).is_none(),
+                "sent for a name while the cache holds it"
+            );
+        }
+
+        let asked = self.asked.take();
+        let mut finished = BTreeMap::new();
+        let mut answered = None;
         while let Some(event) = self.resolver.poll_event() {
-            let id = match event {
-                Event::Response { query, .. } | Event::Failed { query, .. } => query,
+            let id = match &event {
+                Event::Response { query, .. } | Event::Failed { query, .. } => *query,
             };
             assert!(self.done.insert(id), "second event, or event after cancel");
             assert!(self.live.remove(&id), "event for unknown query");
             let name = self.name_of[&id];
-            finished.insert(name);
+            if asked.is_some_and(|(q, _, joined)| q == id && !joined) {
+                answered = Some(event);
+            } else {
+                finished.insert(name, event);
+            }
             self.leave(name);
         }
-        for (_, previous) in &started_over {
-            assert!(
-                !previous.is_some_and(|p| self.live.contains(&p)),
-                "a query sent for a name while another one for it is in flight"
-            );
+        if let Some((id, name, false)) = asked {
+            self.check_cache(id, name, answered.as_ref(), sent.contains(&name));
         }
-        for name in finished {
+        let handed_over = self.handed_over.take();
+        for (name, event) in finished {
             assert!(
-                !self.has_live(name) || started_over.iter().any(|(n, _)| *n == name),
-                "an event for some queries of a name, but the others neither \
-                 got one nor started over"
+                !self.has_live(name),
+                "an event for some queries of a name, but not the others"
             );
+            if handed_over != Some(name) {
+                self.remember(name, &event);
+            }
         }
         for group in self.groups.values_mut() {
             group.handed_over = false;
         }
+    }
+
+    /// What the cache surely holds for `name` now: a failure for at least
+    /// a second, a negative answer for `NEGATIVE_TTL` seconds.
+    fn cached_at(&self, name: usize) -> Option<Cached> {
+        self.cached
+            .get(&name)
+            .copied()
+            .filter(|cached| match cached {
+                Cached::Failed(at) => self.now < *at + FAILURE_CACHED.0,
+                Cached::Negative(at) => self.now < *at + Duration::from_secs(NEGATIVE_TTL.into()),
+            })
+    }
+
+    /// The query `id` for `name`, which joined no query in flight, got
+    /// `event` in its own step, or none, and something was sent for the
+    /// name or not: as the cache says.
+    fn check_cache(&self, id: QueryId, name: usize, event: Option<&Event>, sent: bool) {
+        match (self.cached_at(name), event) {
+            (Some(Cached::Failed(_)), Some(Event::Failed { .. })) => {}
+            (Some(Cached::Negative(at)), Some(Event::Response { response, .. })) => {
+                let soa = response
+                    .authorities
+                    .iter()
+                    .find(|r| r.record_type() == RecordType::SOA)
+                    .map(|r| r.ttl);
+                let elapsed = u32::try_from(self.now.duration_since(at).as_secs()).unwrap();
+                assert_eq!(
+                    soa,
+                    Some(NEGATIVE_TTL - elapsed),
+                    "SOA TTL not counted down"
+                );
+            }
+            (Some(_), _) => panic!("a cached name not answered from the cache: {event:?}"),
+            (None, Some(Event::Failed { .. })) => {
+                // A failure cached longer than the minimum, by the backoff.
+                let Some(Cached::Failed(at)) = self.cached.get(&name) else {
+                    panic!("a failure from no cached one");
+                };
+                assert!(
+                    self.now < *at + FAILURE_CACHED.1,
+                    "a failure cached for longer than the maximum"
+                );
+            }
+            (None, Some(Event::Response { .. })) => panic!("a response from no cached one"),
+            (None, None) => assert!(
+                sent && self.live.contains(&id),
+                "a query for a name with nothing cached wasn't sent"
+            ),
+        }
+        assert!(
+            event.is_none() || !sent,
+            "sent for a query answered from the cache"
+        );
+    }
+
+    /// The queries for `name` ended with `event`, from the network: the
+    /// cache holds it if it is a failure or a negative answer with an SOA
+    /// record, and any other answer ends what it held.
+    fn remember(&mut self, name: usize, event: &Event) {
+        let cached = match event {
+            Event::Failed { .. } => Some(Cached::Failed(self.now)),
+            Event::Response { response, .. } => {
+                let negative = response.answers.is_empty()
+                    && !response.metadata.truncation
+                    && response
+                        .authorities
+                        .iter()
+                        .any(|r| r.record_type() == RecordType::SOA);
+                negative.then_some(Cached::Negative(self.now))
+            }
+        };
+        match cached {
+            Some(cached) => self.cached.insert(name, cached),
+            None => self.cached.remove(&name),
+        };
     }
 }
 

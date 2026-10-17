@@ -131,13 +131,19 @@ pub fn referral(response: Message) -> Message {
 }
 
 /// `response` with the zone's SOA record added to its authority section,
-/// as in a negative answer (RFC 2308 §2.2).
-pub fn with_soa(mut response: Message) -> Message {
+/// as in a negative answer (RFC 2308 §2.2): TTL and MINIMUM 300 seconds.
+pub fn with_soa(response: Message) -> Message {
+    with_soa_ttls(response, 300, 300)
+}
+
+/// [`with_soa`] with the SOA record's TTL and MINIMUM field, which set how
+/// long a negative answer may be cached (RFC 2308 §5).
+pub fn with_soa_ttls(mut response: Message, ttl: u32, minimum: u32) -> Message {
     let zone = Name::from_ascii("example.com.").unwrap();
     let mname = Name::from_ascii("ns1.example.com.").unwrap();
     let rname = Name::from_ascii("hostmaster.example.com.").unwrap();
-    let soa = SOA::new(mname, rname, 1, 7200, 3600, 1_209_600, 300);
-    response.add_authority(Record::from_rdata(zone, 300, RData::SOA(soa)));
+    let soa = SOA::new(mname, rname, 1, 7200, 3600, 1_209_600, minimum);
+    response.add_authority(Record::from_rdata(zone, ttl, RData::SOA(soa)));
     response
 }
 
@@ -312,6 +318,11 @@ impl Trace {
         self.record("shutdown");
     }
 
+    pub fn flush(&mut self) {
+        self.resolver.flush_cache();
+        self.record("flush");
+    }
+
     /// Move the clock to the next deadline and handle it.
     pub fn timeout(&mut self) {
         let deadline = self.resolver.poll_timeout().unwrap();
@@ -427,7 +438,8 @@ fn server(address: SocketAddr) -> String {
 }
 
 /// The question, and for a response its code and answer count, plus the
-/// flags a lifecycle depends on.
+/// flags a lifecycle depends on and the TTL of an SOA record in the
+/// authority section.
 fn describe(message: &Message) -> String {
     let mut text = message.queries.first().map_or_else(
         || "no question".to_owned(),
@@ -442,6 +454,13 @@ fn describe(message: &Message) -> String {
         }
         if !message.metadata.recursion_available {
             text += ", no RA";
+        }
+        let soa = message
+            .authorities
+            .iter()
+            .find(|r| r.record_type() == RecordType::SOA);
+        if let Some(soa) = soa {
+            text += &format!(", SOA {}", soa.ttl);
         }
     }
     if message.metadata.truncation {

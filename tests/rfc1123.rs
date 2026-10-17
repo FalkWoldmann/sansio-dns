@@ -211,7 +211,13 @@ mod section_6_1_3_3 {
 /// so the search moves on. (glibc's moves on only when the answer section
 /// is empty.) When it runs out, the first NODATA is the outcome, ahead of a
 /// later NXDOMAIN. `IpLookup` moves on when neither A nor AAAA has an
-/// address; see `lookup::ip_lookup::search`.
+/// address; see `lookup::ip_lookup::search`. To keep a search list from
+/// sending "excessive queries to the root", a resolver "MUST have one of,
+/// and SHOULD have both of" (a) a cache of negative answers and (b) two or
+/// more interior dots before a name is sent: cached NXDOMAIN and NODATA
+/// answers move the search on without a transmit, and a cached failure ends
+/// it. `Config::tld_query` (glibc's `no-tld-query`, see
+/// `resolv_conf::search`) is a weaker form of (b).
 mod section_6_1_4_3 {
     use super::*;
 
@@ -318,6 +324,157 @@ mod section_6_1_4_3 {
         t=0s <- S1 udp q0: db.corp.example. A: NoError, 1 answer
           -> S1 udp q0: db.lab.example. A
           next t=2s
+        ");
+    }
+
+    /// Provision (a): the second search for `db` skips the candidates the
+    /// cache knows don't exist, and asks only for the one left.
+    #[test]
+    fn cached_negative_answers_move_the_search_on_without_a_transmit() {
+        let mut trace = searching();
+        trace.query("db", RecordType::A);
+        let sent = trace.last();
+        trace.answer(
+            &sent,
+            &with_soa(with_code(reply(&sent), ResponseCode::NXDomain)),
+        );
+        let sent = trace.last();
+        trace.answer(&sent, &with_soa(no_data(reply(&sent))));
+        let sent = trace.last();
+        trace.answer(&sent, &reply(&sent));
+        trace.at(Duration::from_secs(10));
+        trace.query("db", RecordType::A);
+        trace.query("db", RecordType::AAAA);
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 db A
+          -> S1 udp q0: db.corp.example. A
+          next t=2s
+        t=0s <- S1 udp q0: db.corp.example. A: NXDomain, 0 answers, SOA 300
+          -> S1 udp q0: db.lab.example. A
+          next t=2s
+        t=0s <- S1 udp q0: db.lab.example. A: NoError, 0 answers, SOA 300
+          -> S1 udp q0: db. A
+          next t=2s
+        t=0s <- S1 udp q0: db. A: NoError, 1 answer
+          => q0 Response db. A: NoError, 1 answer
+          next none
+        t=10s query q1 db A
+          -> S1 udp q1: db. A
+          next t=12s
+        t=10s query q2 db AAAA
+          -> S1 udp q2: db.lab.example. AAAA
+          next t=12s
+        ");
+    }
+
+    /// When the cache answers every candidate, the search ends at once with
+    /// the first NODATA, as it would after the servers' answers.
+    #[test]
+    fn search_answered_from_the_cache_alone() {
+        let mut trace = searching();
+        trace.query("db", RecordType::A);
+        let nxdomain = |sent| with_soa(with_code(reply(sent), ResponseCode::NXDomain));
+        let sent = trace.last();
+        trace.answer(&sent, &nxdomain(&sent));
+        let sent = trace.last();
+        trace.answer(&sent, &with_soa(no_data(reply(&sent))));
+        let sent = trace.last();
+        trace.answer(&sent, &nxdomain(&sent));
+        trace.at(Duration::from_secs(1));
+        trace.query("db", RecordType::A);
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 db A
+          -> S1 udp q0: db.corp.example. A
+          next t=2s
+        t=0s <- S1 udp q0: db.corp.example. A: NXDomain, 0 answers, SOA 300
+          -> S1 udp q0: db.lab.example. A
+          next t=2s
+        t=0s <- S1 udp q0: db.lab.example. A: NoError, 0 answers, SOA 300
+          -> S1 udp q0: db. A
+          next t=2s
+        t=0s <- S1 udp q0: db. A: NXDomain, 0 answers, SOA 300
+          => q0 Response db.lab.example. A: NoError, 0 answers, SOA 300
+          next none
+        t=1s query q1 db A
+          => q1 Response db.lab.example. A: NoError, 0 answers, SOA 299, no EDNS
+          next none
+        ");
+    }
+
+    /// A NODATA the cache gave an earlier candidate is still the outcome
+    /// when the servers deny the later ones.
+    #[test]
+    fn cached_nodata_wins_over_a_later_nxdomain() {
+        let mut trace = searching();
+        trace.query("db", RecordType::A);
+        let sent = trace.last();
+        trace.answer(&sent, &with_soa(no_data(reply(&sent))));
+        let sent = trace.last();
+        trace.answer(&sent, &reply(&sent));
+        trace.at(Duration::from_secs(1));
+        trace.query("db", RecordType::A);
+        for _ in 0..2 {
+            let sent = trace.last();
+            trace.answer(&sent, &with_code(reply(&sent), ResponseCode::NXDomain));
+        }
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 db A
+          -> S1 udp q0: db.corp.example. A
+          next t=2s
+        t=0s <- S1 udp q0: db.corp.example. A: NoError, 0 answers, SOA 300
+          -> S1 udp q0: db.lab.example. A
+          next t=2s
+        t=0s <- S1 udp q0: db.lab.example. A: NoError, 1 answer
+          => q0 Response db.lab.example. A: NoError, 1 answer
+          next none
+        t=1s query q1 db A
+          -> S1 udp q1: db.lab.example. A
+          next t=3s
+        t=1s <- S1 udp q1: db.lab.example. A: NXDomain, 0 answers
+          -> S1 udp q1: db. A
+          next t=3s
+        t=1s <- S1 udp q1: db. A: NXDomain, 0 answers
+          => q1 Response db.corp.example. A: NoError, 0 answers, SOA 299, no EDNS
+          next none
+        ");
+    }
+
+    /// A cached failure ends the search at its candidate, as the failure
+    /// did when it happened.
+    #[test]
+    fn cached_failure_ends_the_search() {
+        let mut trace = searching();
+        trace.query("db", RecordType::A);
+        let sent = trace.last();
+        trace.answer(
+            &sent,
+            &with_soa(with_code(reply(&sent), ResponseCode::NXDomain)),
+        );
+        for _ in 0..2 {
+            let sent = trace.last();
+            trace.answer(&sent, &with_code(reply(&sent), ResponseCode::ServFail));
+        }
+        trace.query("db", RecordType::A);
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 db A
+          -> S1 udp q0: db.corp.example. A
+          next t=2s
+        t=0s <- S1 udp q0: db.corp.example. A: NXDomain, 0 answers, SOA 300
+          -> S1 udp q0: db.lab.example. A
+          next t=2s
+        t=0s <- S1 udp q0: db.lab.example. A: ServFail, 0 answers
+          -> S2 udp q0: db.lab.example. A
+          next t=2s
+        t=0s <- S2 udp q0: db.lab.example. A: ServFail, 0 answers
+          => q0 Failed Server(ServFail)
+          next none
+        t=0s query q1 db A
+          => q1 Failed Server(ServFail)
+          next none
         ");
     }
 

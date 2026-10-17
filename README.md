@@ -39,10 +39,19 @@ while let Some(event) = resolver.poll_event() {
 CNAME loop as `Error::CnameLoop`.
 
 A query for the same name and type as one already in flight joins it instead of being sent,
-and gets the same outcome as its own event, so parallel lookups of one host share their
-queries. One that joins late doesn't inherit the first one's spent attempts: if that one runs
-out, the later query starts over with its own. Cancelling the first hands the query to the next,
-which still starts over rather than fail if it joined late.
+and gets the same outcome as its own event, however late it joined, so parallel lookups of one
+host share their queries. Cancelling the first hands the query to the next.
+
+Failures and negative answers are cached by question: name, type and class (RFC 9520 §3.2,
+RFC 2308 §5). A question that no server answered usefully isn't sent again for
+`Config::failure_cache_min` (1 s by default, never less), and twice as long each time it fails
+again soon after, up to `Config::failure_cache_max` (30 s, at most 5 minutes); queries for it
+fail at once with the cached error. NXDOMAIN, for every type of the name, and NODATA, for its
+type, are cached when the authority section has an SOA record, for the lesser of its TTL and
+MINIMUM, at most `Config::max_negative_ttl` (1 hour), and answered from the cache with their
+TTLs counted down; a search moves past such a candidate without sending it. The cache holds
+`Config::cache_entries` (1024) entries and needs no timer. Answers with data aren't cached.
+Call `Resolver::flush_cache()` when the host's network changes.
 
 ### Tokio and reqwest
 
@@ -50,8 +59,9 @@ which still starts over rather than fail if it joined late.
 `IpLookup` on a background task shared by all clones of the resolver. Each UDP query gets its
 own socket, connected to its server, and TCP or TLS connections stay open between lookups
 until they go idle; when the last clone is dropped, it closes them, over TLS after
-close_notify. Its `tls` feature turns on DNS over TLS in `sansio-dns`. With its `reqwest`
-feature, it plugs into reqwest as the DNS resolver:
+close_notify. Its `flush_cache()` empties the cache, for a network change. Its `tls` feature
+turns on DNS over TLS in `sansio-dns`. With its `reqwest` feature, it plugs into reqwest as the
+DNS resolver:
 
 ```rust
 let client = reqwest::Client::builder()
@@ -104,14 +114,15 @@ lines it can't use instead of failing. Unlike glibc, it takes at most 3 attempts
 instead of 5, since RFC 9520 §3.1 allows no more than three sends of a query to one server
 over one transport. `options no-aaaa` asks for IPv4 addresses only. With search domains, a
 name without a trailing dot is tried with each of them, before the name as given if it has
-fewer than `ndots` dots and after it otherwise. For `Resolver::query` the
-search moves on after NXDOMAIN and after NODATA (the name exists without records of the type
-and class asked for at the end of its CNAME chain), until a candidate has data (RFC 1123 §6.1.4.3, RFC
-2308 §2.2); when it runs out the outcome is the first NODATA, else the last NXDOMAIN. glibc
-moves on after NODATA only when the answer section is empty, so it stops at a CNAME whose
-target has no data. `IpLookup` asks each candidate for both families and moves on when
-neither has an address, as glibc's `getaddrinfo` does, so its addresses are always those of
-one name.
+fewer than `ndots` dots and after it otherwise. `options no-tld-query` (`Config::tld_query`)
+leaves out a name of one label as given, so with search domains `db` never asks for a
+top-level domain. For `Resolver::query` the search moves on after NXDOMAIN and after NODATA
+(the name exists without records of the type and class asked for at the end of its CNAME
+chain), until a candidate has data (RFC 1123 §6.1.4.3, RFC 2308 §2.2); when it runs out the
+outcome is the first NODATA, else the last NXDOMAIN. glibc moves on after NODATA only when the
+answer section is empty, so it stops at a CNAME whose target has no data. `IpLookup` asks
+each candidate for both families and moves on when neither has an address, as glibc's
+`getaddrinfo` does, so its addresses are always those of one name.
 
 ## Compared with hickory-resolver
 
@@ -131,7 +142,7 @@ hickory-resolver 0.26.3 and its cache off:
 
 On localhost the times are mostly task wakeups; on a real network the round trip to the
 server dominates. With its cache on, hickory answers a repeated lookup in about 1 µs, and
-sansio-dns has no cache yet.
+sansio-dns caches no answers with data yet.
 
 Where the two behave differently:
 
@@ -145,7 +156,7 @@ Where the two behave differently:
 | Names with `_` | Resolved | Rejected |
 | Non-ASCII names | UTS 46 over the whole name, as browsers do: `bücher。example` asks for `xn--bcher-kva.example` | Converted label by label, so `。` ends up inside a label |
 | `local.` names | NXDOMAIN without a query, unless under a search domain such as `cluster.local` or a configured zone | Sent to the name servers |
-| Cache | None | Positive and negative, 8192 entries |
+| Cache | Failures (1 s, backing off to 30 s) and negative answers, 1024 entries | Positive and negative, 8192 entries |
 | Server order | As configured; one that failed to answer goes after the others for a minute | By measured latency, two servers raced |
 | Transports | UDP, TCP, DoT | Also DoH, DoH3, DoQ and DNSSEC validation |
 | System configuration | `resolv.conf` and hosts | Also Windows, and macOS through SystemConfiguration |
@@ -162,7 +173,10 @@ RCODEs of RFC 6891 §6.1.3 and RFC 7873 §5.3; `tests/lookup.rs` also has RFC 35
 CNAME chains into special-use names and RFC 6762 §22.1 for `IpLookup`; RFC 2308 §2.2's
 NODATA and RFC 1035 §7.4's records of another class are in `rfc1123.rs`'s §6.1.4.3 module,
 and RFC 6895, 8482 and 9824 in its §6.1.3.2 module; RFC 2308 §7.2's cap is in
-`rfc9520.rs`'s §3.2 module; `rfc6761.rs` has RFC 7686 in its §6.4 module, RFC 6762 in its
+`rfc9520.rs`'s §3.2 module; RFC 1123 §6.1.3.3 (3) and (4) are covered by the tests of RFC 9520
+§3.2 and RFC 2308 §5, RFC 2308 §8 by `rfc2308.rs`'s §5 and §6 modules, and RFC 4343 §3 for
+cache keys by both; RFC 1123 §6.1.4.3 (b)'s `no-tld-query` is in `resolv_conf.rs`'s `search`
+module; `rfc6761.rs` has RFC 7686 in its §6.4 module, RFC 6762 in its
 `rfc6762_section_22_1` module, and RFC 6761 §6.1, §6.2, §6.5, RFC 8375 and RFC 9476 in its
 `not_special_to_resolvers` module;
 `rfc7858.rs` holds the RFC 7858, 8310, 8467, 7830, 7871 and 8446 tests as plain functions,
@@ -185,7 +199,16 @@ time out on a connection. `tests/main.rs` builds them all as one crate. The Toki
 | 1034 | §4.3.1 | An empty `NOERROR` answer with neither AA nor RA, from a server that doesn't recurse and isn't authoritative (such as a referral), fails over (`Error::NoRecursion` on the last), as glibc does; with AA or RA it is NODATA |
 | 1123 | §6.1.3.2 | Zone transfer and meta query types (AXFR, IXFR, OPT, TSIG, TKEY, MAILA, MAILB, NXNAME, TYPE 0; RFC 6895 §3.1, RFC 9824 §3.5) are rejected by `query`; ANY is allowed (RFC 8482) |
 | 1123 | §6.1.3.3 | Retries back off exponentially: each round through the servers waits twice as long, starting at 5 s by default. Each wait lasts at least 1 s and at most 300 s, above the 240 s (twice TCP's maximum segment lifetime) that any limit must exceed, so every query gives up in finite time |
+| 1123 | §6.1.3.3 (3) | Temporary failures are cached (RFC 9520 §3.2 below): 1 s at first and up to 30 s by default, configurable up to 5 minutes; (3) suggests minutes |
+| 1123 | §6.1.3.3 (4) | Negative answers are cached (RFC 2308 §5 below) |
 | 1123 | §6.1.4.3 | Search candidates are tried until one has data of the type and class asked for: NXDOMAIN and NODATA (RFC 2308 §2.2) move on; then the first NODATA is the outcome, else the last NXDOMAIN; a failure ends the search. `IpLookup` asks each candidate for A and AAAA and moves on when neither has an address, so both families come from the same name (§6.1.4.3 (b)) |
+| 1123 | §6.1.4.3 (a) | A candidate with a cached NXDOMAIN or NODATA is passed over without a query, and one with a cached failure ends the search, for `Resolver::query` and `IpLookup` alike |
+| 1123 | §6.1.4.3 (b) | `options no-tld-query` (`Config::tld_query`) keeps a name of one label from being sent as given when there are search domains, as glibc does: a weaker rule than (b)'s two interior dots |
+| 2308 | §5 | NXDOMAIN is cached for every type of the name, NODATA for its type, under the last name of the CNAME chain (§1, §2.1), when the authority section has an SOA record, for the lesser of its TTL and MINIMUM, at most `max_negative_ttl` (1 hour). Not cached: an answer without an SOA, a truncated one (RFC 1123 §6.1.3.2), one with a zero TTL (RFC 1123 §6.1.2.1), a looping chain. RFC 8020's NXDOMAIN cut isn't applied |
+| 2308 | §6 | An answer from the cache asks the question asked and has the authority section as received, every TTL counted down by the whole seconds it was cached, AA clear and no OPT record (RFC 6891 §6.2.1) |
+| 2308 | §7 | No single server's failure is cached for a question: a server that answered with an error is asked first again by the next query; one that didn't answer goes after the others for `failure_memory`, at most 5 minutes (§7.2) |
+| 2308 | §8 | Since failures are cached, so are negative answers, with their SOA record, which is returned with them |
+| 4343 | §3 | The cache compares names without regard to ASCII case |
 | 2181 | §8 | TTLs with the most significant bit set are passed on as zero |
 | 2181 | §9 | A truncated UDP reply switches to TCP even when it is cut off mid-record and doesn't decode; over TCP a truncated reply is used as it is |
 | 3597 | §3 | Records of unknown type are kept as opaque data. hickory rejects a message with an empty-RDATA record outside UPDATE, although `\# 0` is valid; such a reply moves on to the next server at once |
@@ -226,8 +249,8 @@ time out on a connection. `tests/main.rs` builds them all as one crate. The Toki
 | 8310 | §11.1 | Queries over TLS carry an EDNS Client Subnet option with SOURCE PREFIX-LENGTH 0, FAMILY that of the transport (RFC 7871 §7.1.2) |
 | 8467 | §4.1 | Queries padded to a multiple of 128 octets, the padding option last (§3) |
 | 7830 | §3, §6 | One padding option per query, and none on UDP or TCP without TLS |
-| 9520 | §3.1 | A search candidate is sent at most three times to each server over each transport (UDP, and TCP or TLS), free resends and cancel hand-overs included; a send that would be the fourth goes to the next server as a new attempt, and the query fails when no server is left, unless it took over from a cancelled query after joining late: then it starts over. `resolv.conf` attempts are capped at 3 per server |
-| 9520 | §3.2 | A server that failed to answer goes after the others for at most 5 minutes (`failure_memory`, 60 s by default), kept per server address (RFC 2308 §7.2 caps it too) |
+| 9520 | §3.1 | A search candidate is sent at most three times to each server over each transport (UDP, and TCP or TLS), free resends and cancel hand-overs included; a send that would be the fourth goes to the next server as a new attempt, and the query fails when no server is left. `resolv.conf` attempts are capped at 3 per server |
+| 9520 | §3.2 | Every failure (§2: timeouts, network and TLS errors, error codes, replies that don't decode) is cached for the question, and so are referrals, which §2 counts as useful but a stub can't follow: nothing is sent for it, and queries for it, the ones that joined it and ones in flight that would send it again fail at once with the cached error. 1 s the first time (`failure_cache_min`, at least 1 s), twice as long when a query first sent soon after the last one expired fails too, up to `failure_cache_max` (30 s, at most 5 minutes); a useful answer (data, NXDOMAIN or NODATA) resets the backoff. A cancel hand-over that runs out of servers fails with `Timeout` uncached, since the server may have answered the cancelled queries' sockets. At most `cache_entries` (1024) entries, expired ones dropped first, then the oldest; `flush_cache` empties it. Separately, a server that failed to answer goes after the others for at most 5 minutes (`failure_memory`, 60 s by default), kept per server address (RFC 2308 §7.2 caps it too) |
 
 ### Driver obligations
 
@@ -268,7 +291,9 @@ so the query moves on at once instead of waiting out its deadline. An error does
 socket: keep receiving on it while the query's attempts go to that server, and bind a new one
 when an attempt goes to another. Bind each socket in the destination's address family, pass
 the source address as received (an IPv4 server seen as `::ffff:a.b.c.d` won't match), and
-read datagrams into a buffer of at least 1232 bytes.
+read datagrams into a buffer of at least 1232 bytes. When the host's network changes, call
+`flush_cache()`: failures and negative answers from the old network shouldn't hold on the new
+one.
 
 ### Not implemented
 
@@ -276,7 +301,8 @@ read datagrams into a buffer of at least 1232 bytes.
 - SPKI pin sets (RFC 7858 §4.2) and raw public keys (RFC 8310 §9), and DANE authentication
   (RFC 8310 §8.2), which needs DNSSEC validation.
 - EDNS TCP keepalive (RFC 7828) to negotiate the idle timeout with the server.
-- DoH/DoQ, caching.
+- DoH/DoQ.
+- A cache of answers with data: only failures and negative answers are cached.
 - DNS cookies (RFC 7873): queries carry no COOKIE option.
 - `resolv.conf` options other than the ones above (`rotate`, `use-vc`, `sortlist`, …).
 - Sorting addresses by the host's own ones (RFC 6724 §6); `IpLookup` lists them by family,
@@ -303,11 +329,11 @@ The `fuzz/` crate has [cargo-fuzz](https://crates.io/crates/cargo-fuzz) targets 
 drive the resolver with arbitrary datagrams (`datagram`), TCP bytes (`stream`), DoT
 records (`tls_stream`), hosts and resolv.conf files (`system_files`) and call sequences
 (`driver_ops`). After every step they check one event per query, transmits only for live
-queries and open connections, and a timer exactly while something is pending; `datagram`,
-`stream` and `driver_ops` also bound the sends per query. `system_files` checks the local
-answers for hosts, special-use and link-local names, the order of the search candidates and
-the answer the search ends on, and
-`tls_stream` checks that every query the server decrypts keeps EDNS, carries the Client
+queries and open connections, nothing sent for a question within a second of its failure, and
+a timer exactly while something is pending; `datagram`, `stream` and `driver_ops` also bound
+the sends per query and check that queries for one name never start over. `system_files`
+checks the local answers for hosts, special-use and link-local names, the order of the search
+candidates, `no-tld-query` included, and the answer the search ends on, and `tls_stream` checks that every query the server decrypts keeps EDNS, carries the Client
 Subnet privacy option for the server's address family and then one padding option to a
 multiple of 128 octets, and is sent at most `attempts + 3` times, and at most three times to
 one server, and that every connection the resolver closes ends its session with close_notify

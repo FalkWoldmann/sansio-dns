@@ -4,8 +4,9 @@
 //! Hosts and special-use names, and link-local names none of whose search
 //! candidates is sent, must be answered locally with the right addresses;
 //! other names walk the search candidates in glibc's order, link-local ones
-//! left out, each answered NXDOMAIN, or NODATA for one of them, until the
-//! one chosen to have data. When none has, the walk ends on the NODATA
+//! left out, and a name of one label as given too with `options
+//! no-tld-query`, each answered NXDOMAIN, or NODATA for one of them, until
+//! the one chosen to have data. When none has, the walk ends on the NODATA
 //! answer if there was one.
 
 #![no_main]
@@ -73,6 +74,7 @@ enum ConfLine<'a> {
     Ndots(u8),
     Timeout(u8),
     Attempts(u8),
+    NoTldQuery,
     Raw(&'a [u8]),
 }
 
@@ -147,6 +149,7 @@ fn render_resolv_conf(lines: &[ConfLine<'_>]) -> Vec<u8> {
             ConfLine::Ndots(n) => writeln!(text, "options ndots:{n}"),
             ConfLine::Timeout(n) => writeln!(text, "options timeout:{n}"),
             ConfLine::Attempts(n) => writeln!(text, "options attempts:{n}"),
+            ConfLine::NoTldQuery => writeln!(text, "options no-tld-query"),
             ConfLine::Raw(bytes) => text.write_all(bytes).and_then(|()| writeln!(text)),
         };
     }
@@ -190,9 +193,10 @@ fn never_sent(name: &Name, search: &[Name]) -> bool {
 }
 
 /// The names glibc's `res_search` tries for `name`, in order, leaving out
-/// those that are never sent, the name as given among them. A name tried
-/// only as given is kept: the local answer covers it.
-fn candidates(name: &Name, search: &[Name], ndots: u8) -> Vec<Name> {
+/// those that are never sent, the name as given among them, and a name of
+/// one label as given without `tld_query` (`options no-tld-query`). A name
+/// tried only as given is kept: the local answer covers it.
+fn candidates(name: &Name, search: &[Name], ndots: u8, tld_query: bool) -> Vec<Name> {
     let mut absolute = name.clone();
     absolute.set_fqdn(true);
     if name.is_fqdn() || search.is_empty() {
@@ -202,10 +206,11 @@ fn candidates(name: &Name, search: &[Name], ndots: u8) -> Vec<Name> {
         .iter()
         .filter_map(|domain| name.clone().append_domain(domain).ok());
     let dots = usize::from(name.num_labels()).saturating_sub(1);
+    let as_given = (tld_query || dots > 0).then_some(absolute);
     let all: Vec<Name> = if dots >= usize::from(ndots) {
-        std::iter::once(absolute).chain(searched).collect()
+        as_given.into_iter().chain(searched).collect()
     } else {
-        searched.chain(std::iter::once(absolute)).collect()
+        searched.chain(as_given).collect()
     };
     all.into_iter()
         .filter(|candidate| !never_sent(candidate, search))
@@ -264,7 +269,7 @@ fuzz_target!(|input: Input<'_>| {
     }
     let mut config = Config::from_resolv_conf(&render_resolv_conf(&input.resolv_conf));
     config.hosts = hosts.clone();
-    let (search, ndots) = (config.search.clone(), config.ndots);
+    let (search, ndots, tld_query) = (config.search.clone(), config.ndots, config.tld_query);
     let mut harness = Harness::new(config, Vec::new(), None);
 
     for step in input.steps.iter().take(6) {
@@ -285,7 +290,7 @@ fuzz_target!(|input: Input<'_>| {
         } else {
             RecordType::A
         };
-        let expected = candidates(&name, &search, ndots);
+        let expected = candidates(&name, &search, ndots, tld_query);
         let local = local_answer(&name, record_type, &hosts, &search, &expected);
         let found = step.found.map(usize::from);
         let nodata = step.nodata.map(usize::from).filter(|n| found != Some(*n));

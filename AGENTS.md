@@ -58,15 +58,16 @@ doesn't start with `tests/`) keeps `#![expect(...)]`.
 
 ## Architecture
 
-The core has seven modules: `src/lib.rs` (crate docs and public types), `src/config.rs`
+The core has eight modules: `src/lib.rs` (crate docs and public types), `src/config.rs`
 (`Config`, resolv.conf), `src/hosts.rs` (hosts file entries), `src/wire.rs` (framing, padding,
-reply matching, special-use answers), `src/resolver.rs` (the state machine), `src/lookup.rs`
-(`IpLookup`) and `src/tls.rs` (DoT sessions driven in memory, `tls` feature).
+reply matching, special-use answers), `src/resolver.rs` (the state machine), `src/cache.rs`
+(failures and negative answers), `src/lookup.rs` (`IpLookup`) and `src/tls.rs` (DoT sessions
+driven in memory, `tls` feature).
 The `Resolver` is a state machine over two maps: pending queries
-(`QueryId` -> `Pending`) and stream connections (`ConnectionId` -> `Connection`). Inputs are
-`query`, `handle_datagram(query, from, ..)`, `handle_udp_error`,
-`handle_stream_data/closed/error`, `handle_timeout`, `cancel` and `shutdown`; outputs are
-drained with `poll_transmit`, `poll_event` and `poll_timeout`.
+(`QueryId` -> `Pending`) and stream connections (`ConnectionId` -> `Connection`), plus the
+`Cache`. Inputs are `query`, `handle_datagram(query, from, ..)`, `handle_udp_error`,
+`handle_stream_data/closed/error`, `handle_timeout`, `cancel`, `flush_cache` and `shutdown`;
+outputs are drained with `poll_transmit`, `poll_event` and `poll_timeout`.
 
 - A query's current server is `Config::server(position)` (the list, rotated). `position`
   starts at `first`, the first server not in `Resolver::failed` (no answer within
@@ -119,19 +120,33 @@ drained with `poll_transmit`, `poll_event` and `poll_timeout`.
   transport (RFC 9520 §3.1), so `advance` skips servers without room, and the free sends
   and `switch_to_tcp` check `may_resend` first and move on instead. The crate docs' "How a
   query moves on" table states the rules (at most `attempts + 3` sends per search
-  candidate, not counting a cancel hand-over's resend, the resends after a lost connection
-  that answered since, or a late joiner's fresh start, and at most three per server and
-  transport, all of those included), and a comment above `retry` maps each row to its
-  function: change these functions together and keep the table in sync.
+  candidate, not counting a cancel hand-over's resend or the resends after a lost connection
+  that answered since, and at most three per server and transport, all of those included),
+  and a comment above `retry` maps each row to its function: change these functions
+  together and keep the table in sync.
 - Every wait is bounded (RFC 1123 §6.1.3.3): `Config::wait` keeps a deadline between 1 s
   and 300 s after backoff, and `Config::failed_for` caps the failure memory at 5
   minutes (RFC 9520 §3.2). Deadlines are plain `Instant`s; nothing waits forever.
 - A query for the same name (as given) and type as a pending one joins it as a
-  follower (`Pending::followers`) and gets its outcome. When the leader runs out of attempts
-  or servers, followers that joined after its current search candidate started start over
-  (`give_up`); `cancel(id, now)` hands a query with followers to the first of them,
-  re-sending a UDP attempt from the follower's own socket. The heir's join time goes into
-  `Pending::joined`, so `give_up` starts it over too if it joined late.
+  follower (`Pending::followers`) and gets its outcome, failures included however late it
+  joined; `cancel(id, now)` hands a query with followers to the first of them, re-sending a
+  UDP attempt from the follower's own socket. An heir with no room left moves on by `step`
+  (`advance` without `give_up`), and with no server left fails without caching the
+  `Timeout`: the server may have answered the cancelled queries' sockets.
+- `src/cache.rs` caches resolution failures (RFC 9520 §3.2) and negative answers (RFC 2308
+  §5) in a `BTreeMap` keyed by the question as sent: the lowercased absolute candidate, the
+  class, and the type, or `None` for an NXDOMAIN, which holds for every type. `Entry` is
+  `Negative(Stored)` or `Failed(Failure)`; a positive answer would be one more variant like
+  `Negative`. It reads time only from `now`, so `poll_timeout` doesn't change: an expired
+  negative entry is dropped on lookup, an expired failure stays for the backoff (until its
+  `forget`, which `Cache::failed` compares with `Pending::started`), and the
+  `Config::cache_entries` bound drops expired entries first, then the oldest by `serial`. Lookups: `start` and `search_on` run `walk` over the search
+  candidates before joining or sending (a cached NXDOMAIN or NODATA goes into the `Outcome`
+  and moves on, a cached failure ends the search), and `emit` refuses to send a question
+  with a cached failure, failing the query instead. Stores: `give_up` (every failure,
+  `Cache::failed`, with the backoff judged by `Pending::started`), and `handle_response`
+  (`Cache::answered` for data, `Cache::negative` for NXDOMAIN and NODATA, which also ends a
+  failure's backoff; error codes and referrals don't). `flush_cache` also clears `Resolver::failed`.
 - Some names are answered without a transmit, in this order: `localhost.`, `invalid.` and
   `onion.` names as given (`wire::is_special_use`), then `Config::hosts` entries as given,
   then names under `local.` and the link-local reverse zones (RFC 6762 §22.1) unless they are
@@ -141,9 +156,9 @@ drained with `poll_transmit`, `poll_event` and `poll_timeout`.
   left, since RFC 6762 §3 judges the name actually queried). `IpLookup`
   (`src/lookup.rs`) walks the search candidates itself: per candidate it starts an A and an
   AAAA query for the absolute name (`Resolver::query_candidate`, which skips `Config::hosts`;
-  the lookup checks the name as given with `Resolver::is_local` first), merges the addresses
-  from the events it is fed, and moves on when neither has one, so `handle_event` takes the
-  resolver. `addresses` follows the CNAME chain, stops at a special-use name, keeps only the
+  the lookup checks the name as given with `Resolver::is_local` first, and the cache applies
+  as for any query), merges the addresses from the events it is fed, and moves on when
+  neither has one, so `handle_event` takes the resolver. `addresses` follows the CNAME chain, stops at a special-use name, keeps only the
   question's type and class, and reports a loop as `Error::CnameLoop`.
 - The Tokio driver's `lookup_ip` turns a host into a `Name` itself (`host_name`): UTS 46 over
   the whole name for non-ASCII input (the `idna` crate), A-label checks for ASCII input, which
@@ -157,7 +172,8 @@ drained with `poll_transmit`, `poll_event` and `poll_timeout`.
   writes before it, which over TLS end with the close_notify alert (a connection still
   connecting may be dropped at once). After reporting a stream closed, still write what was
   queued for it before the report (the reply to the server's close_notify), and call
-  `shutdown` and carry out its transmits before stopping.
+  `shutdown` and carry out its transmits before stopping. Call `flush_cache` when the host's
+  network changes.
 
 `sansio-dns-tokio` runs one background task per `Resolver` (shared by its clones), spawned on
 the runtime of the first lookup. It owns the core resolver and all I/O: a UDP socket per query
@@ -170,7 +186,8 @@ until its queue is dropped, which `Io::drop_ended` does only after the transmits
 before the report are carried out. When the last clone is dropped, the task calls
 `shutdown`, carries out its transmits and gives the connections `CLOSE_GRACE` to finish.
 Lookups send a request over a channel with a `oneshot` reply; `CancelOnDrop` cancels a lookup
-whose future is dropped. If the task's runtime shuts down, the next lookup (or a waiting one)
+whose future is dropped, and `Resolver::flush_cache` sends a request that empties the core's
+cache. If the task's runtime shuts down, the next lookup (or a waiting one)
 restarts it on its own runtime.
 A resolver shared with an idle current-thread runtime can hang lookups from other runtimes;
 that limitation is documented, not handled.
@@ -196,9 +213,12 @@ DoT lifecycle tests in `tests/rfc7858.rs` (`tls` feature) use their in-process r
 and plain assertions; `sansio-dns-tokio/tests/tls.rs` runs a rustls server on localhost to
 check how the driver's DoT connections end. `tests/state_machine.rs` is a proptest-state-machine test: random
 driver-call sequences against a reference model, with invariants checked after every step and
-failures shrunk to short call sequences. Of the deadlines it only checks that there is one
-exactly when queries are pending or connections are open, and that it is in the future; the
-snapshots pin their values.
+failures shrunk to short call sequences. Its harness also models the cache from the outcomes
+it sees (nothing sent for a name within a second of its failure or while its negative answer
+lasts, cached outcomes delivered at once with the SOA TTL counted down, a name with nothing
+cached sent). Of the deadlines it only checks that there is one exactly when queries are
+pending or connections are open, and that it is in the future; the snapshots pin their
+values. `tests/rfc2308.rs` and `rfc9520.rs`'s §3.2 module hold the cache lifecycles.
 
 ## Conventions
 

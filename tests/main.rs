@@ -16,6 +16,7 @@ mod resolv_conf;
 mod rfc1035;
 mod rfc1123;
 mod rfc2181;
+mod rfc2308;
 mod rfc3597;
 mod rfc5452;
 mod rfc6761;

@@ -21,6 +21,11 @@
 //! unreachable, which moves the query on at once. Dropping a lookup's future
 //! cancels its queries.
 //!
+//! The background task's [`sansio_dns::Resolver`] caches failures and
+//! negative answers (see `sansio_dns`'s crate docs), so a lookup that just
+//! failed fails again at once for a second or more. Call
+//! [`Resolver::flush_cache`] when the host's network changes.
+//!
 //! The task runs on the runtime of the lookup that started it, so keep a
 //! resolver within one runtime. Used from several, a lookup waits on
 //! whichever runtime runs the task, and a current-thread runtime only runs
@@ -206,6 +211,25 @@ impl Resolver {
         }
         Err(Error::Stopped)
     }
+
+    /// Forget the failures and negative answers the resolver has cached,
+    /// and which name servers failed to answer recently: call it when the
+    /// host's network changes, such as on a new address or default route,
+    /// since what failed or didn't exist on the old network may work on the
+    /// new one. Lookups started after this call don't see the old entries;
+    /// lookups in flight go on. Without a running background task there is
+    /// nothing to forget.
+    pub fn flush_cache(&self) {
+        let task = self
+            .shared
+            .task
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(requests) = &*task {
+            // A task that stopped with its runtime took its cache with it.
+            requests.send(Request::FlushCache).ok();
+        }
+    }
 }
 
 /// `host`, which isn't an IP address, as the name to look up; see
@@ -353,6 +377,8 @@ enum Request {
     },
     /// The lookup's future was dropped before its answer arrived.
     Cancel(u64),
+    /// Empty the resolver's cache.
+    FlushCache,
 }
 
 /// Cancels the lookup `id` unless disarmed by taking `requests`.
@@ -458,6 +484,7 @@ async fn run(config: Config, mut requests: mpsc::UnboundedReceiver<Request>) {
                         }
                     }
                 }
+                Some(Request::FlushCache) => resolver.flush_cache(),
                 None => {
                     resolver.shutdown();
                     while let Some(transmit) = resolver.poll_transmit() {

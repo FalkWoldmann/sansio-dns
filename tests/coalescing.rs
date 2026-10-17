@@ -171,9 +171,11 @@ fn cancelled_leader_on_a_stream_hands_over_without_sending(mut trace: Trace) {
     ");
 }
 
-/// Joining late doesn't mean sharing the first query's spent attempts.
+/// A query that joined just before the first one ran out of attempts
+/// shares its failure, and sends nothing of its own: the failure is cached
+/// (RFC 9520 §3.2), so it would have failed at once a moment later anyway.
 #[test]
-fn late_joiner_starts_over_when_the_first_runs_out() {
+fn late_joiner_gets_the_failure() {
     let mut config = Config::new(S1, []);
     config.timeout = Duration::from_secs(2);
     let mut trace = Trace::new(Resolver::new(config));
@@ -183,6 +185,7 @@ fn late_joiner_starts_over_when_the_first_runs_out() {
     trace.query("example.com.", RecordType::A);
 
     trace.timeout_at(Duration::from_secs(6));
+    trace.query("example.com.", RecordType::A);
 
     assert_snapshot!(trace, @"
     t=0s query q0 example.com. A
@@ -195,8 +198,11 @@ fn late_joiner_starts_over_when_the_first_runs_out() {
       next t=6s
     t=6s timeout
       => q0 Failed Timeout
-      -> S1 udp q1: example.com. A
-      next t=8s
+      => q1 Failed Timeout
+      next none
+    t=6s query q2 example.com. A
+      => q2 Failed Timeout
+      next none
     ");
 }
 
@@ -233,11 +239,10 @@ fn joined_query_follows_the_search() {
     ");
 }
 
-/// A query that joined after the first one started doesn't share the first
-/// one's error answers either: it starts over and may ask every server
-/// again.
+/// The same with error answers: no server is asked again for the query that
+/// joined late.
 #[test]
-fn late_joiner_starts_over_when_every_server_refused() {
+fn late_joiner_gets_the_error_answer() {
     let mut config = Config::new(S1, []);
     config.timeout = Duration::from_secs(2);
     let mut trace = Trace::new(Resolver::new(config));
@@ -256,8 +261,8 @@ fn late_joiner_starts_over_when_every_server_refused() {
       next t=2s
     t=1s <- S1 udp q0: example.com. A: Refused, 0 answers
       => q0 Failed Server(Refused)
-      -> S1 udp q1: example.com. A
-      next t=3s
+      => q1 Failed Server(Refused)
+      next none
     ");
 }
 

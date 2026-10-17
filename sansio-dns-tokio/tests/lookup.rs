@@ -4,14 +4,15 @@ use std::future::{Future, poll_fn};
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::pin;
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
 use std::time::Duration;
 
 use crate::common::{V4, V6, counting_name_server, name_server, name_server_on};
 use rstest::rstest;
 use sansio_dns::Config;
-use sansio_dns::hickory_proto::op::{Message, OpCode};
+use sansio_dns::hickory_proto::op::{Message, OpCode, ResponseCode};
 use sansio_dns::hickory_proto::rr::rdata::{A, AAAA};
 use sansio_dns::hickory_proto::rr::{RData, Record, RecordType};
 use sansio_dns_tokio::{Error, Resolver};
@@ -158,6 +159,52 @@ async fn unknown_name_is_not_found() {
     let result = resolver.lookup_ip("other.example").await;
 
     assert!(matches!(result, Err(Error::NotFound)), "{result:?}");
+}
+
+/// A failed lookup is cached by the resolver (RFC 9520 §3.2): the next
+/// one fails at once without a query, until `flush_cache`, as for a network
+/// change.
+#[tokio::test]
+async fn failure_is_cached_until_flushed() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = server.local_addr().unwrap();
+    let queries = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&queries);
+    tokio::spawn(async move {
+        let mut buf = [0; 512];
+        while let Ok((n, from)) = server.recv_from(&mut buf).await {
+            counted.fetch_add(1, Ordering::Relaxed);
+            let query = Message::from_vec(&buf[..n]).unwrap();
+            let mut response = Message::response(query.metadata.id, OpCode::Query);
+            response.add_queries(query.queries);
+            response.metadata.response_code = ResponseCode::ServFail;
+            server
+                .send_to(&response.to_vec().unwrap(), from)
+                .await
+                .unwrap();
+        }
+    });
+    let resolver = Resolver::new(Config::new(address, []));
+    let servfail = |result: Result<Vec<IpAddr>, Error>| {
+        matches!(
+            result,
+            Err(Error::Resolve(sansio_dns::Error::Server(
+                ResponseCode::ServFail
+            )))
+        )
+    };
+
+    assert!(servfail(resolver.lookup_ip("app.example").await));
+    assert!(servfail(resolver.lookup_ip("app.example").await));
+    assert_eq!(queries.load(Ordering::Relaxed), 2, "A and AAAA, once");
+
+    resolver.flush_cache();
+    assert!(servfail(resolver.lookup_ip("app.example").await));
+    assert_eq!(
+        queries.load(Ordering::Relaxed),
+        4,
+        "sent again after the flush"
+    );
 }
 
 /// The lookup starts the queries for the next search candidate itself

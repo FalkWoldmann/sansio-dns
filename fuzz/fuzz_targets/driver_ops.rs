@@ -16,7 +16,9 @@ use libfuzzer_sys::fuzz_target;
 use sansio_dns::hickory_proto::op::ResponseCode;
 use sansio_dns::hickory_proto::rr::RecordType;
 use sansio_dns::{Config, Transport};
-use sansio_dns_fuzz::{Code, Harness, S1, S2, S3, Sent, add_ns, cut, flip, frame, name, reply};
+use sansio_dns_fuzz::{
+    Code, Harness, S1, S2, S3, Sent, add_ns, add_soa, cut, flip, frame, name, reply,
+};
 
 const NAMES: [&str; 5] = [
     "example.com.",
@@ -39,6 +41,12 @@ enum Reply {
     FormErrWithoutOpt,
     /// `NOERROR` without an answer.
     NoData,
+    /// NXDOMAIN or NODATA with an SOA record, which the resolver caches for
+    /// the record's TTL in seconds.
+    Negative {
+        nxdomain: bool,
+        ttl: u8,
+    },
     /// `NOERROR` without an answer, AA or RA, with an NS record in authority.
     Referral,
     Truncated,
@@ -68,6 +76,7 @@ enum Op {
     Garbage { to: u8, bytes: Vec<u8> },
     UdpError(u8),
     Shutdown,
+    Flush,
 }
 
 #[derive(Arbitrary, Debug)]
@@ -89,12 +98,17 @@ fn answer(sent: &Sent, kind: &Reply) -> Option<(SocketAddr, Vec<u8>)> {
     let code = match kind {
         Reply::Code(code) => (*code).into(),
         Reply::FormErrWithoutOpt => ResponseCode::FormErr,
+        Reply::Negative { nxdomain: true, .. } => ResponseCode::NXDomain,
         _ => ResponseCode::NoError,
     };
     let mut response = reply(&sent.request, code);
     match kind {
         Reply::FormErrWithoutOpt => response.edns = None,
         Reply::NoData => response.answers.clear(),
+        Reply::Negative { ttl, .. } => {
+            response.answers.clear();
+            add_soa(&mut response, u32::from(*ttl % 8));
+        }
         Reply::Referral => {
             response.answers.clear();
             response.metadata.recursion_available = false;
@@ -211,6 +225,7 @@ fuzz_target!(|input: Input| {
                 }
             }
             Op::Shutdown => harness.shutdown(),
+            Op::Flush => harness.flush(),
         }
         harness.check();
     }

@@ -28,6 +28,9 @@
 //! With the `tls` feature, `Config::with_tls` and `Config::with_tls_names`
 //! send every query over DNS over TLS (RFC 7858) instead.
 //!
+//! Failures and negative answers are cached for a while, so the same
+//! question isn't sent again at once; see [Cache](#cache).
+//!
 //! # How a query moves on
 //!
 //! Each query has [`Config::attempts`] attempts. Its first goes to the first
@@ -89,8 +92,11 @@
 //! | Either of the two rows above, a second time | sends its next attempt | next | yes | fresh |
 //! | A connection that never answered is lost, or TLS rejects bytes received on any connection or refuses a write to it | sends its next attempt | next | yes | fresh |
 //! | `NXDOMAIN`, or NODATA (`NOERROR` without records of the type and class asked for), with search candidates left | starts over with the next candidate: new message ID, with EDNS, over UDP unless a connection is open or over TLS, no server skipped, a new free resend | first that hasn't failed | fresh attempts | fresh |
+//! | Its next search candidate, or its first, has a cached `NXDOMAIN` or NODATA (see [Cache](#cache)) | takes that as the candidate's answer and moves on to the candidate after it, or ends as with no candidate left | none | no | |
+//! | Its search candidate has a cached failure: when the query starts or reaches that candidate, or would send it again | fails with the cached error, and so do the queries that joined it | none | | |
 //! | It was the first to join a query that is cancelled (see below) | takes the query over; over UDP the current attempt is sent again, from its own socket | same | no | fresh over UDP, kept on a stream |
-//! | Out of attempts, or every server skipped | fails with the last error, or [`Error::Timeout`] when a query has no server left after it took over a cancelled one or got a truncated answer; a query that joined after the search candidate started starts over instead (see below) | | | |
+//! | The same, when that datagram would be the fourth to the server | sends its next attempt, or with none left fails with [`Error::Timeout`], and so do the queries that joined it; the failure isn't cached, since the server may have answered the cancelled queries' sockets | next | yes | fresh |
+//! | Out of attempts, or every server skipped | fails with the last error, or [`Error::Timeout`] when a query has no server left after a truncated answer, and so do the queries that joined it; the failure is cached | | | |
 //!
 //! A query "sent again" goes to the same server by the rule above: over its
 //! open connection, else over a new one if the query must use a stream,
@@ -133,7 +139,7 @@
 //! something after the query was written to it: those are bounded only by
 //! the three sends per server. Skipping servers only lowers that: with one
 //! server, a server error ends the query. With k candidates that is k times
-//! as many. A late joiner starting over has attempts and sends of its own.
+//! as many, and a candidate the cache answers sends nothing.
 //!
 //! Every attempt and every free send waits at most 300 seconds for its
 //! answer, and a send that keeps its deadline adds no time. So with n
@@ -149,15 +155,87 @@
 //! waits 30, 60 and 120 seconds: 210 per server.
 //!
 //! A query for the same name (as given, trailing dot included, case ignored)
-//! and type as one in flight joins it instead of being sent, and gets its
-//! outcome. An [`IpLookup`] asks for each candidate by its absolute name,
-//! so its queries join, and are joined by, queries for that name. If the
-//! first one runs out of attempts or servers, the queries that joined
-//! after its current search candidate started don't share the failure:
-//! the first of them starts over as a new query, with every server to
-//! ask, and the others join it. [`Resolver::cancel`] hands a query that
-//! others joined to the first of them, which keeps its own join time: if
-//! it joined late, it starts over too rather than fail.
+//! and type as one in flight joins it instead of being sent, unless the
+//! cache answers it, and gets its outcome. An [`IpLookup`] asks for each
+//! candidate by its absolute name, so its queries join, and are joined by,
+//! queries for that name. If the first one runs out of attempts or
+//! servers, every query that joined it fails with it, however late it
+//! joined: the failure is cached, so a query issued just after would fail
+//! the same way, without being sent (RFC 9520 §3.2). [`Resolver::cancel`]
+//! hands a query that others joined to the first of them.
+//!
+//! # Cache
+//!
+//! The resolver caches resolution failures (RFC 9520 §3.2) and negative
+//! answers (RFC 2308 §5), but no answers with data. An entry is keyed by a
+//! question: an absolute name, compared without regard to ASCII case (RFC
+//! 4343 §3), a type and a class. A failure is cached for the search
+//! candidate as sent, a negative answer for the name it denies (see
+//! below). Every search candidate is looked up before it is sent, for
+//! [`Resolver::query`] and [`IpLookup`] alike. The cache reads time only
+//! from the `now` passed in, so it adds no deadline: an expired negative
+//! answer is dropped when it is looked up, and an expired failure is kept
+//! for the backoff below until it is replaced, an answer ends it or the
+//! cache needs room.
+//!
+//! A search candidate fails to resolve (RFC 9520 §2) when its query runs
+//! out of attempts or servers, or its TLS session can't start, whatever
+//! the last error was: no answer by the deadline, a datagram that couldn't
+//! be sent or drew an ICMP error, a lost connection or a TLS error (§2.3),
+//! an error code such as `SERVFAIL` (§2.1), `REFUSED` (§2.2) or `FORMERR`
+//! (§2.7), a reply that doesn't decode, or an empty answer with neither AA
+//! nor RA. §2 counts a referral as a useful answer, to a resolver that can
+//! follow it; a stub resolver asks for recursion and can't, so here it is
+//! a failure like the others. `NXDOMAIN` and NODATA are answers, not
+//! failures. Nor is a query that took over a cancelled one and may send
+//! to no server any more (see the table): the server may have answered
+//! the cancelled queries' sockets. Each failure is cached for the
+//! candidate's question, for [`Config::failure_cache_min`] (one second by
+//! default, and never less) the first time. If the question fails again
+//! and was first sent within [`Config::failure_cache_max`] after its cached
+//! failure expired, it is cached twice as long as the time before (§3.2's
+//! backoff), however long its retries took, up to that maximum: 30
+//! seconds by default, and never more than five minutes (§3.2). A useful
+//! answer for the question, data, `NXDOMAIN` or NODATA, ends the backoff;
+//! an error code or a referral doesn't. While a failure is cached, nothing is sent for its
+//! question (§3.2): a query for it, a search that reaches it, and a query
+//! in flight that would send it again all fail at once with the cached
+//! error.
+//!
+//! An `NXDOMAIN` answer is cached for every type of the name, a NODATA
+//! answer for its type only (RFC 2308 §5), under the last name of the
+//! answer's CNAME chain (§1, §2.1, §2.2): the alias exists, its target
+//! doesn't. It lasts the lesser of the TTL and the MINIMUM field of the SOA
+//! record in the authority section (§5), at most
+//! [`Config::max_negative_ttl`] (one hour by default). Not cached: an
+//! answer without an SOA record (§5), a truncated one (RFC 1123 §6.1.3.2),
+//! one that would last zero seconds (RFC 1123 §6.1.2.1), a chain that
+//! loops, and the answers given locally. Nor is the `NXDOMAIN` cut of RFC
+//! 8020 applied: a stub resolver may sit behind servers that see the
+//! namespace differently. A query the cache answers gets the server's
+//! answer for the question it asks, with the authority section the server
+//! sent (the SOA record, and NS or NSEC records if any), no answer or
+//! additional section and no OPT record (RFC 6891 §6.2.1), AA clear, and
+//! each TTL less the whole seconds the answer has been cached, none above
+//! the entry's lifetime (RFC 2308 §6).
+//! In a search, such an answer moves on to the next candidate without a
+//! transmit, so a search list doesn't ask the servers about the same
+//! nonexistent names again and again, which meets RFC 1123 §6.1.4.3 (a)
+//! here rather than relying on the name servers' caches.
+//!
+//! The cache holds at most [`Config::cache_entries`] entries (1024 by
+//! default). A full cache drops its expired entries first, then the
+//! oldest, which bounds the memory a flood of failing names can take
+//! (RFC 9520 §3.2, §5). [`Resolver::flush_cache`] empties it, and forgets
+//! which servers failed to answer: a driver should call it when the host's
+//! network changes.
+//!
+//! A single server's failure is not cached for a question, which RFC 2308
+//! §7.1 and §7.2 would key by the server's address: a server that answers
+//! with an error is skipped for the rest of the search candidate only, and
+//! one that doesn't answer goes after the others for
+//! [`Config::failure_memory`], kept by server address as RFC 9520 §3.2
+//! allows, which orders the servers but withholds no query.
 //!
 //! # Driver obligations
 //!
@@ -232,6 +310,10 @@
 //! receiving on it while the query's attempts go to that server, and bind
 //! a new one when an attempt goes to another.
 //!
+//! When the host's network changes, such as a new address or a new
+//! default route, call [`Resolver::flush_cache`]: failures and negative
+//! answers from the old network shouldn't hold for the new one.
+//!
 //! [RFC 5452 §9.2]: https://rfc-annotations.research.icann.org/rfc5452.html
 
 use std::io;
@@ -240,6 +322,7 @@ use std::net::SocketAddr;
 pub use hickory_proto;
 use hickory_proto::op::{Message, ResponseCode};
 
+mod cache;
 mod config;
 mod hosts;
 mod lookup;
@@ -299,16 +382,16 @@ pub struct Transmit {
 #[derive(Debug)]
 pub enum Event {
     /// A server answered with `NOERROR` or `NXDOMAIN`, or the name was
-    /// answered locally. Empty answers arrive here too; inspect
-    /// `response.metadata.response_code`. TTLs received with the most
-    /// significant bit set are zero here (RFC 2181 §8).
+    /// answered locally or from the cache. Empty answers arrive here too;
+    /// inspect `response.metadata.response_code`. TTLs received with the
+    /// most significant bit set are zero here (RFC 2181 §8).
     Response {
         /// The query that completed.
         query: QueryId,
         /// The server's answer.
         response: Message,
     },
-    /// The query gave up.
+    /// The query gave up, or its question has a cached failure.
     Failed {
         /// The query that failed.
         query: QueryId,
@@ -317,14 +400,19 @@ pub enum Event {
     },
 }
 
-/// Why a query failed.
+/// Why a query failed. An error in an [`Event::Failed`] is a resolution
+/// failure (RFC 9520 §2), cached for the question that failed; see the
+/// crate docs. Two exceptions: [`Error::NoRecursion`], a referral, which
+/// §2 counts as a useful answer but a stub resolver can't follow, is
+/// cached like a failure; and the [`Error::Timeout`] of a query that took
+/// over a cancelled one and may send to no server any more isn't cached.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
     /// The last attempt got no answer by its deadline, or its connection was
     /// closed because another query on it timed out. Also when a query may
     /// send to no server any more (RFC 9520 §3.1) after it took over a
-    /// cancelled one, or after a truncated answer.
+    /// cancelled one, which isn't cached, or after a truncated answer.
     #[error("no response from any name server")]
     Timeout,
     /// The last TCP connection closed before a complete response arrived.

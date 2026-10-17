@@ -61,6 +61,14 @@ const MAX_WAIT: Duration = Duration::from_secs(300);
 /// The longest a server stays failed (RFC 2308 §7.2, RFC 9520 §3.2).
 const MAX_FAILURE_MEMORY: Duration = Duration::from_secs(300);
 
+/// The shortest time a resolution failure is cached (RFC 9520 §3.2: "at
+/// least 1 second").
+const MIN_FAILURE_CACHE: Duration = Duration::from_secs(1);
+
+/// The longest time a resolution failure is cached (RFC 9520 §3.2: "MUST
+/// NOT be cached for longer than 5 minutes").
+const MAX_FAILURE_CACHE: Duration = Duration::from_secs(300);
+
 /// How often a search candidate may be sent to one server over one
 /// transport (RFC 9520 §3.1).
 pub(crate) const MAX_SENDS_PER_SERVER: u8 = 3;
@@ -139,7 +147,8 @@ pub struct Config {
     /// Zero turns it off. At most five minutes: longer values count as five
     /// minutes, the longest RFC 2308 §7.2 and RFC 9520 §3.2 let a server be
     /// deemed dead. The failure is kept per server address, for every
-    /// query, as RFC 9520 §3.2 allows for unresponsive servers.
+    /// query, as RFC 9520 §3.2 allows for unresponsive servers, and
+    /// [`Resolver::flush_cache`](crate::Resolver::flush_cache) forgets it.
     pub failure_memory: Duration,
     /// Static entries answered before DNS, like `/etc/hosts`. Empty by
     /// default; fill it with [`Hosts::parse`].
@@ -147,6 +156,45 @@ pub struct Config {
     /// Which addresses an [`IpLookup`](crate::IpLookup) asks for, and which
     /// come first. [`IpStrategy::Ipv6First`] by default.
     pub ip_strategy: IpStrategy,
+    /// Whether a name of one label, such as `db`, is also tried as given
+    /// when there are search domains, which asks the name servers for a
+    /// top-level domain. True by default, as in glibc; `options
+    /// no-tld-query` in a `resolv.conf` turns it off. Without search
+    /// domains, such a name is always tried as given.
+    ///
+    /// RFC 1123 §6.1.4.3 asks a search list to keep from sending excessive
+    /// queries to the root, by caching negative answers (provision (a)),
+    /// which the resolver does (see the crate docs), and preferably also
+    /// by sending only names with two or more interior dots to non-local
+    /// servers (provision (b)). Turning this off keeps single-label names
+    /// from being sent as given, a weaker form of (b): a name with one dot,
+    /// such as `db.corp`, is still sent as given.
+    pub tld_query: bool,
+    /// How many failures and negative answers the cache holds, 1024 by
+    /// default. When it is full, a new entry first drops the expired ones,
+    /// and then the oldest, which bounds the memory it takes, as RFC 9520
+    /// §3.2 asks of a failure cache.
+    pub cache_entries: NonZeroUsize,
+    /// How long a resolution failure is cached the first time: while it
+    /// is, nothing is sent for the question and queries for it fail at once
+    /// with the cached error (RFC 9520 §3.2). One second by default, the
+    /// least §3.2 allows: shorter values count as one second, and longer
+    /// ones than five minutes as five minutes.
+    pub failure_cache_min: Duration,
+    /// How long a resolution failure is cached at most. Each time a
+    /// question fails again, and was first sent less than this long after
+    /// its cached failure expired, it is cached twice as long as before
+    /// (the backoff RFC 9520 §3.2 asks for), however long its retries
+    /// took, up to this. A useful answer (data, NXDOMAIN or NODATA) for the
+    /// question starts it over. 30 seconds by default;
+    /// at least `failure_cache_min`, and at most five minutes, the longest
+    /// §3.2 allows.
+    pub failure_cache_max: Duration,
+    /// How long a negative answer (NXDOMAIN or NODATA) is cached at most,
+    /// whatever its SOA record says. One hour by default, the low end of
+    /// the one to three hours RFC 2308 §5 recommends; it found more than a
+    /// day problematic. Zero turns negative caching off.
+    pub max_negative_ttl: Duration,
     /// DNS over TLS settings; see `Config::with_tls`.
     #[cfg(feature = "tls")]
     pub(crate) tls: Option<tls::Settings>,
@@ -157,6 +205,9 @@ impl Config {
     /// seconds on the first round and ten on the second: without measured
     /// round trip times, RFC 1123 §6.1.3.3 asks for no less than five. A
     /// server that fails to answer is tried after the others for a minute.
+    /// A question that fails is cached for a second, backing off to 30
+    /// seconds, and a negative answer for at most an hour, in a cache of
+    /// 1024 entries.
     pub fn new(first: SocketAddr, more: impl IntoIterator<Item = SocketAddr>) -> Self {
         let servers: Vec<SocketAddr> = std::iter::once(first).chain(more).collect();
         let attempts = NonZeroUsize::new(servers.len() * 2).unwrap_or(NonZeroUsize::MIN);
@@ -171,6 +222,11 @@ impl Config {
             failure_memory: Duration::from_secs(60),
             hosts: Hosts::default(),
             ip_strategy: IpStrategy::default(),
+            tld_query: true,
+            cache_entries: NonZeroUsize::new(1024).unwrap_or(NonZeroUsize::MIN),
+            failure_cache_min: MIN_FAILURE_CACHE,
+            failure_cache_max: Duration::from_secs(30),
+            max_negative_ttl: Duration::from_secs(3600),
             #[cfg(feature = "tls")]
             tls: None,
         }
@@ -258,8 +314,9 @@ impl Config {
     /// reads it: the first three usable `nameserver` lines (port 53),
     /// `search` or `domain`, `options ndots:` (default 1, at most 15),
     /// `options timeout:` in seconds (default 5, at most 30),
-    /// `options attempts:` per server (default 2) and
-    /// `options no-aaaa` ([`IpStrategy::Ipv4Only`]). Without usable
+    /// `options attempts:` per server (default 2),
+    /// `options no-aaaa` ([`IpStrategy::Ipv4Only`]) and
+    /// `options no-tld-query` (`tld_query` off). Without usable
     /// `nameserver` lines, the local host is asked (127.0.0.1). Unlike glibc,
     /// later rounds through the servers wait longer; see `timeout`. And
     /// where glibc takes up to 5 attempts per server, this takes at most 3,
@@ -307,13 +364,15 @@ impl Config {
         if parsed.no_aaaa {
             config.ip_strategy = IpStrategy::Ipv4Only;
         }
+        config.tld_query = !parsed.no_tld_query;
         config
     }
 
     /// The names to try for `name`, in order, as glibc's `res_search` does.
     /// Candidates that wouldn't be sent ([`Config::never_sent`]), the name
-    /// as given among them, are left out. Empty when the name is only tried
-    /// as given, which needs no list, or when no candidate is left.
+    /// as given among them, are left out, and so is a name of one label as
+    /// given without `tld_query`. Empty when the name is only tried as
+    /// given, which needs no list, or when no candidate is left.
     pub(crate) fn candidates(&self, name: &Name) -> VecDeque<Name> {
         if name.is_fqdn() || self.search.is_empty() {
             return VecDeque::new();
@@ -326,22 +385,23 @@ impl Config {
             .filter_map(|domain| name.clone().append_domain(domain).ok());
         // `num_labels` doesn't count the root label.
         let dots = usize::from(name.num_labels()).saturating_sub(1);
+        let as_given = (self.tld_query || dots > 0).then_some(absolute);
         let all: VecDeque<Name> = if dots >= usize::from(self.ndots) {
-            std::iter::once(absolute).chain(searched).collect()
+            as_given.into_iter().chain(searched).collect()
         } else {
-            searched.chain(std::iter::once(absolute)).collect()
+            searched.chain(as_given).collect()
         };
         all.into_iter()
             .filter(|candidate| !self.never_sent(candidate))
             .collect()
     }
 
-    /// Whether `name`, as given, gets a link-local NXDOMAIN without a
-    /// transmit: an absolute name, or one tried only as given, that is
-    /// never sent, or a relative name none of whose search candidates is
-    /// sent. RFC 6762 §3 makes no difference between a `.local.` suffix
-    /// typed and one appended from the search list, so a relative name is
-    /// judged by the names actually queried.
+    /// Whether `name`, as given, gets NXDOMAIN without a transmit: an
+    /// absolute name, or one tried only as given, that is never sent, or a
+    /// relative name none of whose search candidates is sent. RFC 6762 §3
+    /// makes no difference between a `.local.` suffix typed and one
+    /// appended from the search list, so a relative name is judged by the
+    /// names actually queried.
     pub(crate) fn never_sent_as_given(&self, name: &Name) -> bool {
         if name.is_fqdn() || self.search.is_empty() {
             let mut absolute = name.clone();
@@ -390,6 +450,17 @@ impl Config {
     /// How long a server that failed to answer stays failed.
     pub(crate) fn failed_for(&self) -> Duration {
         self.failure_memory.min(MAX_FAILURE_MEMORY)
+    }
+
+    /// The shortest and the longest time a resolution failure is cached:
+    /// `failure_cache_min` and `failure_cache_max` within the bounds of RFC
+    /// 9520 §3.2, the longest no shorter than the shortest.
+    pub(crate) fn failure_cache(&self) -> (Duration, Duration) {
+        let shortest = self
+            .failure_cache_min
+            .clamp(MIN_FAILURE_CACHE, MAX_FAILURE_CACHE);
+        let longest = self.failure_cache_max.clamp(shortest, MAX_FAILURE_CACHE);
+        (shortest, longest)
     }
 
     pub(crate) fn servers(&self) -> &[SocketAddr] {
