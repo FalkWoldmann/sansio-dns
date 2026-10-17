@@ -305,6 +305,14 @@ fn channel(
     }
 }
 
+/// The event that ends `query` with `outcome`.
+fn event(query: QueryId, outcome: Result<Message, Error>) -> Event {
+    match outcome {
+        Ok(response) => Event::Response { query, response },
+        Err(error) => Event::Failed { query, error },
+    }
+}
+
 /// The resolver state machine. See the crate docs for how to drive it.
 #[derive(Debug)]
 pub struct Resolver {
@@ -603,7 +611,7 @@ impl Resolver {
         let Ok(mut next) = self.new_pending(name, asked.1, rest, asked, now) else {
             // Can't fail for a name that was encoded once.
             if let Some(response) = outcome.into_response() {
-                self.finish(id, response);
+                self.finish(id, Ok(response));
             }
             return;
         };
@@ -906,7 +914,7 @@ impl Resolver {
                 if let Some(question) = response.queries.first() {
                     self.cache.answered(question);
                 }
-                self.finish(id, response);
+                self.finish(id, Ok(response));
             }
             ResponseCode::NoError | ResponseCode::NXDomain => {
                 self.cache.negative(&response, &self.config, now);
@@ -934,31 +942,28 @@ impl Resolver {
         outcome.add(response);
         match self.walk(&mut rest, record_type, &mut outcome, now) {
             Next::Send(name) => self.next_candidate(id, name, rest, outcome, now),
-            Next::Failed(error) => self.fail(id, error),
+            Next::Failed(error) => self.finish(id, Err(error)),
             Next::Done => {
                 if let Some(response) = outcome.into_response() {
-                    self.finish(id, response);
+                    self.finish(id, Ok(response));
                 }
             }
         }
     }
 
-    /// End `id`, and the queries that joined it, with `response`.
-    fn finish(&mut self, id: QueryId, mut response: Message) {
-        clamp_ttls(&mut response);
+    /// End `id`, and the queries that joined it, with `outcome`: `id`'s
+    /// event first, then its followers' in the order they joined.
+    fn finish(&mut self, id: QueryId, mut outcome: Result<Message, Error>) {
+        if let Ok(response) = &mut outcome {
+            clamp_ttls(response);
+        }
         let followers = self.pending.remove(&id).map(|p| p.followers);
         let copies: Vec<Event> = followers
             .into_iter()
             .flatten()
-            .map(|query| Event::Response {
-                query,
-                response: response.clone(),
-            })
+            .map(|query| event(query, outcome.clone()))
             .collect();
-        self.events.push_back(Event::Response {
-            query: id,
-            response,
-        });
+        self.events.push_back(event(id, outcome));
         self.events.extend(copies);
     }
 
@@ -1136,7 +1141,7 @@ impl Resolver {
                 // Not a resolution failure (RFC 9520 §2): the server may
                 // well have answered, to the cancelled queries' sockets.
                 if !self.step(heir, now) {
-                    self.fail(heir, Error::Timeout);
+                    self.finish(heir, Err(Error::Timeout));
                 }
             }
             (false, _) => {}
@@ -1202,13 +1207,13 @@ impl Resolver {
     // - joined query cancelled: `cancel`, limited only by the rule below
     //   (each hand-over over UDP sends again; the crate docs' `attempts + 3`
     //   bound leaves it out); an heir without room moves on by `step`, and
-    //   with no server left fails through `fail`, not cached
+    //   with no server left fails through `finish`, not cached
     //   (`give_up`), since the server may have answered the cancelled
     //   queries' sockets
     // - out of attempts, or every server excluded or without room: `advance`
     //   calls `give_up`, which caches the failure for the search candidate
     //   (`Cache::failed`, RFC 9520 §3.2) and fails the query and every
-    //   query that joined it (`fail`)
+    //   query that joined it (`finish`)
     // - a search candidate with a cached failure: `emit` fails the query
     //   with it instead of sending, whichever path it came by; one with a
     //   cached NXDOMAIN or NODATA: `walk`, from `start` or `search_on`,
@@ -1461,7 +1466,7 @@ impl Resolver {
             .first()
             .and_then(|question| self.cache.failure(question, now))
         {
-            self.fail(id, error);
+            self.finish(id, Err(error));
             return;
         }
         let server = pending.server(&self.config);
@@ -1620,22 +1625,7 @@ impl Resolver {
             self.cache
                 .failed(question, error.clone(), pending.started, &self.config, now);
         }
-        self.fail(id, error);
-    }
-
-    /// End `id`, and the queries that joined it, with `error`.
-    fn fail(&mut self, id: QueryId, error: Error) {
-        let followers = self.pending.remove(&id).map(|p| p.followers);
-        let copies: Vec<Event> = followers
-            .into_iter()
-            .flatten()
-            .map(|query| Event::Failed {
-                query,
-                error: error.clone(),
-            })
-            .collect();
-        self.events.push_back(Event::Failed { query: id, error });
-        self.events.extend(copies);
+        self.finish(id, Err(error));
     }
 
     /// A query message with an ID that is in use neither by a query in

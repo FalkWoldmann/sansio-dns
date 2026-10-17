@@ -115,7 +115,7 @@ outputs are drained with `poll_transmit`, `poll_event` and `poll_timeout`.
   and `drop_edns` (same server, free), the resends in `move_off` (same server, free every time
   if the connection answered after the query was written, else once per query via
   `forgive`) and `time_out_stream` (once, via the same `forgive`), `next_candidate` (next
-  search name, fresh attempts, no exclusions), `give_up` and `fail`. `emit` counts every
+  search name, fresh attempts, no exclusions), `give_up` and `finish`. `emit` counts every
   send in `Pending::sends`: a search candidate goes at most three times to a server over one
   transport (RFC 9520 §3.1), so `advance` skips servers without room, and the free sends
   and `switch_to_tcp` check `may_resend` first and move on instead. The crate docs' "How a
