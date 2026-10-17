@@ -154,9 +154,9 @@ impl Cache {
     /// is one: nothing may be sent for it (RFC 9520 §3.2).
     pub(crate) fn failure(&self, question: &Query, now: Instant) -> Option<Error> {
         let (exact, _) = Key::of(question);
-        match self.entries.get(&exact).map(|slot| &slot.entry) {
-            Some(Entry::Failed(failure)) if now < failure.until => Some(failure.error.clone()),
-            _ => None,
+        match &self.entries.get(&exact)?.entry {
+            Entry::Failed(failure) => (now < failure.until).then(|| failure.error.clone()),
+            Entry::Negative(_) => None,
         }
     }
 
@@ -247,12 +247,10 @@ impl Cache {
     ) {
         let (shortest, longest) = config.failure_cache();
         let (key, _) = Key::of(question);
-        let previous = match self.entries.get(&key).map(|slot| &slot.entry) {
-            Some(Entry::Failed(previous)) => {
-                Some((previous.until, previous.duration, previous.forget))
-            }
-            _ => None,
-        };
+        let previous = self.entries.get(&key).and_then(|slot| match &slot.entry {
+            Entry::Failed(previous) => Some((previous.until, previous.duration, previous.forget)),
+            Entry::Negative(_) => None,
+        });
         // Lookups keep failure entries after they expire, so the previous
         // one is still here unless an answer ended it or the size bound
         // needed room.
@@ -286,9 +284,11 @@ impl Cache {
     /// `now`. A failure entry stays after it expires: the next failure of
     /// its question backs off from it (`Cache::failed`).
     fn drop_expired(&mut self, key: &Key, now: Instant) {
-        if self.entries.get(key).is_some_and(|slot| {
-            matches!(&slot.entry, Entry::Negative(_)) && !slot.entry.is_live(now)
-        }) {
+        let expired = self.entries.get(key).is_some_and(|slot| match &slot.entry {
+            Entry::Negative(_) => !slot.entry.is_live(now),
+            Entry::Failed(_) => false,
+        });
+        if expired {
             self.entries.remove(key);
         }
     }

@@ -56,11 +56,6 @@ struct Pending {
     /// over a stream only when a connection to its server is open (RFC
     /// 7766 §5).
     stream_only: bool,
-    /// How many responses had arrived on the current attempt's connection
-    /// (`Connection::responses`) when the attempt was written to it, or
-    /// took its request back from an `Orphan`, so that later ones show the
-    /// connection still works.
-    written_after: u64,
     /// How often this search candidate was sent to each server over each
     /// channel, free sends included: at most `MAX_SENDS_PER_SERVER` times
     /// (RFC 9520 §3.1).
@@ -97,6 +92,11 @@ impl Pending {
     /// The server of the current attempt.
     fn server(&self, config: &Config) -> SocketAddr {
         config.server(self.position)
+    }
+
+    /// Whether its current attempt was written to `connection`.
+    fn is_on(&self, connection: ConnectionId) -> bool {
+        matches!(self.route, Route::Stream { connection: c, .. } if c == connection)
     }
 
     /// The deadline of the current attempt sent at `now`: `Config::timeout`,
@@ -178,8 +178,16 @@ enum Next {
 enum Route {
     /// As a datagram, from the query's own socket.
     Udp,
-    /// Written to this stream connection.
-    Stream(ConnectionId),
+    /// Written to `connection`, or waiting there for the answer to its
+    /// request, which an earlier attempt left as an `Orphan`.
+    Stream {
+        connection: ConnectionId,
+        /// How many responses had arrived on `connection`
+        /// (`Connection::responses`) when the attempt was written to it,
+        /// or took its request back from an `Orphan`, so that later ones
+        /// show the connection still works.
+        written_after: u64,
+    },
 }
 
 /// A DNS transport, as RFC 9520 §3.1 counts sends to a server: UDP, or a
@@ -571,7 +579,6 @@ impl Resolver {
             deadline: now.checked_add(self.config.wait(0)).unwrap_or(now),
             route: Route::Udp,
             stream_only: self.config.uses_tls(),
-            written_after: 0,
             sends: Vec::new(),
             rest,
             nodata: None,
@@ -747,10 +754,7 @@ impl Resolver {
     /// connection.
     fn stream_match(&self, connection: ConnectionId, reply: &Reply) -> Option<Matched> {
         let conn = self.connections.get(&connection)?;
-        let queries = self
-            .pending
-            .iter()
-            .filter(|(_, p)| p.route == Route::Stream(connection));
+        let queries = self.pending.iter().filter(|(_, p)| p.is_on(connection));
         if reply.has_question() {
             let query = queries
                 .filter(|(_, p)| reply.answers(p.request.metadata.id, &p.request.queries))
@@ -858,10 +862,9 @@ impl Resolver {
     /// `responses` responses, as [`Resolver::handle_stream_closed`] says.
     fn move_off(&mut self, connection: ConnectionId, responses: u64, now: Instant, error: &Error) {
         for id in self.queries_on(connection) {
-            let progress = self
-                .pending
-                .get(&id)
-                .is_some_and(|p| responses > p.written_after);
+            let progress = self.pending.get(&id).is_some_and(|p| {
+                matches!(p.route, Route::Stream { written_after, .. } if responses > written_after)
+            });
             if self.may_resend(id) && (progress || (responses > 0 && self.forgive(id))) {
                 if let Some(pending) = self.pending.get_mut(&id) {
                     pending.deadline = pending.deadline(&self.config, now);
@@ -1008,14 +1011,17 @@ impl Resolver {
             if pending.deadline > now {
                 continue;
             }
-            let Route::Stream(connection) = pending.route else {
+            let Route::Stream {
+                connection,
+                written_after,
+            } = pending.route
+            else {
                 self.retry(id, now, Error::Timeout);
                 continue;
             };
             match self.connections.get_mut(&connection) {
                 Some(conn)
-                    if conn.responses > pending.written_after
-                        && conn.orphans.len() < MAX_ORPHANS =>
+                    if conn.responses > written_after && conn.orphans.len() < MAX_ORPHANS =>
                 {
                     conn.orphans.push(Orphan::of(pending));
                     self.retry(id, now, Error::Timeout);
@@ -1061,11 +1067,7 @@ impl Resolver {
     /// uses it. An orphan keeps it busy until the deadline its query had.
     fn idle_deadline(&self, connection: ConnectionId) -> Option<Instant> {
         let conn = self.connections.get(&connection)?;
-        if self
-            .pending
-            .values()
-            .any(|p| p.route == Route::Stream(connection))
-        {
+        if self.pending.values().any(|p| p.is_on(connection)) {
             return None;
         }
         let busy = conn
@@ -1116,7 +1118,7 @@ impl Resolver {
         };
         if pending.followers.is_empty() {
             // Its request is still outstanding on its connection.
-            if let Route::Stream(connection) = pending.route
+            if let Route::Stream { connection, .. } = pending.route
                 && let Some(conn) = self.connections.get_mut(&connection)
             {
                 if conn.orphans.len() < MAX_ORPHANS {
@@ -1128,23 +1130,27 @@ impl Resolver {
             return;
         }
         let heir = pending.followers.remove(0);
-        let udp = pending.route == Route::Udp;
-        let server = pending.server(&self.config);
-        let room = pending.may_send(server, channel(&self.connections, &pending, server));
-        if udp && room {
-            pending.deadline = pending.deadline(&self.config, now);
-        }
-        self.pending.insert(heir, pending);
-        match (udp, room) {
-            (true, true) => self.emit(heir, now),
-            (true, false) => {
-                // Not a resolution failure (RFC 9520 §2): the server may
-                // well have answered, to the cancelled queries' sockets.
-                if !self.step(heir, now) {
-                    self.finish(heir, Err(Error::Timeout));
+        match pending.route {
+            // Nothing to send: the answer still arrives on the connection,
+            // and the heir keeps the deadline.
+            Route::Stream { .. } => {
+                self.pending.insert(heir, pending);
+            }
+            Route::Udp => {
+                let server = pending.server(&self.config);
+                if pending.may_send(server, channel(&self.connections, &pending, server)) {
+                    pending.deadline = pending.deadline(&self.config, now);
+                    self.pending.insert(heir, pending);
+                    self.emit(heir, now);
+                } else {
+                    self.pending.insert(heir, pending);
+                    // Not a resolution failure (RFC 9520 §2): the server may
+                    // well have answered, to the cancelled queries' sockets.
+                    if !self.step(heir, now) {
+                        self.finish(heir, Err(Error::Timeout));
+                    }
                 }
             }
-            (false, _) => {}
         }
     }
 
@@ -1194,8 +1200,8 @@ impl Resolver {
     // - connection lost after it answered, or closed by the server's
     //   close_notify (`handle_stream_data`): `move_off`, by way of `lost`
     //   or `shut`, then `emit` again, for free every time if it answered
-    //   after the query was written (`written_after`), else once by way of
-    //   `forgive`
+    //   after the query was written (`written_after` in `Route::Stream`),
+    //   else once by way of `forgive`
     // - neighbour timed out on the connection, or it was closed for holding
     //   too many orphans: `time_out_stream`, then `forgive` and `emit` (the
     //   same `forgiven` flag), else `retry`
@@ -1297,7 +1303,7 @@ impl Resolver {
     fn queries_on(&self, connection: ConnectionId) -> Vec<QueryId> {
         self.pending
             .iter()
-            .filter(|(_, p)| p.route == Route::Stream(connection))
+            .filter(|(_, p)| p.is_on(connection))
             .map(|(id, _)| *id)
             .collect()
     }
@@ -1506,8 +1512,10 @@ impl Resolver {
         };
         if let Some(index) = conn.orphans.iter().position(|o| o.is(pending)) {
             conn.orphans.swap_remove(index);
-            pending.route = Route::Stream(connection);
-            pending.written_after = conn.responses;
+            pending.route = Route::Stream {
+                connection,
+                written_after: conn.responses,
+            };
             return;
         }
         pending.count_send(server, Channel::Stream);
@@ -1521,10 +1529,12 @@ impl Resolver {
 
     /// `id`'s current attempt was written to `connection`.
     fn written(&mut self, id: QueryId, connection: ConnectionId) {
-        let responses = self.connections.get(&connection).map_or(0, |c| c.responses);
+        let written_after = self.connections.get(&connection).map_or(0, |c| c.responses);
         if let Some(pending) = self.pending.get_mut(&id) {
-            pending.route = Route::Stream(connection);
-            pending.written_after = responses;
+            pending.route = Route::Stream {
+                connection,
+                written_after,
+            };
         }
     }
 

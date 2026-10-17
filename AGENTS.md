@@ -74,9 +74,10 @@ outputs are drained with `poll_transmit`, `poll_event` and `poll_timeout`.
   `Config::failure_memory`), and moves on by one per attempt, past the servers in
   `Pending::excluded`; how often it has wrapped around sets the backoff round. `attempt`
   counts the attempts used, bounded by `Config::attempts`. Its `Route` (how the current
-  attempt went out) is `Udp` or `Stream(ConnectionId)`, set by `emit`: every send goes to the
-  open connection to its server if there is one (RFC 7766 §5), else over a new connection if
-  `Pending::stream_only` (after a truncated answer, or with TLS), else over UDP.
+  attempt went out) is `Udp` or `Stream { connection, written_after }`, set by `emit`: every
+  send goes to the open connection to its server if there is one (RFC 7766 §5), else over a
+  new connection if `Pending::stream_only` (after a truncated answer, or with TLS), else over
+  UDP.
 - Streams: one connection per server, shared and pipelined by all queries to it (RFC 7766), with
   answers matched by ID and question, or by ID alone when they have no question (§7). A query
   that leaves a connection before its answer (cancelled, or timed out while the connection
@@ -86,10 +87,10 @@ outputs are drained with `poll_transmit`, `poll_event` and `poll_timeout`.
   ID again if a later attempt returns to that connection. A connection holding
   `MAX_ORPHANS` (256) of them is closed when another would join them (`time_out_stream`),
   so a busy connection can't use up the ID space. `Connection::responses` counts complete
-  responses; `Pending::written_after` records it at write time and again when `emit` takes
-  an orphan back, so a timeout closes the connection only if no response arrived since, and
-  a lost connection gives a free resend whenever it answered since. Only writes and
-  complete responses reset the idle timer. DoT
+  responses; `Route::Stream`'s `written_after` records it at write time and again when `emit`
+  takes an orphan back, so a timeout closes the connection only if no response arrived
+  since, and a lost connection gives a free resend whenever it answered since. Only writes
+  and complete responses reset the idle timer. DoT
   sessions (`tls::Session`) live inside `Connection` and are driven in memory through
   `src/tls.rs`; the driver only moves bytes. Queries written during the handshake wait in the
   session's own queue, not rustls' 64 KiB buffer, and `Session::receive` drains the plaintext
