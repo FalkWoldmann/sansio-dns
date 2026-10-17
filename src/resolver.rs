@@ -46,7 +46,13 @@ struct Pending {
     /// that couldn't be decoded, or a referral: later attempts skip them
     /// (RFC 1035 §7.2, RFC 1034 §5.3.3 step 4d).
     excluded: Vec<SocketAddr>,
-    /// When the current attempt times out.
+    /// When the current attempt times out. Only `Resolver::emit` sets it;
+    /// `Resolver::new_pending` leaves a placeholder that the first `emit`
+    /// replaces, or that goes with the query if a cached failure ends it
+    /// there. `emit` starts it over (`Deadline::Fresh`) for every attempt
+    /// and resend except `Resolver::time_out_stream`'s free resend, which
+    /// keeps it (`Deadline::Kept`). An heir that takes a cancelled query
+    /// over on a stream sends nothing and keeps it too.
     deadline: Instant,
     /// How the current attempt went out; set by `Resolver::emit`.
     route: Route,
@@ -99,15 +105,13 @@ impl Pending {
         matches!(self.route, Route::Stream { connection: c, .. } if c == connection)
     }
 
-    /// The deadline of the current attempt sent at `now`: `Config::timeout`,
-    /// doubled each time the attempts have gone round the server list
-    /// (exponential backoff, RFC 1123 §6.1.3.3), within the bounds of
-    /// `Config::wait`.
-    fn deadline(&self, config: &Config, now: Instant) -> Instant {
+    /// Start the current attempt's deadline over at `now`:
+    /// `Config::timeout`, doubled each time the attempts have gone round
+    /// the server list (exponential backoff, RFC 1123 §6.1.3.3), within
+    /// the bounds of `Config::wait`.
+    fn restart_deadline(&mut self, config: &Config, now: Instant) {
         let round = self.position.saturating_sub(self.first) / config.servers().len();
-        // Only an `Instant` within minutes of the end of its range
-        // overflows; the attempt then times out at once.
-        now.checked_add(config.wait(round)).unwrap_or(now)
+        self.deadline = config.deadline(round, now);
     }
 
     /// Whether this search candidate may be sent to `server` once more,
@@ -203,6 +207,17 @@ enum Route {
 enum Channel {
     Udp,
     Stream,
+}
+
+/// What [`Resolver::emit`] does with the query's deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Deadline {
+    /// Start it over from `now`, for the round the attempt is in
+    /// (`Config::deadline`).
+    Fresh,
+    /// Keep it: for `Resolver::time_out_stream`'s free resend, which must
+    /// not stretch how long the server can hold the query.
+    Kept,
 }
 
 /// A stream connection to one server, shared by its queries.
@@ -769,17 +784,14 @@ impl Resolver {
             }
             Route::Udp => {
                 let server = pending.server(&self.config);
-                if pending.may_send(server, &self.connections) {
-                    pending.deadline = pending.deadline(&self.config, now);
-                    self.pending.insert(heir, pending);
-                    self.emit(heir, now);
-                } else {
-                    self.pending.insert(heir, pending);
+                let room = pending.may_send(server, &self.connections);
+                self.pending.insert(heir, pending);
+                if room {
+                    self.emit(heir, now, Deadline::Fresh);
+                } else if !self.step(heir, now) {
                     // Not a resolution failure (RFC 9520 §2): the server may
                     // well have answered, to the cancelled queries' sockets.
-                    if !self.step(heir, now) {
-                        self.finish(heir, Err(Error::Timeout));
-                    }
+                    self.finish(heir, Err(Error::Timeout));
                 }
             }
         }
@@ -907,7 +919,7 @@ impl Resolver {
         let mut pending = self.new_pending(candidate, record_type, rest, asked, now)?;
         pending.nodata = outcome.nodata;
         self.pending.insert(id, pending);
-        self.emit(id, now);
+        self.emit(id, now, Deadline::Fresh);
         Ok(id)
     }
 
@@ -962,7 +974,8 @@ impl Resolver {
             position: first,
             attempt: 0,
             excluded: Vec::new(),
-            deadline: now.checked_add(self.config.wait(0)).unwrap_or(now),
+            // A placeholder: the caller's `emit` starts the deadline.
+            deadline: now,
             route: Route::Udp,
             stream_only: self.config.uses_tls(),
             sends: Vec::new(),
@@ -1013,7 +1026,7 @@ impl Resolver {
         }
         next.nodata = outcome.nodata;
         self.pending.insert(id, next);
-        self.emit(id, now);
+        self.emit(id, now, Deadline::Fresh);
     }
 
     /// A query message with an ID that is in use neither by a query in
@@ -1174,6 +1187,11 @@ impl Resolver {
     //   cached NXDOMAIN or NODATA: `walk`, from `start` or `search_on`,
     //   moves on past it without sending
     //
+    // `emit`'s `Deadline` argument is the table's Deadline column: `Kept`
+    // for `time_out_stream`'s free resend, `Fresh` at every other call. A
+    // hand-over on a stream (`cancel`) doesn't call `emit` and keeps the
+    // deadline.
+    //
     // `emit` picks the channel of every send (`channel`: the open
     // connection to the server if there is one, RFC 7766 §5) and counts it
     // in `Pending::sends`, and no search candidate goes to a server over a
@@ -1245,8 +1263,7 @@ impl Resolver {
             return false;
         };
         pending.position = position;
-        pending.deadline = pending.deadline(config, now);
-        self.emit(id, now);
+        self.emit(id, now, Deadline::Fresh);
         true
     }
 
@@ -1270,10 +1287,7 @@ impl Resolver {
             self.advance(id, now, Error::Timeout);
             return true;
         }
-        if let Some(pending) = self.pending.get_mut(&id) {
-            pending.deadline = pending.deadline(&self.config, now);
-        }
-        self.emit(id, now);
+        self.emit(id, now, Deadline::Fresh);
         true
     }
 
@@ -1300,8 +1314,7 @@ impl Resolver {
             return;
         };
         pending.payload = payload;
-        pending.deadline = pending.deadline(&self.config, now);
-        self.emit(id, now);
+        self.emit(id, now, Deadline::Fresh);
     }
 
     /// `id` is out of attempts, every server is excluded, or its TLS
@@ -1350,12 +1363,17 @@ impl Resolver {
     /// connection is closed as after a TLS error, and the query moves on
     /// with the others on it.
     ///
+    /// With `Deadline::Fresh` the query's deadline starts over, also for an
+    /// attempt that takes its request back, though nothing is then written
+    /// or counted. With `Deadline::Kept` it stays as it was. A query that
+    /// a cached failure ends (below) is removed before either.
+    ///
     /// Nothing is sent for a question while a failure is cached for it (RFC
     /// 9520 §3.2): the query fails with the cached error instead. That
     /// stops a query that was in flight when another query for the same
     /// question failed, such as one for the name with a trailing dot while
     /// the other was without.
-    fn emit(&mut self, id: QueryId, now: Instant) {
+    fn emit(&mut self, id: QueryId, now: Instant, deadline: Deadline) {
         let Some(pending) = self.pending.get_mut(&id) else {
             return;
         };
@@ -1367,6 +1385,9 @@ impl Resolver {
         {
             self.finish(id, Err(error));
             return;
+        }
+        if deadline == Deadline::Fresh {
+            pending.restart_deadline(&self.config, now);
         }
         let server = pending.server(&self.config);
         // The Client Subnet option names the transport's address family.
@@ -1582,10 +1603,7 @@ impl Resolver {
                 matches!(p.route, Route::Stream { written_after, .. } if responses > written_after)
             });
             if self.may_resend(id) && (progress || (responses > 0 && self.forgive(id))) {
-                if let Some(pending) = self.pending.get_mut(&id) {
-                    pending.deadline = pending.deadline(&self.config, now);
-                }
-                self.emit(id, now);
+                self.emit(id, now, Deadline::Fresh);
             } else {
                 self.retry(id, now, error.clone());
             }
@@ -1619,7 +1637,7 @@ impl Resolver {
         for id in self.queries_on(connection) {
             let expired = self.pending.get(&id).is_some_and(|p| p.deadline <= now);
             if !expired && self.may_resend(id) && self.forgive(id) {
-                self.emit(id, now);
+                self.emit(id, now, Deadline::Kept);
             } else {
                 self.retry(id, now, Error::Timeout);
             }

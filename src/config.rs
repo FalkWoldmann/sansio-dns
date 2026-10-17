@@ -5,7 +5,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV6};
 use std::num::NonZeroUsize;
 #[cfg(feature = "tls")]
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hickory_proto::rr::{Name, RecordType};
 
@@ -445,6 +445,14 @@ impl Config {
             .max(MIN_WAIT)
             .saturating_mul(factor)
             .min(MAX_WAIT)
+    }
+
+    /// When an attempt in `round` started at `now` times out: [`Config::wait`]
+    /// for `round` after `now`, or `now` itself if that overflows.
+    pub(crate) fn deadline(&self, round: usize, now: Instant) -> Instant {
+        // Only an `Instant` within minutes of the end of its range
+        // overflows; the attempt then times out at once.
+        now.checked_add(self.wait(round)).unwrap_or(now)
     }
 
     /// How long a server that failed to answer stays failed.

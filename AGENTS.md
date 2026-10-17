@@ -121,7 +121,10 @@ outputs are drained with `poll_transmit`, `poll_event` and `poll_timeout`.
   send in `Pending::sends`: a search candidate goes at most three times to a server over one
   transport (RFC 9520 §3.1), so `advance` skips servers without room (in `step`), and the
   free sends, a cancel hand-over's resend included, check `Pending::may_send` first (`cancel`
-  directly, the others through `may_resend`) and move on instead. The crate docs' "How a
+  directly, the others through `may_resend`) and move on instead. Only `emit` sets a query's
+  deadline (`Config::deadline`; `new_pending` leaves a placeholder): every caller passes
+  `Deadline::Fresh` except `time_out_stream`'s free resend, which passes `Deadline::Kept`.
+  The crate docs' "How a
   query moves on" table states the rules (at most `attempts + 3` sends per search
   candidate, not counting a cancel hand-over's resend or the resends after a lost connection
   that answered since, and at most three per server and transport, all of those included),
