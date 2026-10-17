@@ -175,6 +175,7 @@ pub enum Event {
 
 /// Why a query failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The last attempt got no answer by its deadline, or its connection was
     /// closed because another query on it timed out.

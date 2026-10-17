@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "A sans-IO DNS stub resolver built on hickory-proto"
+readme = "README.md"
+keywords = ["dns", "resolver", "sans-io", "dns-over-tls", "hickory"]
+categories = ["network-programming"]
+exclude = [".github", ".config", "AGENTS.md", "CLAUDE.md"]
 # The files in tests/ are modules of tests/main.rs, one crate that builds once.
 autotests = false
 
@@ -143,6 +148,9 @@ zero_sized_map_values = "deny"
 assertions_on_result_states = "warn"
 string_slice = "warn"
 unreachable = "warn"
+
+[package.metadata.docs.rs]
+all-features = true
 
 [[test]]
 name = "integration"

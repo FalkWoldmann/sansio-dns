@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Tokio driver for sansio-dns: resolve host names to addresses"
+readme = "../README.md"
+keywords = ["dns", "resolver", "tokio", "reqwest", "async"]
+categories = ["network-programming", "asynchronous"]
 # The files in tests/ are modules of tests/main.rs, one crate that builds once.
 autotests = false
 
@@ -26,6 +29,9 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
 
 [[test]]
 name = "integration"
