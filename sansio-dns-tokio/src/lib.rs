@@ -12,9 +12,14 @@
 //! Clones of a [`Resolver`] share one [`sansio_dns::Resolver`], run by a
 //! background task that the first lookup spawns on its runtime. TCP and TLS
 //! connections stay open between lookups and are shared by concurrent ones,
-//! until they have been idle for `Config::idle_timeout`. Each UDP query still
-//! gets a fresh socket (RFC 5452 §9.2). Dropping a lookup's future cancels
-//! its queries.
+//! until they have been idle for `Config::idle_timeout`, with Nagle's
+//! algorithm off so pipelined queries go out at once (RFC 7766 §6.2.1.1).
+//! Each UDP query gets a fresh socket of its own (RFC 5452 §9.2), connected
+//! to its server, and a new one when it moves to another server: the
+//! kernel then only delivers datagrams from that server to the address the
+//! query was sent from (§9.1), and reports an ICMP error such as port
+//! unreachable, which moves the query on at once. Dropping a lookup's future
+//! cancels its queries.
 //!
 //! The task runs on the runtime of the lookup that started it, so keep a
 //! resolver within one runtime. Used from several, a lookup waits on
@@ -345,6 +350,9 @@ fn take_in(resolver: &mut sansio_dns::Resolver, io: &mut Io, input: Input) {
         Input::Datagram(query, from, data) => {
             resolver.handle_datagram(query, from, &data, Instant::now());
         }
+        Input::UdpError(query, to, error) => {
+            resolver.handle_udp_error(query, to, error, Instant::now());
+        }
         Input::Stream(connection, data) => {
             resolver.handle_stream_data(connection, &data, Instant::now());
         }
@@ -378,6 +386,9 @@ async fn sleep_until(deadline: Option<Instant>) {
 /// What the socket and connection tasks report back to the background task.
 enum Input {
     Datagram(QueryId, SocketAddr, Vec<u8>),
+    /// Receiving on the query's socket, connected to this server, failed:
+    /// typically an ICMP error for an earlier datagram.
+    UdpError(QueryId, SocketAddr, io::ErrorKind),
     Stream(ConnectionId, Vec<u8>),
     /// The connection ended: closed by the server, or with an I/O error.
     Closed(ConnectionId, Result<(), io::ErrorKind>),
@@ -387,7 +398,9 @@ enum Input {
 /// their tasks.
 struct Io {
     tasks: JoinSet<()>,
-    sockets: HashMap<QueryId, (Arc<UdpSocket>, AbortHandle)>,
+    /// Each query's socket, the server it is connected to, and the task
+    /// forwarding what it receives.
+    sockets: HashMap<QueryId, (Arc<UdpSocket>, SocketAddr, AbortHandle)>,
     streams: HashMap<ConnectionId, (mpsc::UnboundedSender<Vec<u8>>, AbortHandle)>,
     input: mpsc::UnboundedSender<Input>,
 }
@@ -438,55 +451,69 @@ impl Io {
         to: SocketAddr,
         payload: &[u8],
     ) -> io::Result<()> {
-        self.socket(query, to).await?.send_to(payload, to).await?;
+        self.socket(query, to).await?.send(payload).await?;
         Ok(())
     }
 
-    /// The socket for `query`, bound on first use and again when the query
-    /// moves to a server of the other address family, with a task
-    /// forwarding what it receives.
+    /// The socket for `query`, connected to `to`, with a task forwarding
+    /// what it receives. A query that moves to another server gets a new
+    /// socket rather than connecting its old one again: Linux keeps the
+    /// local address the first connect picked, which may not reach the new
+    /// server.
     async fn socket(&mut self, query: QueryId, to: SocketAddr) -> io::Result<Arc<UdpSocket>> {
         if let Entry::Occupied(entry) = self.sockets.entry(query) {
-            let (socket, _) = entry.get();
-            if socket
-                .local_addr()
-                .is_ok_and(|local| local.is_ipv4() == to.is_ipv4())
-            {
+            let (socket, peer, _) = entry.get();
+            if *peer == to {
                 return Ok(Arc::clone(socket));
             }
-            // A retry rotated to a server of the other address family.
-            entry.remove().1.abort();
+            entry.remove().2.abort();
         }
         let any = match to {
             SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
         };
         let socket = Arc::new(UdpSocket::bind((any, 0)).await?);
-        let task = self
-            .tasks
-            .spawn(datagrams(query, Arc::clone(&socket), self.input.clone()));
-        self.sockets.insert(query, (Arc::clone(&socket), task));
+        socket.connect(to).await?;
+        let task = self.tasks.spawn(datagrams(
+            query,
+            Arc::clone(&socket),
+            to,
+            self.input.clone(),
+        ));
+        self.sockets.insert(query, (Arc::clone(&socket), to, task));
         Ok(socket)
     }
 
     /// Close the socket of `query`, which is over.
     fn forget(&mut self, query: QueryId) {
-        if let Some((_, task)) = self.sockets.remove(&query) {
+        if let Some((_, _, task)) = self.sockets.remove(&query) {
             task.abort();
         }
     }
 }
 
-/// Forward every datagram `socket` receives, until its query is over. Each
-/// is copied out at its size, so a queue of them holds no spare capacity.
-async fn datagrams(query: QueryId, socket: Arc<UdpSocket>, input: mpsc::UnboundedSender<Input>) {
+/// Forward every datagram `socket`, connected to `server`, receives, and
+/// every error receiving reports, until its query is over. Each datagram is
+/// copied out at its size, so a queue of them holds no spare capacity. An
+/// error, such as an ICMP port unreachable for the last datagram, doesn't
+/// end the socket: it serves the query's attempts to `server` until one
+/// goes to another server.
+async fn datagrams(
+    query: QueryId,
+    socket: Arc<UdpSocket>,
+    server: SocketAddr,
+    input: mpsc::UnboundedSender<Input>,
+) {
     let mut buf = [0; 4096];
     loop {
-        let Ok((n, from)) = socket.recv_from(&mut buf).await else {
-            return;
+        let received = match socket.recv_from(&mut buf).await {
+            Ok((n, from)) => {
+                let data = buf.get(..n).map(<[u8]>::to_vec).unwrap_or_default();
+                Input::Datagram(query, from, data)
+            }
+            Err(error) => Input::UdpError(query, server, error.kind()),
         };
-        let data = buf.get(..n).map(<[u8]>::to_vec).unwrap_or_default();
-        if input.send(Input::Datagram(query, from, data)).is_err() {
+        if input.send(received).is_err() {
             return;
         }
     }
@@ -515,6 +542,10 @@ async fn carry(
     input: &mpsc::UnboundedSender<Input>,
 ) -> io::Result<()> {
     let mut stream = TcpStream::connect(to).await?;
+    // Each payload is one whole message, written in one call (RFC 7766
+    // §8); without Nagle a pipelined one goes out before the answers to the
+    // earlier ones are in (§6.2.1.1).
+    stream.set_nodelay(true)?;
     stream.write_all(&first).await?;
     let mut buf = [0; 4096];
     loop {

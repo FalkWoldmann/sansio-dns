@@ -104,20 +104,51 @@ impl Reply {
         })
     }
 
-    /// Whether it answers `request` (RFC 5452 §9.1, RFC 1035 §7.3).
-    /// `Query` equality compares name, type and class, and hickory's `Name`
-    /// equality ignores case (RFC 1035 §2.3.3) but not the trailing dot.
-    pub(crate) fn answers(&self, request: &Message) -> bool {
-        let (metadata, queries) = match self {
+    fn header(&self) -> (&Metadata, &[Query]) {
+        match self {
             Self::Whole(message) => (&message.metadata, &message.queries),
             Self::Broken {
                 metadata, queries, ..
             } => (metadata, queries),
-        };
+        }
+    }
+
+    /// Whether it is a response to a standard query with message ID `id`,
+    /// whatever its question section holds.
+    pub(crate) fn responds_to(&self, id: u16) -> bool {
+        let (metadata, _) = self.header();
         metadata.message_type == MessageType::Response
-            && request.metadata.id == metadata.id
-            && request.metadata.op_code == metadata.op_code
-            && request.queries == *queries
+            && metadata.op_code == OpCode::Query
+            && metadata.id == id
+    }
+
+    /// Whether it is a response at all (QR set).
+    pub(crate) fn is_response(&self) -> bool {
+        self.header().0.message_type == MessageType::Response
+    }
+
+    /// Whether it has a question section.
+    pub(crate) fn has_question(&self) -> bool {
+        !self.header().1.is_empty()
+    }
+
+    /// Whether it answers the standard query with message ID `id` and
+    /// question section `question` (RFC 5452 §9.1, RFC 1035 §7.3, RFC 7766
+    /// §7). `Query` equality compares name, type and class, and hickory's
+    /// `Name` equality ignores case (RFC 1035 §2.3.3) but not the trailing
+    /// dot.
+    pub(crate) fn answers(&self, id: u16, question: &[Query]) -> bool {
+        self.responds_to(id) && self.header().1 == question
+    }
+
+    /// Give a response without a question section the question it was
+    /// matched to by message ID, so it reads like any other answer.
+    pub(crate) fn fill_question(&mut self, question: &[Query]) {
+        if let Self::Whole(message) = self
+            && message.queries.is_empty()
+        {
+            message.queries = question.to_vec();
+        }
     }
 }
 

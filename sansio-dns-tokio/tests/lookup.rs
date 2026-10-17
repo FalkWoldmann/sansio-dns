@@ -113,6 +113,131 @@ async fn unsendable_datagram_moves_on_at_once(#[case] working_server: bool) {
     }
 }
 
+/// A datagram to a closed port draws an ICMP port unreachable, which the
+/// connected socket reports as `ConnectionRefused`: the lookup moves to the
+/// next server without waiting out the five-second timeout, and fails with
+/// that error when no server is left (RFC 1123 §6.1.3.3). One query with
+/// one attempt to the closed port, since kernels rate-limit ICMP errors.
+#[rstest]
+#[case::next_server_answers(true)]
+#[case::no_server_left(false)]
+#[tokio::test]
+async fn refused_datagram_moves_on_at_once(#[case] working_server: bool) {
+    let closed = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let more = if working_server {
+        vec![name_server("app.example.", false).await]
+    } else {
+        Vec::new()
+    };
+    let mut config = Config::new(closed, more);
+    config.ip_strategy = sansio_dns::IpStrategy::Ipv4Only;
+    if !working_server {
+        config.attempts = std::num::NonZeroUsize::MIN;
+    }
+    let resolver = Resolver::new(config);
+
+    let lookup = resolver.lookup_ip("app.example");
+    let result = tokio::time::timeout(Duration::from_secs(1), lookup).await;
+
+    match result.expect("no deadline waited out") {
+        Ok(addresses) => {
+            assert!(working_server);
+            assert_eq!(addresses, [IpAddr::V4(V4)]);
+        }
+        Err(error) => {
+            assert!(!working_server, "{error:?}");
+            assert!(
+                matches!(
+                    error,
+                    Error::Resolve(sansio_dns::Error::Io(ErrorKind::ConnectionRefused))
+                ),
+                "{error:?}"
+            );
+        }
+    }
+}
+
+/// A receive error doesn't end the socket: with one server, the second
+/// attempt goes out on the same connected socket, and its ICMP port
+/// unreachable is reported too, so the lookup fails at once instead of
+/// waiting out the timeout. macOS doesn't report a second port
+/// unreachable on one socket that comes within a few hundred milliseconds
+/// of the first, so there the second attempt waits out its deadline.
+#[tokio::test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "macOS reports no second port unreachable this soon"
+)]
+async fn socket_works_after_a_receive_error() {
+    let closed = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let mut config = Config::new(closed, []);
+    config.ip_strategy = sansio_dns::IpStrategy::Ipv4Only;
+    config.attempts = std::num::NonZeroUsize::new(2).unwrap();
+    let resolver = Resolver::new(config);
+
+    let lookup = resolver.lookup_ip("app.example");
+    let result = tokio::time::timeout(Duration::from_secs(1), lookup).await;
+
+    let error = result.expect("no deadline waited out").unwrap_err();
+    assert!(
+        matches!(
+            error,
+            Error::Resolve(sansio_dns::Error::Io(ErrorKind::ConnectionRefused))
+        ),
+        "{error:?}"
+    );
+}
+
+/// An answer from another address doesn't complete the lookup, and the
+/// genuine one still does (RFC 5452 §9.1).
+#[tokio::test]
+async fn datagram_from_another_address_is_not_received() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let spoofer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut config = Config::new(server.local_addr().unwrap(), []);
+    config.ip_strategy = sansio_dns::IpStrategy::Ipv4Only;
+    let resolver = Resolver::new(config);
+    let lookup = tokio::spawn(async move { resolver.lookup_ip("app.example").await });
+    let mut buf = [0; 512];
+    let (n, from) = server.recv_from(&mut buf).await.unwrap();
+    let query = Message::from_vec(&buf[..n]).unwrap();
+    let mut spoofed = Message::response(query.metadata.id, OpCode::Query);
+    spoofed.add_query(query.queries[0].clone());
+    spoofed.add_answer(Record::from_rdata(
+        query.queries[0].name().clone(),
+        300,
+        RData::A(A(Ipv4Addr::new(192, 0, 2, 66))),
+    ));
+    spoofer
+        .send_to(&spoofed.to_vec().unwrap(), from)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut genuine = Message::response(query.metadata.id, OpCode::Query);
+    genuine.add_query(query.queries[0].clone());
+    genuine.add_answer(Record::from_rdata(
+        query.queries[0].name().clone(),
+        300,
+        RData::A(A(V4)),
+    ));
+    server
+        .send_to(&genuine.to_vec().unwrap(), from)
+        .await
+        .unwrap();
+
+    let addresses = lookup.await.unwrap().unwrap();
+    assert_eq!(addresses, [IpAddr::V4(V4)]);
+}
+
 #[tokio::test]
 async fn refused_tcp_fallback_fails_with_the_connect_error() {
     let server = truncating_udp_server().await;

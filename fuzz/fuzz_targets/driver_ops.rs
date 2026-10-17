@@ -143,9 +143,10 @@ fuzz_target!(|input: Input| {
     config.timeout = Duration::from_millis(1 + u64::from(timeout_millis));
     config.idle_timeout = Duration::from_millis(1 + u64::from(idle_millis));
     // One send per attempt, plus a switch to TCP, an EDNS downgrade and a
-    // resend after losing a connection, each at most once. Up to six
+    // free resend, each at most once; the harness leaves out the resends
+    // after a lost connection, which can come more often. Up to six
     // attempts on one server reach RFC 9520 §3.1's limit of three sends per
-    // server and transport, which the harness checks too.
+    // server and transport, which the harness checks for every send.
     let mut harness = Harness::new(config, servers, Some(attempts + 3));
 
     for op in input.ops.iter().take(256) {

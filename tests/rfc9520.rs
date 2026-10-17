@@ -172,8 +172,6 @@ mod section_3_1 {
         trace.timeout();
         let q0_tcp = trace.last();
         trace.query("b.example.", RecordType::A);
-        let sent = trace.last();
-        trace.answer(&sent, &truncated(reply(&sent)));
         let q1_tcp = trace.last();
         trace.answer(&q1_tcp, &reply(&q1_tcp));
         trace.close(&q0_tcp);
@@ -192,9 +190,6 @@ mod section_3_1 {
           -> S1 connect c1: a.example. A
           next t=6s
         t=2s query q1 b.example. A
-          -> S1 udp q1: b.example. A
-          next t=4s
-        t=2s <- S1 udp q1: b.example. A: NoError, 1 answer, TC
           -> S1 write c1: b.example. A
           next t=4s
         t=2s <- S1 c1: b.example. A: NoError, 1 answer

@@ -71,11 +71,25 @@ The `Resolver` is a state machine over two maps: pending queries
   starts at `first`, the first server not in `Resolver::failed` (no answer within
   `Config::failure_memory`), and moves on by one per attempt, past the servers in
   `Pending::excluded`; how often it has wrapped around sets the backoff round. `attempt`
-  counts the attempts used, bounded by `Config::attempts`. Its `Route` is `Udp` or
-  `Stream(Option<ConnectionId>)`.
+  counts the attempts used, bounded by `Config::attempts`. Its `Route` (how the current
+  attempt went out) is `Udp` or `Stream(ConnectionId)`, set by `emit`: every send goes to the
+  open connection to its server if there is one (RFC 7766 §5), else over a new connection if
+  `Pending::stream_only` (after a truncated answer, or with TLS), else over UDP.
 - Streams: one connection per server, shared and pipelined by all queries to it (RFC 7766), with
-  answers matched by ID and question. DoT sessions live inside `Connection` and are driven
-  in memory through `src/tls.rs`; the driver only moves bytes.
+  answers matched by ID and question, or by ID alone when they have no question (§7). A query
+  that leaves a connection before its answer (cancelled, or timed out while the connection
+  had answered since it was written) leaves an `Orphan` there: its ID stays in use
+  (`new_message` avoids it, §6.2.1) until the answer comes or the connection ends, it keeps
+  the connection busy until its old deadline, and `emit` takes it back instead of writing the
+  ID again if a later attempt returns to that connection. A connection holding
+  `MAX_ORPHANS` (256) of them is closed when another would join them (`time_out_stream`),
+  so a busy connection can't use up the ID space. `Connection::responses` counts complete
+  responses; `Pending::written_after` records it at write time and again when `emit` takes
+  an orphan back, so a timeout closes the connection only if no response arrived since, and
+  a lost connection gives a free resend whenever it answered since. Only writes and
+  complete responses reset the idle timer. DoT
+  sessions live inside `Connection` and are driven in memory through `src/tls.rs`; the driver
+  only moves bytes.
 - Replies go through `handle_reply`: one whose header and question match but whose records
   don't decode (`wire::Reply::Broken`) switches to TCP if TC is set over UDP and is a server
   error otherwise. `NOERROR` with data finishes a query; `NXDOMAIN` and NODATA go to
@@ -86,15 +100,17 @@ The `Resolver` is a state machine over two maps: pending queries
   (no answer: next server, uses an attempt, marks the server failed for new queries),
   `reject` (error answer: excludes the server for this search candidate, then the same),
   both through `advance`, which gives up once out of attempts or servers; `switch_to_tcp`
-  and `drop_edns` (same server, free), `resend` (same server, free once per query via
-  `forgive`, used by `lost` and `time_out_stream`), `next_candidate` (next search name,
-  fresh attempts, no exclusions), `give_up` and `fail`. `emit` counts every send in
-  `Pending::sends`: a search candidate goes at most three times to a server over one transport
-  (RFC 9520 §3.1), so `advance` skips servers without room, and the free sends check
-  `may_resend` first and move on instead. The crate docs' "How a query moves on" table
-  states the rules (at most `attempts + 3` sends per search candidate, not counting a cancel
-  hand-over's resend or a late joiner's fresh start, and at most three per server and
-  transport, hand-overs included), and a comment above `retry` maps each row to its
+  and `drop_edns` (same server, free), the resends in `lost` (same server, free every time
+  if the connection answered after the query was written, else once per query via
+  `forgive`) and `time_out_stream` (once, via the same `forgive`), `next_candidate` (next
+  search name, fresh attempts, no exclusions), `give_up` and `fail`. `emit` counts every
+  send in `Pending::sends`: a search candidate goes at most three times to a server over one
+  transport (RFC 9520 §3.1), so `advance` skips servers without room, and the free sends
+  and `switch_to_tcp` check `may_resend` first and move on instead. The crate docs' "How a
+  query moves on" table states the rules (at most `attempts + 3` sends per search
+  candidate, not counting a cancel hand-over's resend, the resends after a lost connection
+  that answered since, or a late joiner's fresh start, and at most three per server and
+  transport, all of those included), and a comment above `retry` maps each row to its
   function: change these functions together and keep the table in sync.
 - Every wait is bounded (RFC 1123 §6.1.3.3): `Config::wait` keeps a deadline between 1 s
   and 300 s after backoff, and `Config::failed_for` caps the failure memory at 5
@@ -111,14 +127,17 @@ The `Resolver` is a state machine over two maps: pending queries
   (`Resolver::query_candidate`, which skips `Config::hosts`; the lookup checks the name as
   given with `Resolver::is_local` first), merges the addresses from the events it is fed, and
   moves on when neither has one, so `handle_event` takes the resolver.
-- Driver obligations (also in the README): bind a fresh UDP socket per query (RFC 5452 §9.2)
-  and pass that query with each datagram; report a failed bind or send with
+- Driver obligations (also in the README): bind a fresh UDP socket per query (RFC 5452 §9.2),
+  connected to its server, with a new one for each server (§9.1), and pass that query with
+  each datagram; report a failed bind, connect, send or receive (ICMP errors) with
   `handle_udp_error`, a stream that the server closed with `handle_stream_closed` and an I/O
-  failure with `handle_stream_error`.
+  failure with `handle_stream_error`; write each stream payload in one call, with
+  `TCP_NODELAY` set (RFC 7766 §8, §6.2.1.1).
 
 `sansio-dns-tokio` runs one background task per `Resolver` (shared by its clones), spawned on
-the runtime of the first lookup. It owns the core resolver and all I/O: a UDP socket and
-forwarding task per query, and a task per stream connection. Lookups send a request over a
+the runtime of the first lookup. It owns the core resolver and all I/O: a UDP socket per query
+and server, connected to it, with a task forwarding datagrams and receive errors, and a task
+per stream connection. Lookups send a request over a
 channel with a `oneshot` reply; `CancelOnDrop` cancels a lookup whose future is dropped. If the
 task's runtime shuts down, the next lookup (or a waiting one) restarts it on its own runtime.
 A resolver shared with an idle current-thread runtime can hang lookups from other runtimes;
@@ -135,8 +154,9 @@ not coalesce; `reply` answers as a recursive server does, with RA set, so an emp
 NODATA rather than a referral; `no_data`, `referral`, `with_soa` and `cut` make NODATA,
 referrals, negative answers and undecodable replies) and
 `Trace`, which drives a resolver and renders each input, its events, its transmits and the
-next deadline as text (`answer_bytes` sends raw bytes; a response shows `AA` and `no RA`
-when they differ from a recursive server's). Tests of a query's lifecycle assert that text as an
+next deadline as text (`answer_bytes` sends raw message bytes, framed on a stream, and
+`stream_bytes` unframed bytes on a connection; a response shows `AA` and `no RA` when they
+differ from a recursive server's). Tests of a query's lifecycle assert that text as an
 insta inline snapshot (`assert_snapshot!(trace, @"...")`): after a deliberate behaviour change,
 run `cargo insta test --review` (or `--accept`) and read every changed snapshot against the
 crate docs' lifecycle table before accepting it. `Trace` decodes plaintext DNS only, so the

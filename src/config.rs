@@ -88,9 +88,10 @@ pub struct Config {
     ///
     /// RFC 9520 §3.1 allows at most three sends of a query to a server over
     /// one transport, free ones included, so a search candidate gets at
-    /// most three attempts per server over UDP, and three more over TCP
-    /// after a truncated answer. Attempts beyond that go unused: a query
-    /// whose servers have all had their three fails early.
+    /// most three attempts per server over UDP, and three more over a
+    /// stream, after a truncated answer or on an open connection. Attempts
+    /// beyond that go unused: a query whose servers have all had their
+    /// three fails early.
     pub attempts: NonZeroUsize,
     /// Domains to try appending to names without a trailing dot, in order.
     /// Empty means every name is used as given.
@@ -101,8 +102,10 @@ pub struct Config {
     pub ndots: u8,
     /// How long a stream connection may go without any query on it before
     /// the resolver asks for it to be closed (RFC 7766 §6.2.3), counted
-    /// from the last write or read on it, or from when the last query on it
-    /// was cancelled.
+    /// from the last query written to it or complete response read from it
+    /// (partial messages don't count), or from the deadline of any query
+    /// that left it before its answer came: cancelled, or moved on after a
+    /// timeout.
     pub idle_timeout: Duration,
     /// How long a server that failed to answer, by timing out or with a
     /// network error, stays failed: until then, new queries start at the

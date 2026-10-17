@@ -54,8 +54,10 @@ const MAX_DATAGRAMS: usize = 2 * MAX_SENDS_PER_SERVER;
 
 /// Datagrams and stream writes one search candidate may cause: one per
 /// attempt, plus switching to TCP, dropping EDNS and one free resend. A
-/// cancel hand-over's resend and a late joiner's fresh start don't count
-/// (see `Group`).
+/// cancel hand-over's resend, the resends after a lost connection and a
+/// late joiner's fresh start don't count (see `Group`): a connection that
+/// answered since a query was written gives it a free resend each time it
+/// is lost, bounded only by `MAX_SENDS_PER_SERVER`.
 const MAX_SENDS: usize = ATTEMPTS + 3;
 
 /// Transmits kept for replies, so late replies to old ones still happen.
@@ -77,6 +79,9 @@ enum Reply {
     },
     WrongId,
     WrongSource,
+    /// An answer without a question section, which only a stream matches
+    /// (RFC 7766 §7).
+    NoQuestion,
     BitFlip {
         byte: usize,
         bit: u8,
@@ -136,6 +141,7 @@ fn reply_strategy() -> impl Strategy<Value = Reply> {
         1 => any::<bool>().prop_map(|truncated| Reply::Cut { truncated }),
         1 => Just(Reply::WrongId),
         1 => Just(Reply::WrongSource),
+        1 => Just(Reply::NoQuestion),
         1 => (any::<usize>(), 0u8..8).prop_map(|(byte, bit)| Reply::BitFlip { byte, bit }),
     ]
 }
@@ -166,6 +172,11 @@ fn datagram(sent: &Transmit, kind: &Reply) -> (SocketAddr, Vec<u8>) {
         Reply::WrongId => {
             let mut m = answer;
             m.metadata.id = m.metadata.id.wrapping_add(1);
+            encode(&m)
+        }
+        Reply::NoQuestion => {
+            let mut m = answer;
+            m.queries.clear();
             encode(&m)
         }
     };
@@ -302,9 +313,12 @@ struct Group {
 }
 
 impl Group {
-    fn count(&mut self, to: SocketAddr, datagram: bool) {
-        self.sends += 1;
-        assert!(self.sends <= MAX_SENDS, "too many sends for one name");
+    /// Count a send to `to`, towards `MAX_SENDS` too unless it is `free`.
+    fn count(&mut self, to: SocketAddr, datagram: bool, free: bool) {
+        if !free {
+            self.sends += 1;
+            assert!(self.sends <= MAX_SENDS, "too many sends for one name");
+        }
         if datagram {
             self.datagrams += 1;
             assert!(
@@ -335,18 +349,25 @@ struct Harness {
     live: BTreeSet<QueryId>,
     done: BTreeSet<QueryId>,
     datagrams: BTreeMap<QueryId, usize>,
-    open: BTreeSet<ConnectionId>,
+    /// Open connections and their servers.
+    open: BTreeMap<ConnectionId, SocketAddr>,
     ever_opened: BTreeSet<ConnectionId>,
     recent: VecDeque<Transmit>,
     /// By name, for names with queries in flight.
     groups: BTreeMap<usize, Group>,
-    /// The name each message ID was sent for over UDP, which tells the
-    /// group of a stream write.
-    by_message_id: BTreeMap<u16, usize>,
-    /// Message IDs sent over a stream since their name's query last
-    /// started, and that name: such a query never goes back to UDP, since a
-    /// retry keeps the route.
-    streamed: BTreeMap<u16, usize>,
+    /// The message ID of a datagram just answered with TC set: a stream
+    /// write of that ID in the same step means the query switched to TCP,
+    /// to the same server or, when that one had no room left (RFC 9520
+    /// §3.1), to the next.
+    truncated: Option<u16>,
+    /// Message IDs that switched to TCP since their name's query last
+    /// started, and that name: such a query never goes back to UDP (RFC
+    /// 1123 §6.1.3.2), while one that went over a stream only because a
+    /// connection was open may.
+    switched: BTreeMap<u16, usize>,
+    /// The server of a connection lost in this step: the sends to it are
+    /// resends, which `MAX_SENDS` leaves out.
+    lost: Option<SocketAddr>,
 }
 
 impl Harness {
@@ -363,12 +384,13 @@ impl Harness {
             live: BTreeSet::new(),
             done: BTreeSet::new(),
             datagrams: BTreeMap::new(),
-            open: BTreeSet::new(),
+            open: BTreeMap::new(),
             ever_opened: BTreeSet::new(),
             recent: VecDeque::new(),
             groups: BTreeMap::new(),
-            by_message_id: BTreeMap::new(),
-            streamed: BTreeMap::new(),
+            truncated: None,
+            switched: BTreeMap::new(),
+            lost: None,
         }
     }
 
@@ -389,6 +411,9 @@ impl Harness {
                 let (from, bytes) = datagram(sent, &reply);
                 match sent.transport {
                     Transport::Udp(q) => {
+                        if matches!(reply, Reply::Truncated | Reply::Cut { truncated: true }) {
+                            self.truncated = Some(decode(sent).metadata.id);
+                        }
                         self.resolver.handle_datagram(q, from, &bytes, self.now);
                     }
                     Transport::TcpConnect(c) | Transport::TcpWrite(c) => {
@@ -421,25 +446,10 @@ impl Harness {
                     self.resolver.handle_timeout(self.now);
                 }
             }
-            Op::Cancel { query } => {
-                let id = self.pick(query);
-                self.resolver.cancel(id, self.now);
-                self.done.insert(id);
-                if self.live.remove(&id) {
-                    let name = self.name_of[&id];
-                    let heir = self.first_live(name);
-                    if let Some(group) = self.groups.get_mut(&name)
-                        && group.sender == Some(id)
-                    {
-                        group.sender = heir;
-                        group.handed_over = true;
-                    }
-                    self.leave(name);
-                }
-            }
+            Op::Cancel { query } => self.cancel(self.pick(query)),
             Op::StreamClosed { which, failed } => {
-                if let Some(&c) = self.open.iter().nth(which % self.open.len().max(1)) {
-                    self.open.remove(&c);
+                if let Some(&c) = self.open.keys().nth(which % self.open.len().max(1)) {
+                    self.lost = self.open.remove(&c);
                     if failed {
                         self.resolver
                             .handle_stream_error(c, ErrorKind::ConnectionReset, self.now);
@@ -452,6 +462,23 @@ impl Harness {
                 let id = self.pick(query);
                 self.resolver.handle_datagram(id, S1, &bytes, self.now);
             }
+        }
+    }
+
+    /// Cancel `id`, as the driver does when its lookup is dropped.
+    fn cancel(&mut self, id: QueryId) {
+        self.resolver.cancel(id, self.now);
+        self.done.insert(id);
+        if self.live.remove(&id) {
+            let name = self.name_of[&id];
+            let heir = self.first_live(name);
+            if let Some(group) = self.groups.get_mut(&name)
+                && group.sender == Some(id)
+            {
+                group.sender = heir;
+                group.handed_over = true;
+            }
+            self.leave(name);
         }
     }
 
@@ -490,8 +517,7 @@ impl Harness {
     fn leave(&mut self, name: usize) {
         if !self.has_live(name) {
             self.groups.remove(&name);
-            self.by_message_id.retain(|_, n| *n != name);
-            self.streamed.retain(|_, n| *n != name);
+            self.switched.retain(|_, n| *n != name);
         }
     }
 
@@ -502,9 +528,14 @@ impl Harness {
         let mut started_over = Vec::new();
         while let Some(t) = self.resolver.poll_transmit() {
             assert!(t.destination == S1 || t.destination == S2, "unknown server");
+            let free = self.lost == Some(t.destination);
             match t.transport {
                 Transport::Udp(q) => {
                     assert!(self.live.contains(&q), "datagram for a finished query");
+                    assert!(
+                        !self.open.values().any(|&server| server == t.destination),
+                        "a datagram to a server with an open connection"
+                    );
                     let id = decode(&t).metadata.id;
                     let name = self.name_of[&q];
                     let group = self.groups.entry(name).or_default();
@@ -521,21 +552,21 @@ impl Harness {
                         // IDs may come up again for any query. Another
                         // query that sent before must fail now.
                         started_over.push((name, other));
-                        self.streamed.retain(|_, n| *n != name);
+                        self.switched.retain(|_, n| *n != name);
                         self.datagrams.remove(&q);
                         *group = Group {
                             sender: Some(q),
                             began: Some(q),
                             ..Group::default()
                         };
-                        group.count(t.destination, true);
+                        group.count(t.destination, true, false);
                     } else if group.handed_over {
                         // The heir of a sender cancelled in this step sends
                         // the attempt again for free.
                         group.handed_over = false;
                         group.count_per_server(t.destination, true);
                     } else {
-                        group.count(t.destination, true);
+                        group.count(t.destination, true, free);
                     }
                     group.message_id = Some(id);
                     group.began.get_or_insert(q);
@@ -543,32 +574,62 @@ impl Harness {
                     *count += 1;
                     assert!(*count <= MAX_DATAGRAMS, "too many datagrams for one query");
                     assert!(
-                        !self.streamed.contains_key(&id),
-                        "a query back on UDP after a stream"
+                        !self.switched.contains_key(&id),
+                        "a query back on UDP after a truncated answer"
                     );
-                    self.by_message_id.insert(id, name);
                 }
                 Transport::TcpConnect(c) | Transport::TcpWrite(c) => {
                     if matches!(t.transport, Transport::TcpConnect(_)) {
                         assert!(self.ever_opened.insert(c), "connection id reused");
-                        self.open.insert(c);
+                        assert!(
+                            !self.open.values().any(|&server| server == t.destination),
+                            "a second connection to one server"
+                        );
+                        self.open.insert(c, t.destination);
                     }
-                    assert!(self.open.contains(&c), "write on a closed connection");
+                    assert!(self.open.contains_key(&c), "write on a closed connection");
                     assert!(!self.live.is_empty(), "query written with none pending");
                     let len = usize::from(u16::from_be_bytes([t.payload[0], t.payload[1]]));
                     assert_eq!(len + 2, t.payload.len(), "wrong TCP length prefix");
-                    let id = decode(&t).metadata.id;
-                    let name = self.by_message_id.get(&id);
-                    if let Some(&name) = name {
-                        self.streamed.insert(id, name);
+                    let request = decode(&t);
+                    let id = request.metadata.id;
+                    let name = name_of(&request);
+                    assert!(self.has_live(name), "stream write for no query in flight");
+                    if self.truncated == Some(id) {
+                        self.switched.insert(id, name);
                     }
-                    let Some(group) = name.and_then(|name| self.groups.get_mut(name)) else {
-                        panic!("stream write for no query in flight");
-                    };
-                    group.count(t.destination, false);
+                    let leader = self.first_live(name);
+                    let group = self.groups.entry(name).or_default();
+                    if group.message_id.is_none() {
+                        // The group's first send: from its leader, the
+                        // earliest of its queries in flight.
+                        group.sender = group.sender.or(leader);
+                        group.began = group.began.or(leader);
+                    }
+                    if group.message_id.is_some_and(|m| m != id) {
+                        // A late joiner starting over, on an open
+                        // connection.
+                        started_over.push((name, None));
+                        self.switched.retain(|_, n| *n != name);
+                        let name_of = &self.name_of;
+                        self.datagrams.retain(|q, _| name_of[q] != name);
+                        *group = Group::default();
+                        group.count(t.destination, false, false);
+                    } else if group.handed_over {
+                        // The heir of a sender cancelled in this step sends
+                        // the attempt again on a connection opened since.
+                        group.handed_over = false;
+                        group.count_per_server(t.destination, false);
+                    } else {
+                        group.count(t.destination, false, free);
+                    }
+                    group.message_id = Some(id);
                 }
                 Transport::TcpClose(c) => {
-                    assert!(self.open.remove(&c), "closing a connection that isn't open");
+                    assert!(
+                        self.open.remove(&c).is_some(),
+                        "closing a connection that isn't open"
+                    );
                     assert!(t.payload.is_empty(), "close with a payload");
                     continue;
                 }
@@ -578,6 +639,8 @@ impl Harness {
             }
             self.recent.push_back(t);
         }
+        self.truncated = None;
+        self.lost = None;
 
         let mut finished = BTreeSet::new();
         while let Some(event) = self.resolver.poll_event() {
@@ -607,6 +670,15 @@ impl Harness {
             group.handed_over = false;
         }
     }
+}
+
+/// Which of the `NAMES` a query asks for: `q{n}.example.`.
+fn name_of(request: &hickory_proto::op::Message) -> usize {
+    let name = request.queries[0].name().to_ascii();
+    name.trim_start_matches('q')
+        .trim_end_matches(".example.")
+        .parse()
+        .unwrap()
 }
 
 impl StateMachineTest for Harness {

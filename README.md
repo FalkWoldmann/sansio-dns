@@ -16,7 +16,7 @@ loop {
 }
 ```
 
-Complete drivers are in `examples/` (`std`, `tokio`, `compio`), about 100 lines each including TCP.
+Complete drivers are in `examples/` (`std`, `tokio`, `compio`), about 150 lines each including TCP.
 
 For hostnames, `IpLookup` runs the A and AAAA queries and merges the addresses, following
 CNAMEs. `Config::ip_strategy` picks the families and their order: IPv6 first by default, or
@@ -47,7 +47,8 @@ which still starts over rather than fail if it joined late.
 
 [`sansio-dns-tokio`](sansio-dns-tokio) is a ready-made driver: `lookup_ip(host)` runs an
 `IpLookup` on a background task shared by all clones of the resolver. Each UDP query gets its
-own socket, and TCP or TLS connections stay open between lookups until they go idle. With its
+own socket, connected to its server, and TCP or TLS connections stay open between lookups
+until they go idle. With its
 `reqwest` feature, it plugs into reqwest as the DNS resolver:
 
 ```rust
@@ -140,7 +141,8 @@ RFC 6891 §6.1.3 and RFC 7873 §5.3; RFC 2308 §2.2's NODATA is in `rfc1123.rs`'
 module, and RFC 6895, 8482 and 9824 in its §6.1.3.2 module; RFC 2308 §7.2's cap is in
 `rfc9520.rs`'s §3.2 module; RFC 6762 and 7686 are tested in `rfc6761.rs`'s §6.4 module;
 `rfc7858.rs` holds the RFC 7858, 8310 and 8467 tests as plain functions, without section
-modules; and `rfc7766.rs` also has `stream_timeout` and `lost_connection` modules.
+modules; and `rfc7766.rs` also has a `stream_timeout` module for queries that time out on a
+connection.
 `tests/main.rs` builds them all as one crate.
 
 | RFC | Section | Behavior |
@@ -148,7 +150,7 @@ modules; and `rfc7766.rs` also has `stream_timeout` and `lost_connection` module
 | 1035 | §2.3.3 | Question names are compared case-insensitively |
 | 1035 | §3.1 | Names are absolute: without search domains, `example.com` and `example.com.` ask the same question |
 | 1035 | §4.1.1 | `RD` set; only `NOERROR` and `NXDOMAIN` answer the question; every other code fails over, the codes 6 to 15 and extended ones included |
-| 1035 | §4.2.1 | `TC` set → retry over TCP (RFC 7766) |
+| 1035 | §4.2.1 | `TC` set → retry over TCP (RFC 1123 §6.1.3.2) |
 | 1035 | §7.2 | Retransmit on timeout, or at once when the datagram can't be sent, rotating through servers; new queries start after a server that recently failed to answer |
 | 1035 | §7.2 | A server that answers with an error code, a reply that doesn't decode or an empty answer without AA or RA is removed from the query's list until the next search candidate; once every server is removed, the query fails with the last error |
 | 1035 | §7.3 | Non-responses (`QR=0`) and wrong opcodes are discarded; a matching reply whose records don't decode moves on to the next server at once |
@@ -159,17 +161,20 @@ modules; and `rfc7766.rs` also has `stream_timeout` and `lost_connection` module
 | 2181 | §8 | TTLs with the most significant bit set are passed on as zero |
 | 2181 | §9 | A truncated UDP reply switches to TCP even when it is cut off mid-record and doesn't decode; over TCP a truncated reply is used as it is |
 | 3597 | §3 | Records of unknown type are kept as opaque data. hickory rejects a message with an empty-RDATA record outside UPDATE, although `\# 0` is valid; such a reply moves on to the next server at once |
-| 5452 | §9.1 | Responses must match source address, port, ID, QNAME, QTYPE and QCLASS, also when their records don't decode |
+| 5452 | §9.1 | Datagrams must match source address, port, ID, QNAME, QTYPE and QCLASS, also when their records don't decode; the driver's socket per query, connected to the server, checks destination address and port. On a stream, a response without a question section matches by ID alone (RFC 7766 §7) |
 | 5452 | §4.6 | The first answer that ends the query wins, and later copies are ignored. A copy of an error answer counts again while the query is still on that server: after a `FORMERR` without OPT made it drop EDNS, a second copy counts as the answer to the query without EDNS |
-| 5452 | §9.2 | IDs from a CSPRNG, avoiding those of outstanding queries (up to 16 picks); per-query source ports are the driver's job (see below) |
+| 5452 | §9.2 | IDs from a CSPRNG, avoiding those of outstanding queries, cancelled ones still outstanding on a connection included (16 random picks, then the next free ID); per-query source ports are the driver's job (see below) |
 | 6891 | §6.1.3 | BADVERS fails over like any server error: version 0 is the lowest there is |
 | 6891 | §6.2.3 | One OPT record, 1232-byte payload (DNS Flag Day 2020) |
 | 6891 | §7, §6.2.2 | `FORMERR` without OPT → same server once more without EDNS (over TLS: fail over, since EDNS carries the padding); with OPT → fail over |
 | 7873 | §5.3 | No cookie is sent, so BADCOOKIE is a server error and fails over |
-| 7766 | §5 | Truncated UDP response → same server over TCP; later attempts stay on TCP; UDP replies then ignored |
-| 7766 | §6.2.1 | One connection per server, reused and pipelined; answers matched in any order |
-| 7766 | §6.2.3 | Idle connections closed after `idle_timeout`, counted from the last read or write or from cancelling the last query on it; a timeout closes the connection |
-| 7766 | §8 | Two-byte length prefix; replies reassembled from any chunking |
+| 7766 | §5 | An open connection to a server carries every query to it, new ones and retries included; a query on it only for that goes back to UDP once it is gone. TCP is supported: a truncated UDP response sends the query to the same server over TCP, and its later attempts stay on TCP (RFC 1123 §6.1.3.2); UDP replies are then ignored |
+| 7766 | §6.2.1 | Connections reused and pipelined; no two queries outstanding on one share a message ID: a query cancelled or timed out there keeps its ID until its answer comes or the connection ends, and a later attempt on that connection waits for that answer instead of writing the ID again. A connection holding 256 such requests is closed when another would join them (§6.2.4 lets either end close under unusual conditions), which frees their IDs |
+| 7766 | §6.2.2 | At most one connection per server; when it fails, the queries on it that must use a stream share one new connection |
+| 7766 | §6.2.3 | Idle connections closed after `idle_timeout`, counted from the last write or complete response, or from the deadline of a query that left the connection before its answer came (cancelled, or moved on after a timeout); partial messages don't count |
+| 7766 | §6.2.4 | Queries on a lost connection that had answered go to the same server again without using an attempt: every time if it answered after they were written, else once per query |
+| 7766 | §7 | Answers matched in any order, by message ID and question, or by ID alone without a question section; a query that times out closes the connection only if no response arrived on it since the query was written |
+| 7766 | §8 | Two-byte length prefix; replies reassembled from any chunking, up to 65535 octets |
 | 1034 | §3.6.2 | `addresses` follows the CNAME chain and ignores records owned by other names |
 | 6761 | §6.3 | `localhost` names → loopback for A/AAAA, empty answer otherwise; nothing sent |
 | 6761 | §6.4 | `invalid.` → NXDOMAIN; nothing sent |
@@ -184,26 +189,35 @@ modules; and `rfc7766.rs` also has `stream_timeout` and `lost_connection` module
 
 ### Driver obligations
 
-RFC 5452 §9.2 requires an unpredictable source port per outstanding query. A sans-IO core
-can't pick ports, so `Transport::Udp(query)` names the query: bind a fresh ephemeral socket
-per query, and pass that query along with each datagram the socket receives to `handle_datagram`.
+RFC 5452 §9.2 requires an unpredictable source port per outstanding query, and §9.1 a reply's
+destination address and port to match the query's source. A sans-IO core can't pick ports or
+see where a datagram was sent to, so `Transport::Udp(query)` names the query: bind a fresh
+ephemeral socket per query, connect it to the destination (a new socket when the query moves
+to another server), and pass that query along with each datagram the socket receives to
+`handle_datagram`. The kernel then delivers only datagrams from that server to that address
+and port.
 
 Stream connections are named by a `ConnectionId`: `TcpConnect(id)` means open a connection
 to the destination and write the payload, `TcpWrite(id)` write to it, `TcpClose(id)` close
-it. Payloads are already length-prefixed or TLS-encrypted. Pass everything read to
-`handle_stream_data(id, …)`. Call `handle_stream_closed(id, …)` if the server closes the
-connection, and `handle_stream_error(id, kind, …)` if connecting, reading or writing fails,
-so a query out of attempts fails with that error. The resolver keeps one connection per
-server and pipelines queries over it; it closes the connection after `Config::idle_timeout`
-(10 s) without queries, when a query on it times out, or, with `tls`, when TLS rejects bytes
-received on it.
+it. Payloads are already length-prefixed or TLS-encrypted: write each in one call (RFC 7766
+§8), and disable Nagle's algorithm (`TCP_NODELAY`) so pipelined queries go out at once
+(§6.2.1.1). Pass everything read to `handle_stream_data(id, …)`. Call
+`handle_stream_closed(id, …)` if the server closes the connection, and
+`handle_stream_error(id, kind, …)` if connecting, reading or writing fails, so a query out of
+attempts fails with that error. The resolver keeps one connection per server and pipelines
+queries over it; it closes the connection after `Config::idle_timeout` (10 s) without
+queries, when a query on it times out with no response since it was written, when 256
+requests on it went unanswered, or, with `tls`, when TLS rejects bytes received on it.
 
 A `TcpWrite` can follow its `TcpConnect` before connecting has finished, so queue it. After
-reporting a connection closed or failed, forget it: no `TcpClose` follows. When binding a
-query's socket or sending its datagram fails, call `handle_udp_error(query, to, kind, …)`,
-so the query moves on at once instead of waiting out its deadline. Bind each socket in the
-destination's address family, pass the source address as received (an IPv4 server seen as
-`::ffff:a.b.c.d` won't match), and read datagrams into a buffer of at least 1232 bytes.
+reporting a connection closed or failed, forget it: no `TcpClose` follows. When binding,
+connecting or sending on a query's socket fails, or receiving on it reports an error such as
+an ICMP port unreachable (RFC 1122 §4.1.3.3), call `handle_udp_error(query, to, kind, …)`,
+so the query moves on at once instead of waiting out its deadline. An error doesn't end the
+socket: keep receiving on it while the query's attempts go to that server, and bind a new one
+when an attempt goes to another. Bind each socket in the destination's address family, pass
+the source address as received (an IPv4 server seen as `::ffff:a.b.c.d` won't match), and
+read datagrams into a buffer of at least 1232 bytes.
 
 ### Not implemented
 

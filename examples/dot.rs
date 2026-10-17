@@ -53,6 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     c,
                     TcpStream::connect_timeout(&t.destination, Duration::from_secs(2)).and_then(
                         |mut stream| {
+                            stream.set_nodelay(true)?;
                             stream.write_all(&t.payload)?;
                             tcp = Some((c, stream));
                             Ok(())

@@ -2,11 +2,13 @@
 //!
 //! Without a server argument, settings come from `/etc/resolv.conf`.
 //!
-//! Handles one query, so the socket bound up front stands in for that
-//! query's own; a driver with several binds one per `Transport::Udp` query,
-//! in the server's address family, as sansio-dns-tokio does. While a TCP
-//! connection is open it reads only from that, since the resolver ignores
-//! UDP replies once a query has switched to TCP.
+//! Handles one query, so it keeps one UDP socket, connected to the server
+//! of the query's current attempt and bound anew when the query moves to
+//! another server, as sansio-dns-tokio does for each query. A connected
+//! socket only takes datagrams from that server to the address the query
+//! went out from (RFC 5452 §9.1), and reports an ICMP error such as port
+//! unreachable. While a TCP connection is open it reads only from that,
+//! since the resolver ignores UDP replies once a query has switched to TCP.
 
 #![expect(
     clippy::disallowed_methods,
@@ -17,7 +19,7 @@
 )]
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::{TcpStream, UdpSocket};
+use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
 use sansio_dns::hickory_proto::rr::{Name, RecordType};
@@ -27,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let name = Name::from_ascii(args.next().unwrap_or_else(|| "example.com.".into()))?;
 
-    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    let mut udp: Option<(SocketAddr, UdpSocket)> = None;
     let mut tcp: Option<(ConnectionId, TcpStream)> = None;
     let config = match args.next() {
         Some(server) => Config::new(server.parse()?, []),
@@ -41,7 +43,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Some(t) = resolver.poll_transmit() {
             match t.transport {
                 Transport::Udp(q) => {
-                    if let Err(e) = socket.send_to(&t.payload, t.destination) {
+                    let sent = connect(&mut udp, t.destination).and_then(|s| s.send(&t.payload));
+                    if let Err(e) = sent {
                         resolver.handle_udp_error(q, t.destination, e.kind(), Instant::now());
                     }
                 }
@@ -88,20 +91,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
+        let Some((server, socket)) = &udp else {
+            std::thread::sleep(wait);
+            resolver.handle_timeout(Instant::now());
+            continue;
+        };
         socket.set_read_timeout(Some(wait))?;
-        match socket.recv_from(&mut buf) {
-            Ok((n, from)) => resolver.handle_datagram(query, from, &buf[..n], Instant::now()),
+        match socket.recv(&mut buf) {
+            Ok(n) => resolver.handle_datagram(query, *server, &buf[..n], Instant::now()),
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                 resolver.handle_timeout(Instant::now());
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => resolver.handle_udp_error(query, *server, e.kind(), Instant::now()),
         }
     }
+}
+
+/// The socket connected to `to`, bound anew for each server.
+fn connect(
+    udp: &mut Option<(SocketAddr, UdpSocket)>,
+    to: SocketAddr,
+) -> std::io::Result<&UdpSocket> {
+    if udp.as_ref().is_none_or(|(server, _)| *server != to) {
+        let socket = UdpSocket::bind(if to.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" })?;
+        socket.connect(to)?;
+        *udp = Some((to, socket));
+    }
+    udp.as_ref()
+        .map(|(_, socket)| socket)
+        .ok_or_else(|| ErrorKind::NotConnected.into())
 }
 
 /// Connect to the transmit's destination and send its (length-prefixed) payload.
 fn open(t: &Transmit) -> std::io::Result<TcpStream> {
     let mut stream = TcpStream::connect_timeout(&t.destination, Duration::from_secs(2))?;
+    stream.set_nodelay(true)?;
     stream.write_all(&t.payload)?;
     Ok(stream)
 }

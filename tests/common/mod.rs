@@ -264,6 +264,18 @@ impl Trace {
         self.record(&line);
     }
 
+    /// Bytes on the connection `on` was sent over, as they are, without a
+    /// length prefix, described as `what`.
+    pub fn stream_bytes(&mut self, on: &Transmit, bytes: &[u8], what: &str) {
+        self.resolver.handle_stream_data(conn(on), bytes, self.now);
+        let line = format!(
+            "<- {} {}: {what}",
+            server(on.destination),
+            self.conn_name(conn(on))
+        );
+        self.record(&line);
+    }
+
     /// The server closed the connection `on` was sent over.
     pub fn close(&mut self, on: &Transmit) {
         self.resolver.handle_stream_closed(conn(on), self.now);
