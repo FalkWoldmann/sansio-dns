@@ -350,14 +350,38 @@ impl Resolver {
     /// Connecting, reading or writing failed on `connection` with `error`.
     /// Its queries move on exactly as with [`Resolver::handle_stream_closed`];
     /// the difference is that a query out of attempts fails with
-    /// [`Error::Connection`] carrying `error`.
+    /// [`Error::Io`] carrying `error`.
     pub fn handle_stream_error(
         &mut self,
         connection: ConnectionId,
         error: io::ErrorKind,
         now: Instant,
     ) {
-        self.lost(connection, now, &Error::Connection(error));
+        self.lost(connection, now, &Error::Io(error));
+    }
+
+    /// Binding the socket of `query`, or sending its datagram to `to`,
+    /// failed with `error`. The query moves on to its next attempt at once
+    /// instead of waiting out its deadline, and a query out of attempts
+    /// fails with [`Error::Io`] carrying `error`.
+    ///
+    /// Ignored unless the query's current attempt goes over UDP to `to`, so
+    /// a late report can't skip an attempt to another server. Report the
+    /// failure as soon as it happens: with one server, a late one would
+    /// still use up the current attempt.
+    pub fn handle_udp_error(
+        &mut self,
+        query: QueryId,
+        to: SocketAddr,
+        error: io::ErrorKind,
+        now: Instant,
+    ) {
+        let Some(pending) = self.pending.get(&query) else {
+            return;
+        };
+        if pending.route == Route::Udp && self.config.server(pending.attempt) == to {
+            self.retry(query, now, Error::Io(error));
+        }
     }
 
     /// `connection` went away without being asked to; see
@@ -546,7 +570,8 @@ impl Resolver {
     // How a query moves on, row by row of the crate docs' table, and the
     // state that keeps each free step to once per search candidate:
     //
-    // - no answer by its deadline, server error: `retry`
+    // - no answer by its deadline, datagram not sent (`handle_udp_error`),
+    //   server error: `retry`
     // - truncated over UDP: `switch_to_tcp`, once because `route` never goes
     //   back to `Route::Udp`
     // - FORMERR without OPT: `drop_edns`, once because `request.edns` is

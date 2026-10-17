@@ -63,8 +63,9 @@ reply matching, special-use answers), `src/resolver.rs` (the state machine), `sr
 (`IpLookup`) and `src/tls.rs` (DoT sessions driven in memory, `tls` feature).
 The `Resolver` is a state machine over two maps: pending queries
 (`QueryId` -> `Pending`) and stream connections (`ConnectionId` -> `Connection`). Inputs are
-`query`, `handle_datagram(query, from, ..)`, `handle_stream_data/closed/error`, `handle_timeout`
-and `cancel`; outputs are drained with `poll_transmit`, `poll_event` and `poll_timeout`.
+`query`, `handle_datagram(query, from, ..)`, `handle_udp_error`,
+`handle_stream_data/closed/error`, `handle_timeout` and `cancel`; outputs are drained with
+`poll_transmit`, `poll_event` and `poll_timeout`.
 
 - A query's `attempt` index picks its server (`Config::server` rotates through the list) and is
   bounded by `Config::attempts`. Its `Route` is `Udp` or `Stream(Option<ConnectionId>)`.
@@ -88,8 +89,9 @@ and `cancel`; outputs are drained with `poll_transmit`, `poll_event` and `poll_t
   without a transmit. `IpLookup` (`src/lookup.rs`) runs the A and AAAA queries on a `Resolver`
   and merges the addresses from the events it is fed.
 - Driver obligations (also in the README): bind a fresh UDP socket per query (RFC 5452 §9.2)
-  and pass that query with each datagram; report a stream that the server closed with
-  `handle_stream_closed` and an I/O failure with `handle_stream_error`.
+  and pass that query with each datagram; report a failed bind or send with
+  `handle_udp_error`, a stream that the server closed with `handle_stream_closed` and an I/O
+  failure with `handle_stream_error`.
 
 `sansio-dns-tokio` runs one background task per `Resolver` (shared by its clones), spawned on
 the runtime of the first lookup. It owns the core resolver and all I/O: a UDP socket and

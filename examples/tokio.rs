@@ -38,8 +38,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         while let Some(t) = resolver.poll_transmit() {
             match t.transport {
-                Transport::Udp(_) => {
-                    socket.send_to(&t.payload, t.destination).await?;
+                Transport::Udp(q) => {
+                    if let Err(e) = socket.send_to(&t.payload, t.destination).await {
+                        resolver.handle_udp_error(q, t.destination, e.kind(), Instant::now());
+                    }
                 }
                 Transport::TcpConnect(c) => match timeout(Duration::from_secs(2), open(&t)).await {
                     Ok(Ok(stream)) => tcp = Some((c, stream)),

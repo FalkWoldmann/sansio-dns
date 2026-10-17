@@ -214,6 +214,18 @@ impl Trace {
         self.record(&line);
     }
 
+    /// Binding the socket for `on`, or sending it, failed.
+    pub fn udp_error(&mut self, on: &Transmit, error: ErrorKind) {
+        self.resolver
+            .handle_udp_error(udp(on), on.destination, error, self.now);
+        let line = format!(
+            "udp {} to {} error {error:?}",
+            self.query_name(udp(on)),
+            server(on.destination)
+        );
+        self.record(&line);
+    }
+
     pub fn cancel(&mut self, query: QueryId) {
         self.resolver.cancel(query, self.now);
         let line = format!("cancel {}", self.query_name(query));

@@ -1,10 +1,12 @@
 //! Sequences of driver calls, like the state machine proptest but coverage
 //! guided and with the timeouts, attempts and servers chosen too. Replies
 //! go to recent transmits over their transport, well-formed or tampered
-//! with; raw bytes go to datagram sockets and connections.
+//! with, and send errors to recent datagrams; raw bytes go to datagram
+//! sockets and connections.
 
 #![no_main]
 
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::time::Duration;
@@ -52,6 +54,7 @@ enum Op {
     StreamClosed { connection: u8, failed: bool },
     StreamBytes { connection: u8, bytes: Vec<u8> },
     Garbage { to: u8, bytes: Vec<u8> },
+    UdpError(u8),
 }
 
 #[derive(Arbitrary, Debug)]
@@ -167,6 +170,15 @@ fuzz_target!(|input: Input| {
                     .map(|s| (s.transport, s.destination));
                 if let Some((Transport::Udp(q), from)) = target {
                     harness.resolver.handle_datagram(q, from, bytes, now);
+                }
+            }
+            Op::UdpError(to) => {
+                let target = harness
+                    .recent(*to, |s| matches!(s.transport, Transport::Udp(_)))
+                    .map(|s| (s.transport, s.destination));
+                if let Some((Transport::Udp(q), to)) = target {
+                    let unreachable = ErrorKind::NetworkUnreachable;
+                    harness.resolver.handle_udp_error(q, to, unreachable, now);
                 }
             }
         }

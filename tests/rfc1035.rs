@@ -1,7 +1,8 @@
 //! RFC 1035, Domain Names - Implementation and Specification.
 //! <https://rfc-annotations.research.icann.org/rfc1035.html>
 
-use std::time::Instant;
+use std::io::ErrorKind;
+use std::time::{Duration, Instant};
 
 use crate::common::*;
 use hickory_proto::op::{MessageType, OpCode, Query, ResponseCode};
@@ -191,6 +192,67 @@ mod section_7_2 {
         ");
     }
 
+    /// A datagram that can't be sent, say to a server of an address family
+    /// the host has no route for, moves the query on without waiting out
+    /// its deadline, and the last such error is the query's.
+    #[rstest]
+    fn unsendable_datagram_moves_on_at_once(mut trace: Trace) {
+        trace.query("example.com.", RecordType::A);
+        trace.at(Duration::from_millis(500));
+
+        for _ in 0..4 {
+            let sent = trace.last();
+            trace.udp_error(&sent, ErrorKind::NetworkUnreachable);
+        }
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 example.com. A
+          -> S1 udp q0: example.com. A
+          next t=2s
+        t=0.5s udp q0 to S1 error NetworkUnreachable
+          -> S2 udp q0: example.com. A
+          next t=2.5s
+        t=0.5s udp q0 to S2 error NetworkUnreachable
+          -> S1 udp q0: example.com. A
+          next t=2.5s
+        t=0.5s udp q0 to S1 error NetworkUnreachable
+          -> S2 udp q0: example.com. A
+          next t=2.5s
+        t=0.5s udp q0 to S2 error NetworkUnreachable
+          => q0 Failed Io(NetworkUnreachable)
+          next none
+        ");
+    }
+
+    /// A report about an attempt the query has moved on from is ignored:
+    /// one to an earlier server, or one sent before switching to TCP.
+    #[rstest]
+    fn stale_udp_error_is_ignored(mut trace: Trace) {
+        trace.query("example.com.", RecordType::A);
+        let first = trace.last();
+        trace.timeout();
+        let second = trace.last();
+        trace.udp_error(&first, ErrorKind::NetworkUnreachable);
+        trace.answer(&second, &truncated(reply(&second)));
+        trace.udp_error(&second, ErrorKind::NetworkUnreachable);
+
+        assert_snapshot!(trace, @"
+        t=0s query q0 example.com. A
+          -> S1 udp q0: example.com. A
+          next t=2s
+        t=2s timeout
+          -> S2 udp q0: example.com. A
+          next t=4s
+        t=2s udp q0 to S1 error NetworkUnreachable
+          next t=4s
+        t=2s <- S2 udp q0: example.com. A: NoError, 1 answer, TC
+          -> S2 connect c0: example.com. A
+          next t=4s
+        t=2s udp q0 to S2 error NetworkUnreachable
+          next t=4s
+        ");
+    }
+
     #[rstest]
     fn retransmission_resends_the_same_question(mut resolver: Resolver) {
         let now = Instant::now();
@@ -202,7 +264,7 @@ mod section_7_2 {
     #[test]
     fn timeout_too_large_for_instant_waits_forever() {
         let mut config = sansio_dns::Config::new(S1, []);
-        config.timeout = std::time::Duration::MAX;
+        config.timeout = Duration::MAX;
         let mut r = Resolver::new(config);
         let now = Instant::now();
         let sent = start(&mut r, now);

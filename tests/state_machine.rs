@@ -1,10 +1,11 @@
 //! Random sequences of driver calls, checking invariants after every step.
 //!
 //! The resolver only ever sees `query`, `handle_datagram`,
-//! `handle_stream_data`, `handle_stream_closed`, `handle_stream_error`,
-//! `handle_timeout` and `cancel`, so any sequence of those is a valid input.
-//! Replies go to recent transmits over their transport, often tampered with
-//! and, over TCP, split into two chunks; there is raw garbage too.
+//! `handle_udp_error`, `handle_stream_data`, `handle_stream_closed`,
+//! `handle_stream_error`, `handle_timeout` and `cancel`, so any sequence of
+//! those is a valid input. Replies and send errors go to recent transmits
+//! over their transport, replies often tampered with and, over TCP, split
+//! into two chunks; there is raw garbage too.
 //!
 //! [`Model`] generates the calls from what a driver knows without asking the
 //! resolver: how many queries it started, and whether it sent a reply that
@@ -70,6 +71,10 @@ enum Op {
         to: usize,
         reply: Reply,
         split: usize,
+    },
+    /// Sending a recent datagram failed; nothing for a stream transmit.
+    UdpError {
+        to: usize,
     },
     Elapse {
         millis: u16,
@@ -183,6 +188,7 @@ impl ReferenceStateMachine for Model {
                     .prop_map(|(to, reply, split)| Op::Reply { to, reply, split })
                     .boxed(),
             ));
+            ops.push((1, any::<usize>().prop_map(|to| Op::UdpError { to }).boxed()));
             ops.push((
                 1,
                 any::<Index>()
@@ -211,7 +217,9 @@ impl ReferenceStateMachine for Model {
         match op {
             Op::Query { name } => *name < NAMES,
             Op::Elapse { .. } | Op::Timeout => true,
-            Op::Reply { .. } | Op::Cancel { .. } | Op::Garbage { .. } => model.queries > 0,
+            Op::Reply { .. } | Op::UdpError { .. } | Op::Cancel { .. } | Op::Garbage { .. } => {
+                model.queries > 0
+            }
             Op::StreamClosed { .. } => model.streams,
         }
     }
@@ -224,6 +232,7 @@ impl ReferenceStateMachine for Model {
                 ..
             } => model.streams = true,
             Op::Reply { .. }
+            | Op::UdpError { .. }
             | Op::Elapse { .. }
             | Op::Timeout
             | Op::Cancel { .. }
@@ -333,6 +342,17 @@ impl Harness {
                         self.resolver.handle_stream_data(c, b, self.now);
                     }
                     Transport::TcpClose(_) => {}
+                }
+            }
+            Op::UdpError { to } => {
+                let sent = &self.recent[to % self.recent.len()];
+                if let Transport::Udp(q) = sent.transport {
+                    self.resolver.handle_udp_error(
+                        q,
+                        sent.destination,
+                        ErrorKind::NetworkUnreachable,
+                        self.now,
+                    );
                 }
             }
             Op::Elapse { millis } => {

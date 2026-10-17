@@ -40,8 +40,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         while let Some(t) = resolver.poll_transmit() {
             match t.transport {
-                Transport::Udp(_) => {
-                    socket.send_to(&t.payload, t.destination)?;
+                Transport::Udp(q) => {
+                    if let Err(e) = socket.send_to(&t.payload, t.destination) {
+                        resolver.handle_udp_error(q, t.destination, e.kind(), Instant::now());
+                    }
                 }
                 Transport::TcpConnect(c) => match open(&t) {
                     Ok(stream) => tcp = Some((c, stream)),

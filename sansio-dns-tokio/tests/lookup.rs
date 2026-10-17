@@ -60,6 +60,40 @@ async fn unknown_name_is_not_found() {
     assert!(matches!(result, Err(Error::NotFound)), "{result:?}");
 }
 
+/// Sending to the broadcast address without `SO_BROADCAST` fails at once,
+/// so the lookup moves to the next server without waiting out the
+/// timeout, and fails with the send error when no server is left.
+#[rstest]
+#[case::next_server_answers(true)]
+#[case::no_server_left(false)]
+#[tokio::test]
+async fn unsendable_datagram_moves_on_at_once(#[case] working_server: bool) {
+    let broadcast = SocketAddr::from((Ipv4Addr::BROADCAST, 53));
+    let more = if working_server {
+        vec![name_server("app.example.", false).await]
+    } else {
+        Vec::new()
+    };
+    let resolver = Resolver::new(Config::new(broadcast, more));
+
+    let lookup = resolver.lookup_ip("app.example");
+    let result = tokio::time::timeout(Duration::from_secs(1), lookup).await;
+
+    match result.expect("no deadline waited out") {
+        Ok(addresses) => {
+            assert!(working_server);
+            assert_eq!(addresses, [IpAddr::V4(V4), IpAddr::V6(V6)]);
+        }
+        Err(error) => {
+            assert!(!working_server, "{error:?}");
+            assert!(
+                matches!(error, Error::Resolve(sansio_dns::Error::Io(_))),
+                "{error:?}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn refused_tcp_fallback_fails_with_the_connect_error() {
     let server = truncating_udp_server().await;
@@ -70,7 +104,7 @@ async fn refused_tcp_fallback_fails_with_the_connect_error() {
     assert!(
         matches!(
             result,
-            Err(Error::Resolve(sansio_dns::Error::Connection(
+            Err(Error::Resolve(sansio_dns::Error::Io(
                 ErrorKind::ConnectionRefused
             )))
         ),

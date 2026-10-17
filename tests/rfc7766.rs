@@ -141,7 +141,7 @@ mod section_5 {
           -> S2 connect c3: example.com. A
           next t=2s
         t=0s c3 error ConnectionRefused
-          => q0 Failed Connection(ConnectionRefused)
+          => q0 Failed Io(ConnectionRefused)
           next none
         ");
     }

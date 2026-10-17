@@ -31,7 +31,7 @@
 //!
 //! | What happens | What the query does next | Server | Uses an attempt | Deadline |
 //! |---|---|---|---|---|
-//! | No answer by its deadline | sends its next attempt | next | yes | fresh |
+//! | No answer by its deadline, or its datagram couldn't be sent | sends its next attempt | next | yes | fresh |
 //! | `SERVFAIL`, `REFUSED`, `NOTIMP`, or any other `FORMERR` | sends its next attempt | next | yes | fresh |
 //! | Truncated answer over UDP | switches to TCP; later attempts stay on TCP | same | no | fresh |
 //! | `FORMERR` without OPT to a query that still has EDNS (not over TLS) | drops EDNS, once; later attempts stay without it | same | no | fresh |
@@ -82,8 +82,10 @@
 //!
 //! A [`Transport::TcpWrite`] can follow its [`Transport::TcpConnect`]
 //! before connecting has finished: queue it. After reporting a connection
-//! closed or failed, forget it; no [`Transport::TcpClose`] follows. A UDP
-//! send that fails needs no call: the query times out and moves on.
+//! closed or failed, forget it; no [`Transport::TcpClose`] follows. When
+//! binding a query's socket or sending its datagram fails, call
+//! [`Resolver::handle_udp_error`], so the query moves on at once instead of
+//! waiting out its deadline.
 //!
 //! For UDP, [RFC 5452 §9.2] requires an unpredictable source port, and a
 //! different one for each outstanding query. The resolver can't choose
@@ -184,10 +186,11 @@ pub enum Error {
     /// The last TCP connection closed before a complete response arrived.
     #[error("connection closed before a response")]
     ConnectionClosed,
-    /// The last TCP connection failed with this I/O error, for example
-    /// when connecting was refused.
-    #[error("connection failed: {0}")]
-    Connection(io::ErrorKind),
+    /// The last attempt failed with this I/O error: its TCP connection
+    /// failed, for example when connecting was refused, or its datagram
+    /// couldn't be sent, for example to an unreachable network.
+    #[error("network I/O failed: {0}")]
+    Io(io::ErrorKind),
     /// The last TLS session failed, for example on an invalid certificate.
     /// Only with the `tls` feature.
     #[error("TLS failed: {0}")]

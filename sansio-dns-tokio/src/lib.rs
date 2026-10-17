@@ -267,7 +267,10 @@ async fn run(config: Config, mut requests: mpsc::UnboundedReceiver<Request>) {
     loop {
         while io.tasks.try_join_next().is_some() {}
         while let Some(transmit) = resolver.poll_transmit() {
-            io.send(transmit).await;
+            let to = transmit.destination;
+            if let Err((query, error)) = io.send(transmit).await {
+                resolver.handle_udp_error(query, to, error, Instant::now());
+            }
         }
         while let Some(event) = resolver.poll_event() {
             let (Event::Response { query, .. } | Event::Failed { query, .. }) = &event;
@@ -378,18 +381,16 @@ struct Io {
 }
 
 impl Io {
-    /// Carry out `transmit`.
-    async fn send(&mut self, transmit: Transmit) {
+    /// Carry out `transmit`. Fails with its query if a datagram's socket
+    /// can't be bound or the datagram can't be sent; stream failures are
+    /// reported by the connection's task.
+    async fn send(&mut self, transmit: Transmit) -> Result<(), (QueryId, io::ErrorKind)> {
         match transmit.transport {
             Transport::Udp(query) => {
-                // A datagram that can't be sent is lost like any other: the
-                // query times out and moves on to the next server.
-                if let Ok(socket) = self.socket(query, transmit.destination).await {
-                    socket
-                        .send_to(&transmit.payload, transmit.destination)
-                        .await
-                        .ok();
-                }
+                return self
+                    .send_datagram(query, transmit.destination, &transmit.payload)
+                    .await
+                    .map_err(|error| (query, error.kind()));
             }
             Transport::TcpConnect(connection) => {
                 let (writes, queued) = mpsc::unbounded_channel();
@@ -416,6 +417,17 @@ impl Io {
                 }
             }
         }
+        Ok(())
+    }
+
+    async fn send_datagram(
+        &mut self,
+        query: QueryId,
+        to: SocketAddr,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        self.socket(query, to).await?.send_to(payload, to).await?;
+        Ok(())
     }
 
     /// The socket for `query`, bound on first use and again when the query

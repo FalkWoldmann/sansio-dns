@@ -131,7 +131,7 @@ modules; and `rfc7766.rs` also has `stream_timeout` and `lost_connection` module
 | 1035 | §3.1 | Names are absolute: without search domains, `example.com` and `example.com.` ask the same question |
 | 1035 | §4.1.1 | `RD` set; `NOERROR` ends the query, and `NXDOMAIN` does once no search candidate is left; `SERVFAIL`/`NOTIMP`/`REFUSED` fail over |
 | 1035 | §4.2.1 | `TC` set → retry over TCP (RFC 7766) |
-| 1035 | §7.2 | Retransmit on timeout, rotating through servers |
+| 1035 | §7.2 | Retransmit on timeout, or at once when the datagram can't be sent, rotating through servers |
 | 1035 | §7.3 | Non-responses (`QR=0`) and wrong opcodes are discarded |
 | 5452 | §9.1 | Responses must match source address, port, ID, QNAME, QTYPE and QCLASS |
 | 5452 | §4.6 | Only the first matching response is accepted |
@@ -169,8 +169,9 @@ server and pipelines queries over it; it closes the connection after `Config::id
 received on it.
 
 A `TcpWrite` can follow its `TcpConnect` before connecting has finished, so queue it. After
-reporting a connection closed or failed, forget it: no `TcpClose` follows. A UDP send that
-fails needs no call, since the query times out and moves on. Bind each socket in the
+reporting a connection closed or failed, forget it: no `TcpClose` follows. When binding a
+query's socket or sending its datagram fails, call `handle_udp_error(query, to, kind, …)`,
+so the query moves on at once instead of waiting out its deadline. Bind each socket in the
 destination's address family, pass the source address as received (an IPv4 server seen as
 `::ffff:a.b.c.d` won't match), and read datagrams into a buffer of at least 1232 bytes.
 
