@@ -126,14 +126,24 @@ impl Settings {
 
 /// A TLS session, and the messages that wait for its handshake.
 ///
-/// It is handshaking first, holding the messages written meanwhile in
-/// `early`, and established once [`Session::receive`] finds the handshake
-/// done, when it sends them. In either phase, the server's close_notify or
-/// a TLS error from `receive` ([`Received::ending`]), or a TLS error from
-/// [`Session::send`], ends it, and the resolver then shuts its connection
-/// in the same call, which sends what [`Session::close`] returns. A
-/// connection the resolver shuts for another reason closes its session the
-/// same way, and one the driver reports gone drops it.
+/// | Input \[guard\] | Next | Bytes to send |
+/// |---|---|---|
+/// | `Settings::connect` | handshaking | the ClientHello |
+/// | [`Session::send`] [while handshaking] | handshaking | none: the message waits in `early` |
+/// | `send` [once established, TLS refuses the message] | ended (`Err`) | none |
+/// | `send` [once established] | established | what rustls has to send: the message's records |
+/// | [`Session::receive`] [no ending] | handshaking, or established once rustls finds the handshake done | what rustls has to send (the rest of the handshake), then, once established, the records of the messages in `early` |
+/// | `receive` [the server's close_notify, no TLS error] | ended ([`Ending::CloseNotify`]) | the same |
+/// | `receive` [a TLS error] | ended ([`Ending::Failed`]), with `alerted` set if rustls reports the server's alert as the error | none |
+/// | [`Session::close`] [in any phase] | closed | the alert rustls queued for a TLS error, or else close_notify, after anything else rustls has left to send; nothing if `alerted` or if rustls can't produce them |
+///
+/// Between inputs it is handshaking or established: the resolver acts on
+/// an ending in the input that brought it. After `receive`, it first
+/// handles the plaintext decrypted before the ending. Then it shuts the
+/// connection (`Resolver::shut`, which sends what `close` returns) and
+/// drops it with the session. A connection the resolver shuts for another
+/// reason closes its session the same way, and one the driver reports gone
+/// drops it.
 #[derive(Debug)]
 pub(crate) struct Session {
     connection: ClientConnection,
@@ -141,8 +151,19 @@ pub(crate) struct Session {
     /// as it has. rustls itself would hold only 64 KiB of them and then
     /// take part of a message, breaking the framing (RFC 7858 §3.3).
     early: Vec<u8>,
-    /// Whether the server sent a fatal alert, after which nothing more may
-    /// be sent (RFC 8446 §6.2). rustls doesn't record it.
+    /// Whether the error that ended the session is the server's alert, as
+    /// rustls reports it (`Error::AlertReceived`): rustls has no flag for
+    /// it that `close` could read. Such an alert is taken for an error
+    /// alert, after which nothing more may be sent (RFC 8446 §6), not even
+    /// the alert rustls queued in reply, so `close` returns nothing.
+    ///
+    /// rustls (`CommonState::process_alert`) reports an alert this way if
+    /// its level is unknown, and otherwise, unless it is a close_notify
+    /// once the handshake is done, if its level is fatal or, once the
+    /// server has chosen TLS 1.3, if it is a warning other than
+    /// user_canceled and one of the session's first four warnings. For the
+    /// unknown level and the warning it queues its own illegal_parameter or
+    /// decode_error alert.
     alerted: bool,
 }
 
@@ -191,8 +212,8 @@ impl Session {
     /// TLS error (a bad certificate, say) ends the session
     /// ([`Received::ending`]), and nothing after it is taken in (RFC 8446
     /// §6). The plaintext decrypted before the end still comes back, so an
-    /// answer that arrived intact counts (RFC 7858 §3.3). [`Session::close`]
-    /// then gives the last bytes to send.
+    /// answer that arrived intact counts. [`Session::close`] then gives the
+    /// last bytes to send.
     pub(crate) fn receive(&mut self, data: &[u8]) -> Received {
         let mut plaintext = Vec::new();
         let ending = self.decrypt(data, &mut plaintext);
@@ -264,11 +285,12 @@ impl Session {
         Ok(out)
     }
 
-    /// The last bytes to send before closing the connection: the alert
-    /// rustls queued for a TLS error, which already ends the session (RFC
-    /// 8446 §6.2), or, if it queued none, the close_notify alert (§6.1).
-    /// Nothing after a fatal alert from the server, which ends the session
-    /// at once (§6.2), and nothing if rustls can't produce them.
+    /// The last bytes to send before closing the connection: what rustls
+    /// still has to send, ending with the alert it queued for a TLS error,
+    /// which already ends the session (RFC 8446 §6.2), or, if it queued
+    /// none, with the close_notify alert (§6.1). Nothing if rustls reported
+    /// the server's alert as the error (`alerted`), as after an error alert
+    /// (§6), and nothing if rustls can't produce them.
     pub(crate) fn close(&mut self) -> Vec<u8> {
         if self.alerted {
             return Vec::new();

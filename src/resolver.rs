@@ -318,14 +318,16 @@ enum Deadline {
 /// | Input | Ends it | `TcpClose` | Its queries |
 /// |---|---|---|---|
 /// | `handle_stream_closed`, `handle_stream_error` | `lost` | no | sent again or moved on (`move_off`) |
-/// | the server's close_notify, with no TLS error in the same bytes, in `handle_stream_data` | `retire` | yes | the same, after the answers that came before it |
-/// | a TLS error on bytes read from it, the server's fatal alert among them, or a write TLS refuses | `abort` | yes | moved on (`retry`), after the answers decrypted before the error |
+/// | the server's close_notify, with no TLS error (`Ending::CloseNotify`), in `handle_stream_data` | `retire` | yes | the same, after the answers that came before it |
+/// | a TLS error on bytes read from it (`Ending::Failed`), in `handle_stream_data` | `abort` | yes | moved on (`retry`), after the answers decrypted before the error |
+/// | a write to it that TLS refuses, in `emit` | `abort` | yes | moved on (`retry`), the query written included |
 /// | a query on it times out with no response since `written_after`, or one more `Orphan` would go past `MAX_ORPHANS` | `time_out_stream` | yes | sent again if their deadline hasn't passed, they have room and their free resend is left (`use_free_resend`), else moved on |
 /// | its idle deadline passes (`handle_timeout`) | `close_idle_connections` | yes | none: no query is on it |
 /// | `shutdown` | `shutdown` | yes | none left |
 ///
 /// Every end but `lost` goes through `shut`, which also queues a TLS
-/// session's last bytes before the `TcpClose`.
+/// session's last bytes before the `TcpClose`: none after an alert from
+/// the server that rustls reported as the error (`tls::Session::alerted`).
 #[derive(Debug)]
 struct Connection {
     /// Between inputs no other connection goes to this server:
@@ -388,8 +390,8 @@ enum Ending {
 }
 
 impl Connection {
-    /// Whether it takes queries to `server`: it goes to `server`, and the
-    /// server hasn't ended it (`closing`).
+    /// Whether it takes queries to `server`: it goes to `server`, and its
+    /// TLS session, if it has one, hasn't ended (`closing`).
     fn is_open_to(&self, server: SocketAddr) -> bool {
         self.server == server && !self.closing
     }
@@ -709,21 +711,26 @@ impl Resolver {
     /// trickles bytes can't keep it open. Over TLS, the bytes go through
     /// the session first, which may queue a [`Transport::TcpWrite`]: the
     /// rest of the handshake, and then the queries that waited for it. A
-    /// TLS error, such as a record that doesn't decrypt or a fatal alert
-    /// from the server, ends the session: the answers decrypted before it
-    /// in the same bytes count, and then the connection is closed and its
-    /// queries move on to their next attempt. Before the close, the
-    /// resolver sends the alert rustls queued for the error (RFC 8446
-    /// §6.2), or close_notify if it queued none; after a fatal alert from
-    /// the server it sends nothing and closes at once (§6.2).
-    /// When the server's close_notify arrives, the answers before it count
-    /// and anything after it is ignored (RFC 8446 §6.1): the resolver
-    /// sends its own close_notify, closes the connection and moves its
-    /// queries on as [`Resolver::handle_stream_closed`] does. A query that
-    /// one of those answers moves on to the same server (the next search
-    /// candidate, say) goes to a new connection. A later
-    /// `handle_stream_closed` or `handle_stream_error` for the connection
-    /// is ignored.
+    /// TLS error, such as a record that doesn't decrypt or an alert from
+    /// the server that rustls reports as the error
+    /// (`rustls::Error::AlertReceived`), ends the session: the answers
+    /// decrypted before it in the same bytes count, and then the connection
+    /// is closed and its queries move on to their next attempt. Before the
+    /// close, the resolver sends what rustls still has to send (the rest of
+    /// the handshake, say), ending with the alert it queued for the error
+    /// (RFC 8446 §6.2), or with close_notify if it queued none, but nothing
+    /// at all after such an alert from the server, as after an error alert
+    /// (§6). The server's close_notify ends the session once the handshake
+    /// is done; before then, rustls takes it for a TLS error, or ignores it
+    /// if it is a warning, one of the session's first four, that arrives
+    /// before the server has chosen TLS 1.3. When it ends the session with
+    /// no TLS error, the answers before it count and anything after it is
+    /// ignored (RFC 8446 §6.1): the resolver sends its own close_notify,
+    /// closes the connection and moves its queries on as
+    /// [`Resolver::handle_stream_closed`] does. A query that one of those
+    /// answers moves on to the same server (the next search candidate, say)
+    /// goes to a new connection. A later `handle_stream_closed` or
+    /// `handle_stream_error` for the connection is ignored.
     pub fn handle_stream_data(&mut self, connection: ConnectionId, data: &[u8], now: Instant) {
         let Some(conn) = self.connections.get_mut(&connection) else {
             return;
@@ -1880,7 +1887,9 @@ impl Resolver {
     /// [`Transport::TcpWrite`] the driver writes before closing. They end
     /// with the alert rustls queued for a TLS error, which ends the session
     /// (RFC 8446 §6.2), or, if it queued none, with its close_notify alert
-    /// (§6.1). After a fatal alert from the server there are none (§6.2).
+    /// (§6.1). There are none after an alert from the server that rustls
+    /// reported as the error (`tls::Session::alerted`), as after an error
+    /// alert (§6).
     fn shut(&mut self, connection: ConnectionId) -> Option<Connection> {
         #[cfg_attr(
             not(feature = "tls"),

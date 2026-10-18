@@ -103,12 +103,15 @@ fields in sync with the code.
   after every record batch (rustls holds 16 KiB), and also after a TLS error, so the answers
   decrypted before it count. Every close the resolver starts goes through `shut`, which sends
   the alert rustls queued for a TLS error, or else the session's close_notify, as a `TcpWrite`
-  before the `TcpClose` (RFC 8446 §6), and nothing after the server's fatal alert
-  (`Session::alerted`, §6.2). A TLS error on received bytes (after the answers decrypted
-  before it, which can't send on the connection either) or a refused write aborts the
-  connection: `abort` calls `shut`, then `retry` for each query on it. The server's
-  close_notify retires the connection like `handle_stream_closed` (`retire`: `shut`, then
-  `move_off`), after the answers decrypted with it, which can't send on it
+  before the `TcpClose` (RFC 8446 §6), and nothing after an alert from the server that rustls
+  reports as the error (`AlertReceived`, recorded in `Session::alerted`). A TLS error on
+  received bytes (`tls::Ending::Failed`, after the answers decrypted before it, which can't
+  send on the connection either) or a refused write aborts the connection: `abort` calls
+  `shut`, then `retry` for each query on it. The server's close_notify once the handshake is
+  done (`tls::Ending::CloseNotify`; before then rustls takes it for a TLS error, or ignores it
+  if it is a warning, one of the session's first four, from before the server has chosen TLS
+  1.3) retires the connection like `handle_stream_closed` (`retire`:
+  `shut`, then `move_off`), after the answers decrypted with it, which can't send on it
   (`Connection::closing`, skipped by `emit` and `channel` through `Connection::is_open_to`).
   `shutdown` drops every query and shuts every connection, for a driver that stops. Over TLS,
   `wire::protect` adds the EDNS Client Subnet privacy option (prefix 0, FAMILY of the
@@ -189,7 +192,8 @@ fields in sync with the code.
   bytes), since a server may send more than the 1232 the queries advertise; write each stream
   payload in one call, with `TCP_NODELAY` set (RFC 7766 §8, §6.2.1.1), and carry out a
   `TcpClose` only after the writes before it, which over TLS end with the close_notify alert
-  (a connection still connecting may be dropped at once). After reporting a stream closed,
+  or the alert for a TLS error, and are none after an alert from the server that rustls
+  reports as the error (a connection still connecting may be dropped at once). After reporting a stream closed,
   still write what was queued for it before the report (the reply to the server's
   close_notify), and call `shutdown` and carry out its transmits before stopping. Call
   `flush_cache` when the host's network changes.

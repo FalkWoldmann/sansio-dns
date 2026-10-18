@@ -7,10 +7,11 @@
 //! padding option, last, to a multiple of 128 octets (RFC 8467 §3, §4.1),
 //! and is sent at most `attempts + 3` times, and at most three times to one
 //! server (RFC 9520 §3.1). Every connection the resolver closes ends its
-//! session first, with close_notify or an alert (RFC 8446 §6), unless a
-//! fatal alert from the server ended it: the server's own, or one that raw
-//! or tampered bytes may hold while the client still takes a plaintext
-//! alert, before it has decrypted anything. Once the server's own fatal
+//! session first, with close_notify or an alert (RFC 8446 §6), unless an
+//! alert from the server that rustls reports as the error ended it: the
+//! server's own fatal alert, or one that raw or tampered bytes may hold
+//! while the client still takes a plaintext alert, before it has decrypted
+//! anything. Once the server's own fatal
 //! alert reaches an untampered connection, the resolver writes nothing more
 //! to it (§6.2). Run with `-timeout` so a receive loop that stops making
 //! progress shows up as a hang.

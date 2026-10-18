@@ -255,11 +255,13 @@
 //! [`Transport::TcpWrite`], write the payload to that connection; for
 //! [`Transport::TcpClose`], close it once the payloads before it are
 //! written. With TLS the last of them carries the close_notify alert, which
-//! must go out before the connection closes (RFC 8446 §6.1), or the alert
-//! that ends a session that failed (§6.2); after a fatal alert from the
-//! server, nothing is written before the close (§6.2). A connection still
-//! connecting when its `TcpClose` comes can be dropped at once: nothing
-//! written to it has gone out. Pass everything read from a connection to
+//! must go out before the connection closes (RFC 8446 §6.1), or, after a
+//! TLS error, the alert rustls queued for it instead, if it queued one
+//! (§6.2). After an alert from the server that rustls reports as the error
+//! (`rustls::Error::AlertReceived`), nothing is written before the close,
+//! as after an error alert (§6). A connection still connecting when its
+//! `TcpClose` comes can be dropped at once: nothing written to it has gone
+//! out. Pass everything read from a connection to
 //! [`Resolver::handle_stream_data`]. Call
 //! [`Resolver::handle_stream_closed`] when the server closes it, and
 //! [`Resolver::handle_stream_error`] when connecting, reading or writing
@@ -377,10 +379,12 @@ pub enum Transport {
     TcpWrite(ConnectionId),
     /// Close this connection, once the payloads of the transmits before it
     /// are written: over TLS, the last one carries the close_notify alert,
-    /// or after a TLS error the alert for that error (RFC 8446 §6.1, §6.2).
-    /// After a fatal alert from the server there is none: the connection
-    /// closes at once (§6.2). A connection still connecting can be dropped
-    /// at once. The payload is empty.
+    /// or, after a TLS error, the alert rustls queued for it instead, if it
+    /// queued one (RFC 8446 §6.1, §6.2). After an alert from the server
+    /// that rustls reports as the error (`rustls::Error::AlertReceived`)
+    /// there is none, as after an error alert: the connection closes at
+    /// once (§6). A connection still connecting can be dropped at once. The
+    /// payload is empty.
     TcpClose(ConnectionId),
 }
 

@@ -265,10 +265,10 @@ time out on a connection. `tests/main.rs` builds them all as one crate. The Toki
 | 9476 | §3.2 | `alt.` names are sent like any other |
 | 7858 | §3 | With `tls`: every query over TLS on a stream, never UDP; TLS errors fail the attempt |
 | 7858 | §3.1 | Servers on port 53 are refused |
-| 7858 | §3.3 | Queries written during the handshake wait for it in the resolver, any number of them, and go out whole after it; replies of any size come through the session in any chunking; an answer that arrived intact counts even when a record after it in the same read doesn't decrypt or is a fatal alert |
+| 7858 | §3.3 | Queries written during the handshake wait for it in the resolver, any number of them, and go out whole after it; replies of any size come through the session in any chunking; an answer that arrived intact counts even when a record after it in the same read doesn't decrypt or is an alert from the server that rustls reports as the error |
 | 7858 | §3.4 | The TLS session is reused for later queries, and resumed on a new connection; the server's close_notify closes the connection and its queries go to a new one, as after any close, and so does a query that an answer arriving with the close_notify moves on to the same server |
 | 8446 | §6.1 | Every connection the resolver closes gets close_notify first, written by the driver before it closes, unless an error alert, the resolver's or the server's, already ended the session (§6.2); `shutdown` closes them all this way when the driver stops, and the server's close_notify is answered with the resolver's own |
-| 8446 | §6.2 | On a TLS error the resolver detects, such as a bad certificate or a record that doesn't decrypt, the alert rustls queued is sent before the connection closes; after a fatal alert from the server, nothing is sent, not even close_notify, and the connection closes at once |
+| 8446 | §6.2 | On a TLS error the resolver detects, such as a bad certificate or a record that doesn't decrypt, the alert rustls queued is sent before the connection closes; after an alert from the server that rustls reports as the error (`AlertReceived`), taken for an error alert (§6), nothing is sent, not even close_notify, and the connection closes at once |
 | 8310 | §5, §8.1 | Strict profile: the certificate must chain to a trusted root and match the configured name (with the default WebPKI verifier) |
 | 8310 | §7.1 | One authentication name per server (`with_tls_names`) |
 | 8310 | §11.1 | Queries over TLS carry an EDNS Client Subnet option with SOURCE PREFIX-LENGTH 0, FAMILY that of the transport (RFC 7871 §7.1.2) |
@@ -290,12 +290,14 @@ and port.
 Stream connections are named by a `ConnectionId`: `TcpConnect(id)` means open a connection
 to the destination and write the payload, `TcpWrite(id)` write to it, `TcpClose(id)` close
 it once the writes before it are done. With TLS the last of them carries the close_notify
-alert, which must reach the server before the close (RFC 8446 §6.1), or the alert for a TLS
-error (§6.2); after a fatal alert from the server there is none. A connection still
-connecting when its `TcpClose` comes can be dropped at once, since nothing written to it has
-gone out. Payloads are already length-prefixed or TLS-encrypted: write each in one call (RFC
-7766 §8), and disable Nagle's algorithm (`TCP_NODELAY`) so pipelined queries go out at once
-(§6.2.1.1). Pass everything read to `handle_stream_data(id, …)`. Call
+alert, which must reach the server before the close (RFC 8446 §6.1), or, after a TLS error,
+the alert rustls queued for it instead, if it queued one (§6.2). After an alert from the
+server that rustls reports as the error (`rustls::Error::AlertReceived`) there is none, as
+after an error alert (§6). A connection still connecting when its `TcpClose` comes can be
+dropped at once, since nothing written to it has gone out. Payloads are already
+length-prefixed or TLS-encrypted: write each in one call (RFC 7766 §8), and disable Nagle's
+algorithm (`TCP_NODELAY`) so pipelined queries go out at once (§6.2.1.1). Pass everything
+read to `handle_stream_data(id, …)`. Call
 `handle_stream_closed(id, …)` if the server closes the connection, and
 `handle_stream_error(id, kind, …)` if connecting, reading or writing fails, so a query out of
 attempts fails with that error. The resolver keeps one connection per server and pipelines
@@ -368,9 +370,9 @@ candidates, `no-tld-query` included, the answer the search ends on, and that `LO
 query the server decrypts keeps EDNS, carries the Client Subnet privacy option for the
 server's address family and then one padding option to a multiple of 128 octets, and is sent
 at most `attempts + 3` times, and at most three times to one server, that every connection the
-resolver closes ends its session with close_notify or an alert first, unless a fatal alert from
-the server ended it (its own, or one that raw or tampered bytes may hold before the client has
-decrypted anything), and that the resolver writes nothing to a connection once the server's
+resolver closes ends its session with close_notify or an alert first, unless an alert from the
+server that rustls reports as the error ended it (the server's own fatal alert, or one that raw
+or tampered bytes may hold before the client has decrypted anything), and that the resolver writes nothing to a connection once the server's
 fatal alert reached it. They need nightly:
 
 ```sh
