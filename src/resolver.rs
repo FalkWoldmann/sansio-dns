@@ -363,14 +363,28 @@ struct Connection {
 #[derive(Debug, Default)]
 struct Incoming {
     /// The bytes to send back: the rest of the handshake, and then the
-    /// queries that waited for it.
+    /// queries that waited for it. Empty if the session failed.
     to_send: Vec<u8>,
-    /// Whether the server's close_notify arrived: what followed it is
-    /// ignored (RFC 8446 §6.1).
-    closed: bool,
-    /// The TLS error that ended the session. The bytes decrypted before it
-    /// are kept.
-    failed: Option<Error>,
+    /// How the bytes ended the TLS session, if they did.
+    ending: Option<Ending>,
+}
+
+/// How bytes read from a connection ended its TLS session: `tls::Ending`
+/// with the error as [`Error::Tls`], defined here so that
+/// [`Resolver::handle_stream_data`] matches on it without the `tls`
+/// feature too. The bytes decrypted before the end are kept either way.
+#[derive(Debug)]
+#[cfg_attr(
+    not(feature = "tls"),
+    expect(dead_code, reason = "only a TLS session ends in the bytes it reads")
+)]
+enum Ending {
+    /// The server's close_notify: what followed it is ignored (RFC 8446
+    /// §6.1).
+    CloseNotify,
+    /// The TLS error that ended the session, as [`Error::Tls`]. It wins
+    /// over a close_notify in the same bytes.
+    Failed(Error),
 }
 
 impl Connection {
@@ -381,7 +395,8 @@ impl Connection {
     }
 
     /// Take in `data` read from it, through the TLS session if it has one.
-    /// After a TLS error, it keeps what the records before it decrypted.
+    /// If the bytes end the session, it keeps what was decrypted before the
+    /// end.
     fn receive(&mut self, data: &[u8]) -> Incoming {
         #[cfg(feature = "tls")]
         if let Some(session) = &mut self.tls {
@@ -389,8 +404,10 @@ impl Connection {
             self.received.extend_from_slice(&received.plaintext);
             return Incoming {
                 to_send: received.reply,
-                closed: received.closed,
-                failed: received.error.map(Error::Tls),
+                ending: received.ending.map(|ending| match ending {
+                    tls::Ending::CloseNotify => Ending::CloseNotify,
+                    tls::Ending::Failed(e) => Ending::Failed(Error::Tls(e)),
+                }),
             };
         }
         self.received.extend_from_slice(data);
@@ -711,13 +728,9 @@ impl Resolver {
         let Some(conn) = self.connections.get_mut(&connection) else {
             return;
         };
-        let Incoming {
-            to_send,
-            closed,
-            failed,
-        } = conn.receive(data);
+        let Incoming { to_send, ending } = conn.receive(data);
         // Answers that move a query on must not send it here.
-        conn.closing = closed || failed.is_some();
+        conn.closing = ending.is_some();
         let server = conn.server;
         self.queue_write(connection, server, to_send);
         // One response at a time: acting on an answer may change this
@@ -742,10 +755,10 @@ impl Resolver {
                 None => {}
             }
         }
-        if let Some(error) = failed {
-            self.abort(connection, now, &error);
-        } else if closed {
-            self.retire(connection, now);
+        match ending {
+            None => {}
+            Some(Ending::CloseNotify) => self.retire(connection, now),
+            Some(Ending::Failed(error)) => self.abort(connection, now, &error),
         }
     }
 

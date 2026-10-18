@@ -128,13 +128,12 @@ impl Settings {
 ///
 /// It is handshaking first, holding the messages written meanwhile in
 /// `early`, and established once [`Session::receive`] finds the handshake
-/// done, when it sends them. In either phase, the server's close_notify
-/// ([`Received::closed`]) or a TLS error from `receive`
-/// ([`Received::error`]) or [`Session::send`] ends it, and the resolver
-/// then shuts its connection in the same call, which sends what
-/// [`Session::close`] returns. A connection the resolver shuts for another
-/// reason closes its session the same way, and one the driver reports gone
-/// drops it.
+/// done, when it sends them. In either phase, the server's close_notify or
+/// a TLS error from `receive` ([`Received::ending`]), or a TLS error from
+/// [`Session::send`], ends it, and the resolver then shuts its connection
+/// in the same call, which sends what [`Session::close`] returns. A
+/// connection the resolver shuts for another reason closes its session the
+/// same way, and one the driver reports gone drops it.
 #[derive(Debug)]
 pub(crate) struct Session {
     connection: ClientConnection,
@@ -151,18 +150,26 @@ pub(crate) struct Session {
 #[derive(Debug)]
 pub(crate) struct Received {
     /// The bytes to send back, and any messages that waited for the
-    /// handshake. Empty after an error.
+    /// handshake. Empty if the session failed ([`Ending::Failed`]).
     pub(crate) reply: Vec<u8>,
-    /// The decrypted bytes, also those decrypted before an error.
+    /// The decrypted bytes, also those decrypted before the session ended.
     pub(crate) plaintext: Vec<u8>,
-    /// Whether the server sent close_notify: it sends nothing more (RFC
-    /// 8446 §6.1).
-    pub(crate) closed: bool,
-    /// The TLS error that ended the session, such as a bad certificate, a
-    /// record that doesn't decrypt or a fatal alert from the server. The
-    /// records before the one that failed still count: their plaintext is
-    /// in `plaintext`.
-    pub(crate) error: Option<String>,
+    /// How the bytes ended the session, if they did.
+    pub(crate) ending: Option<Ending>,
+}
+
+/// How the bytes fed to [`Session::receive`] ended the session.
+#[derive(Debug)]
+pub(crate) enum Ending {
+    /// rustls reported the server's close_notify: the server sends nothing
+    /// more, and what follows it in the bytes is ignored (RFC 8446 §6.1).
+    CloseNotify,
+    /// A TLS error: the first one from reading records in, processing them
+    /// (a bad certificate, a record that doesn't decrypt, an alert rustls
+    /// reports as an error), taking their plaintext out, or producing
+    /// [`Received::reply`]. It wins over a close_notify in the same bytes.
+    /// The plaintext decrypted before it is kept.
+    Failed(String),
 }
 
 impl Session {
@@ -180,70 +187,81 @@ impl Session {
         Ok(out)
     }
 
-    /// Feed bytes read from the connection. A TLS error (a bad certificate,
-    /// say) ends the session, and comes back with the plaintext of the
-    /// records before it: an answer that arrived intact is still good
-    /// (RFC 7858 §3.3). After an error, [`Session::close`] returns the
-    /// alert that tells the server, if rustls queued one, nothing if the
-    /// error was the server's fatal alert, and otherwise close_notify.
-    pub(crate) fn receive(&mut self, mut data: &[u8]) -> Received {
+    /// Feed bytes read from the connection. The server's close_notify or a
+    /// TLS error (a bad certificate, say) ends the session
+    /// ([`Received::ending`]), and nothing after it is taken in (RFC 8446
+    /// §6). The plaintext decrypted before the end still comes back, so an
+    /// answer that arrived intact counts (RFC 7858 §3.3). [`Session::close`]
+    /// then gives the last bytes to send.
+    pub(crate) fn receive(&mut self, data: &[u8]) -> Received {
         let mut plaintext = Vec::new();
-        let mut closed = false;
-        let mut error = None;
-        while !data.is_empty() && !closed {
+        let ending = self.decrypt(data, &mut plaintext);
+        let (reply, ending) = match ending {
+            Some(Ending::Failed(_)) => (Vec::new(), ending),
+            None | Some(Ending::CloseNotify) => match self.reply() {
+                Ok(reply) => (reply, ending),
+                Err(e) => (Vec::new(), Some(Ending::Failed(e))),
+            },
+        };
+        Received {
+            reply,
+            plaintext,
+            ending,
+        }
+    }
+
+    /// Feed `data` to rustls a batch at a time, appending what each batch
+    /// decrypts to `plaintext`, until the session ends, the data runs out
+    /// or rustls takes none of a batch. Per batch, it checks for an ending
+    /// in this order and returns the first: an error reading the batch in,
+    /// before it is processed; then, once the batch's plaintext is taken
+    /// out, an error processing it, an error taking the plaintext out, and
+    /// the server's close_notify.
+    fn decrypt(&mut self, mut data: &[u8], plaintext: &mut Vec<u8>) -> Option<Ending> {
+        while !data.is_empty() {
             let read = match self.connection.read_tls(&mut data) {
                 Ok(read) => read,
-                Err(e) => {
-                    error = Some(e.to_string());
-                    break;
-                }
+                Err(e) => return Some(Ending::Failed(e.to_string())),
             };
             let processed = self.connection.process_new_packets();
             // rustls holds at most 16 KiB of plaintext: take it out before
             // reading more, and after an error, which leaves what the
             // records before it decrypted.
-            match self.connection.reader().read_to_end(&mut plaintext) {
-                Ok(_) => {}
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                Err(e) => error = Some(e.to_string()),
-            }
-            match processed {
-                // After the server's close_notify, what follows is ignored
-                // (RFC 8446 §6.1).
-                Ok(state) => closed = state.peer_has_closed(),
+            let taken = self.connection.reader().read_to_end(plaintext);
+            let state = match processed {
+                Ok(state) => state,
                 Err(e) => {
                     self.alerted = matches!(e, rustls::Error::AlertReceived(_));
-                    error = Some(e.to_string());
+                    return Some(Ending::Failed(e.to_string()));
                 }
+            };
+            match taken {
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                Err(e) => return Some(Ending::Failed(e.to_string())),
             }
-            if read == 0 || error.is_some() {
+            // After the server's close_notify, what follows is ignored
+            // (RFC 8446 §6.1).
+            if state.peer_has_closed() {
+                return Some(Ending::CloseNotify);
+            }
+            if read == 0 {
                 break;
             }
         }
-        let mut reply = Vec::new();
-        if error.is_none() {
-            error = self.reply(&mut reply).err();
-        }
-        if error.is_some() {
-            reply.clear();
-        }
-        Received {
-            reply,
-            plaintext,
-            closed,
-            error,
-        }
+        None
     }
 
-    /// Move into `out` what rustls has to send, and the messages that
-    /// waited for the handshake once it is done.
-    fn reply(&mut self, out: &mut Vec<u8>) -> Result<(), String> {
-        flush(&mut self.connection, out)?;
+    /// What rustls has to send, and the messages that waited for the
+    /// handshake once it is done.
+    fn reply(&mut self) -> Result<Vec<u8>, String> {
+        let mut out = Vec::new();
+        flush(&mut self.connection, &mut out)?;
         if !self.connection.is_handshaking() && !self.early.is_empty() {
             let early = std::mem::take(&mut self.early);
-            write(&mut self.connection, &early, out)?;
+            write(&mut self.connection, &early, &mut out)?;
         }
-        Ok(())
+        Ok(out)
     }
 
     /// The last bytes to send before closing the connection: the alert
