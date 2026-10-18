@@ -29,6 +29,7 @@
 //! `ConnectionId` order.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::time::Instant;
@@ -460,7 +461,6 @@ fn event(query: QueryId, outcome: Result<Message, Error>) -> Event {
 }
 
 /// The resolver state machine. See the crate docs for how to drive it.
-#[derive(Debug)]
 pub struct Resolver {
     config: Config,
     next_query: u64,
@@ -474,6 +474,20 @@ pub struct Resolver {
     cache: Cache,
     transmits: VecDeque<Transmit>,
     events: VecDeque<Event>,
+}
+
+/// Shows the settings and how much is in flight, not the internal state,
+/// which is not part of the API.
+impl fmt::Debug for Resolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Resolver")
+            .field("config", &self.config)
+            .field("queries", &self.pending.len())
+            .field("connections", &self.connections.len())
+            .field("transmits", &self.transmits.len())
+            .field("events", &self.events.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Resolver {

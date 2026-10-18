@@ -10,6 +10,7 @@
 
 mod coalescing;
 mod common;
+mod debug;
 mod hosts;
 mod lookup;
 mod resolv_conf;
