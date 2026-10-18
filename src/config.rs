@@ -342,20 +342,23 @@ impl Config {
     ///
     /// - `nameserver`: the first three usable ones, on port 53. An IPv4
     ///   address may take any form `inet_aton` reads, such as `127.1`,
-    ///   `0x7f.0.0.1` or `2130706433`; an IPv6 address may have a numeric
+    ///   `0x7f.0.0.1` or `2130706433`; an IPv6 address may have a decimal
     ///   scope (`fe80::1%2`). Without a usable one, the local host is asked
     ///   (127.0.0.1), and `0.0.0.0` or `::` asks it too (see
     ///   [`Config::new`]).
-    /// - `search` and `domain`: the last of them sets the search domains,
-    ///   `domain` a single one.
+    /// - `search` and `domain`: the last of them with a word sets the search
+    ///   domains, `domain` its first word only. Words that aren't valid
+    ///   names are left out after that, so a last line of only such words
+    ///   leaves no search domains.
     /// - `options`: `ndots:` (default 1, at most 15), `timeout:` in seconds
-    ///   (default 5, at most 30), `attempts:` per server (default 2),
+    ///   (default 5, 1 to 30), `attempts:` per server (default 2),
     ///   `no-aaaa` ([`IpStrategy::Ipv4Only`]), and `no-tld-query` or
     ///   `no_tld_query` (`tld_query` off). As in glibc, an option is known
     ///   by how it starts, so `no-aaaa-x` is `no-aaaa`, a `-` in front of a
     ///   flag turns it off again (`-no-aaaa`), and a number is read the way
     ///   `strtol` reads it: `ndots:2x` and `ndots: 2` are 2, and `ndots:x`
-    ///   is 0.
+    ///   is 0. On a 64-bit system glibc then keeps only the low 32 bits of
+    ///   the number, so `ndots:4294967298` is 2 there; here it is 15.
     ///
     /// Unlike glibc, later rounds through the servers wait longer; see
     /// `timeout`. Where glibc takes up to 5 attempts per server, this takes
@@ -368,12 +371,14 @@ impl Config {
     /// `;` on as a comment, and takes lines that end in CRLF.
     ///
     /// Like glibc, it never fails: lines and options it can't use are
-    /// skipped. So is a server whose scope isn't a number, such as a
-    /// link-local one with a named scope (`fe80::1%eth0`), since mapping an
-    /// interface name to its index needs a system call; glibc maps it, and
-    /// keeps a server whose scope it can't read with scope 0. Other
-    /// options, such as `rotate`, `use-vc` and `edns0` (EDNS is always on),
-    /// are ignored, and so are `sortlist` lines.
+    /// skipped. So is a server whose scope isn't a decimal number that fits
+    /// in 32 bits: an empty, signed or too large one, or an interface name
+    /// (`fe80::1%eth0`), which would take a system call to map to its
+    /// index. glibc keeps such a server: for an address of interface-local
+    /// or link-local scope it maps an interface name to its index, and a
+    /// scope it can't read becomes 0. Other options, such as `rotate`,
+    /// `use-vc` and `edns0` (EDNS is always on), are ignored, and so are
+    /// `sortlist` lines.
     pub fn from_resolv_conf(text: &[u8]) -> Self {
         Self::from_resolv_conf_with_env(text, &ResolvEnv::default())
     }
@@ -383,10 +388,12 @@ impl Config {
     ///
     /// - `LOCALDOMAIN` replaces the file's `search` and `domain` lines, even
     ///   when it is empty: its words, separated by spaces or tabs up to the
-    ///   first newline, are the search domains.
-    /// - Without it and without a `search` or `domain` line, the search
-    ///   domain is the host name's domain, the part after its first dot.
-    ///   A host name without a dot gives none.
+    ///   first newline, are the search domains, leaving out any that aren't
+    ///   valid names.
+    /// - Without it and without a `search` or `domain` line with a word, the
+    ///   search domain is the host name's domain, the part after its first
+    ///   dot, if that is a valid name. A host name without a dot, or whose
+    ///   first dot ends it, gives none.
     /// - `RES_OPTIONS` holds options as an `options` line does, applied
     ///   after the file's, so they win.
     pub fn from_resolv_conf_with_env(text: &[u8], env: &ResolvEnv) -> Self {
@@ -398,12 +405,15 @@ impl Config {
             .unwrap_or_else(|| SocketAddr::from((Ipv4Addr::LOCALHOST, 53)));
         let mut config = Self::new(first, servers);
         let options = parsed.options;
+        // 30 is glibc's RES_MAXRETRANS.
         config.timeout = Duration::from_secs(options.timeout.clamp(1, 30).unsigned_abs());
+        // At most MAX_SENDS_PER_SERVER, not glibc's RES_MAXRETRY (5).
         let per_server =
             usize::try_from(options.attempts.clamp(1, MAX_SENDS_PER_SERVER.into())).unwrap_or(1);
         config.attempts =
             NonZeroUsize::new(per_server * config.servers.len()).unwrap_or(NonZeroUsize::MIN);
         config.search = parsed.search.into_iter().filter_map(domain).collect();
+        // 15 is glibc's RES_MAXNDOTS.
         config.ndots = u8::try_from(options.ndots.clamp(0, 15)).unwrap_or(15);
         if options.no_aaaa {
             config.ip_strategy = IpStrategy::Ipv4Only;
@@ -555,8 +565,8 @@ pub struct ResolvEnv {
     /// line, applied after the file's.
     pub res_options: Option<Vec<u8>>,
     /// The host name, as `gethostname` returns it. Its domain, the part
-    /// after the first dot, is the search domain when neither the file nor
-    /// `LOCALDOMAIN` sets one.
+    /// after the first dot, is the search domain when there is neither
+    /// `LOCALDOMAIN` nor a `search` or `domain` line with a word.
     pub hostname: Option<Vec<u8>>,
 }
 
@@ -585,8 +595,8 @@ impl<'a> ResolvConf<'a> {
     /// 4. `RES_OPTIONS` (`res_setoptions`).
     ///
     /// Besides the differences its helpers' docs note (comments and line ends
-    /// in [`lines`], interface scopes in [`nameserver`]), it leaves out an
-    /// empty search domain glibc keeps:
+    /// in [`lines`], scopes in [`nameserver`], numbers outside an `int` in
+    /// [`Options`]), it leaves out an empty search domain glibc keeps:
     ///
     /// - One in front of `LOCALDOMAIN`'s words, when its text up to the
     ///   first newline is empty or starts with a space or a tab.
@@ -627,8 +637,16 @@ impl<'a> ResolvConf<'a> {
     }
 }
 
-/// The options glibc's `res_setoptions` reads, with its defaults, as it
-/// stores them: the numbers not yet limited.
+/// The options glibc's `res_setoptions` reads, with its defaults. glibc
+/// caps each number from above as it stores it; here the numbers stay as
+/// [`strtol`] read them, and [`Config::from_resolv_conf_with_env`] limits
+/// them once, to the bounds [`Config::from_resolv_conf`] lists (the lower
+/// bounds and the cap of 3 on `attempts` are this crate's own). Limiting
+/// once at the end gives what limiting each would, since only the last
+/// number of each kind counts.
+/// The number as read differs from glibc's only outside the range of an
+/// `int`: glibc stores `strtol`'s `long` in an `int`, which on a 64-bit
+/// system keeps only its low 32 bits (4294967298 is 2 there).
 #[derive(Clone, Copy, Debug)]
 struct Options {
     ndots: i64,
@@ -761,9 +779,13 @@ fn domain(word: &[u8]) -> Option<Name> {
 
 /// The server on a `nameserver` line whose address is `word`, on port 53,
 /// as glibc reads it: an IPv4 address in any form `inet_aton` takes, or
-/// else an IPv6 address with an optional scope after `%`. Of the scopes,
-/// only a number is used: an interface name (`fe80::1%eth0`) needs a
-/// system call to map to its index, so such a server is skipped.
+/// else an IPv6 address with an optional scope after `%`. Unlike glibc,
+/// it skips a server whose scope isn't a decimal number that fits in 32
+/// bits: an empty, signed or too large one, or an interface name
+/// (`fe80::1%eth0`), which would take a system call to map to its index.
+/// glibc keeps such a server (`__inet6_scopeid_pton`): for an address of
+/// interface-local or link-local scope it maps an interface name to its
+/// index, and a scope it can't read becomes 0.
 fn nameserver(word: &[u8]) -> Option<SocketAddr> {
     if let Some(address) = inet_aton(word) {
         return Some(SocketAddr::from((address, 53)));
@@ -838,8 +860,9 @@ fn c_number(text: &[u8]) -> Option<(u32, &[u8])> {
 }
 
 /// The number that `text` starts with, as C's `strtol` reads it in base
-/// 10: after any white space, an optional sign and the digits, saturating
-/// at the bounds; 0 without digits.
+/// 10: after any white space, an optional sign and the digits; 0 without
+/// digits. It saturates at `i64::MAX`, and at `-i64::MAX` for a negative
+/// number, one above C's `LONG_MIN`, which the limits on the options hide.
 fn strtol(text: &[u8]) -> i64 {
     let space = |byte: &&u8| matches!(byte, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r');
     let text = text
