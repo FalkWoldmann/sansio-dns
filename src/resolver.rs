@@ -1781,9 +1781,8 @@ impl Resolver {
     /// The server's close_notify ended `connection`'s TLS session (RFC 8446
     /// §6.1), and `handle_stream_data` has acted on the answers that came
     /// before it in the same bytes: shut the connection (`shut`, which
-    /// queues the session's last bytes, if it has any, and the
-    /// `TcpClose`), then
-    /// move its queries off as `lost` does (`move_off`), with
+    /// queues the session's last bytes, if it has any, and the `TcpClose`),
+    /// then move its queries off as `lost` does (`move_off`), with
     /// [`Error::ConnectionClosed`] for those that move on.
     fn retire(&mut self, connection: ConnectionId, now: Instant) {
         if let Some(conn) = self.shut(connection) {

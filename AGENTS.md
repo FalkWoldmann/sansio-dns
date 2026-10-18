@@ -193,10 +193,10 @@ fields in sync with the code.
   payload in one call, with `TCP_NODELAY` set (RFC 7766 §8, §6.2.1.1), and carry out a
   `TcpClose` only after the writes before it, which over TLS end with the close_notify alert
   or the alert for a TLS error, and are none after an alert from the server that rustls
-  reports as the error (a connection still connecting may be dropped at once). After reporting a stream closed,
-  still write what was queued for it before the report (the reply to the server's
-  close_notify), and call `shutdown` and carry out its transmits before stopping. Call
-  `flush_cache` when the host's network changes.
+  reports as the error (a connection still connecting may be dropped at once). After
+  reporting a stream closed, still write what was queued for it before the report (the reply
+  to the server's close_notify), and call `shutdown` and carry out its transmits before
+  stopping. Call `flush_cache` when the host's network changes.
 
 `sansio-dns-tokio` runs one background task per `Resolver` (shared by its clones), spawned on
 the runtime of the first lookup. It owns the core resolver and all I/O: a UDP socket per query

@@ -11,10 +11,10 @@
 //! alert from the server that rustls reports as the error ended it: the
 //! server's own fatal alert, or one that raw or tampered bytes may hold
 //! while the client still takes a plaintext alert, before it has decrypted
-//! anything. Once the server's own fatal
-//! alert reaches an untampered connection, the resolver writes nothing more
-//! to it (§6.2). Run with `-timeout` so a receive loop that stops making
-//! progress shows up as a hang.
+//! anything. Once the server's own fatal alert reaches an untampered
+//! connection, the resolver writes nothing more to it (§6.2). Run with
+//! `-timeout` so a receive loop that stops making progress shows up as a
+//! hang.
 
 #![no_main]
 

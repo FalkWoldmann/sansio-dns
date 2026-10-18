@@ -372,8 +372,8 @@ server's address family and then one padding option to a multiple of 128 octets,
 at most `attempts + 3` times, and at most three times to one server, that every connection the
 resolver closes ends its session with close_notify or an alert first, unless an alert from the
 server that rustls reports as the error ended it (the server's own fatal alert, or one that raw
-or tampered bytes may hold before the client has decrypted anything), and that the resolver writes nothing to a connection once the server's
-fatal alert reached it. They need nightly:
+or tampered bytes may hold before the client has decrypted anything), and that the resolver
+writes nothing to a connection once the server's fatal alert reached it. They need nightly:
 
 ```sh
 cd fuzz && cargo fuzz run driver_ops -- -max_total_time=60 -timeout=5
