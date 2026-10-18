@@ -107,8 +107,8 @@ fields in sync with the code.
   (`Session::alerted`, §6.2). A TLS error on received bytes (after the answers decrypted
   before it, which can't send on the connection either) or a refused write aborts the
   connection: `abort` calls `shut`, then `retry` for each query on it. The server's
-  close_notify retires the connection like `handle_stream_closed`
-  (`shut`, then `move_off`), after the answers decrypted with it, which can't send on it
+  close_notify retires the connection like `handle_stream_closed` (`retire`: `shut`, then
+  `move_off`), after the answers decrypted with it, which can't send on it
   (`Connection::closing`, skipped by `emit` and `channel` through `Connection::is_open_to`).
   `shutdown` drops every query and shuts every connection, for a driver that stops. Over TLS,
   `wire::protect` adds the EDNS Client Subnet privacy option (prefix 0, FAMILY of the

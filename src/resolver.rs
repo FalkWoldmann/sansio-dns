@@ -318,11 +318,11 @@ enum Deadline {
 /// | Input | Ends it | `TcpClose` | Its queries |
 /// |---|---|---|---|
 /// | `handle_stream_closed`, `handle_stream_error` | `lost` | no | sent again or moved on (`move_off`) |
-/// | the server's close_notify, in `handle_stream_data` | `shut` | yes | the same, after the answers that came before it |
+/// | the server's close_notify, with no TLS error in the same bytes, in `handle_stream_data` | `retire` | yes | the same, after the answers that came before it |
 /// | a TLS error on bytes read from it, the server's fatal alert among them, or a write TLS refuses | `abort` | yes | moved on (`retry`), after the answers decrypted before the error |
 /// | a query on it times out with no response since `written_after`, or one more `Orphan` would go past `MAX_ORPHANS` | `time_out_stream` | yes | sent again if their deadline hasn't passed, they have room and their free resend is left (`use_free_resend`), else moved on |
-/// | its idle deadline passes (`handle_timeout`) | `shut` | yes | none: no query is on it |
-/// | `shutdown` | `shut` | yes | none left |
+/// | its idle deadline passes (`handle_timeout`) | `close_idle_connections` | yes | none: no query is on it |
+/// | `shutdown` | `shutdown` | yes | none left |
 ///
 /// Every end but `lost` goes through `shut`, which also queues a TLS
 /// session's last bytes before the `TcpClose`.
@@ -729,8 +729,8 @@ impl Resolver {
         }
         if let Some(error) = failed {
             self.abort(connection, now, &error);
-        } else if closed && let Some(conn) = self.shut(connection) {
-            self.move_off(connection, conn.responses, now, &Error::ConnectionClosed);
+        } else if closed {
+            self.retire(connection, now);
         }
     }
 
@@ -1277,7 +1277,7 @@ impl Resolver {
     //   taken
     // - connection lost after it answered, or closed by the server's
     //   close_notify (`handle_stream_data`): `move_off`, by way of `lost`
-    //   or `shut`, then `emit` again, for free every time if it answered
+    //   or `retire`, then `emit` again, for free every time if it answered
     //   after the query was written or took its request back
     //   (`written_after` in `Route::Stream`), else once by way of
     //   `use_free_resend`
@@ -1754,9 +1754,22 @@ impl Resolver {
         }
     }
 
-    /// Move the queries on `connection`, which was lost (`lost`) or ended
-    /// by the server's close_notify after `responses` responses, as
-    /// [`Resolver::handle_stream_closed`] says: a query with room to go to
+    /// The server's close_notify ended `connection`'s TLS session (RFC 8446
+    /// §6.1), and `handle_stream_data` has acted on the answers that came
+    /// before it in the same bytes: shut the connection (`shut`, which
+    /// queues the session's last bytes, if it has any, and the
+    /// `TcpClose`), then
+    /// move its queries off as `lost` does (`move_off`), with
+    /// [`Error::ConnectionClosed`] for those that move on.
+    fn retire(&mut self, connection: ConnectionId, now: Instant) {
+        if let Some(conn) = self.shut(connection) {
+            self.move_off(connection, conn.responses, now, &Error::ConnectionClosed);
+        }
+    }
+
+    /// Move the queries on `connection`, which was lost (`lost`) or retired
+    /// by the server's close_notify (`retire`) after `responses` responses,
+    /// as [`Resolver::handle_stream_closed`] says: a query with room to go to
     /// its server again (`may_resend`) is sent again for free if a
     /// response arrived since it was written or took its request back
     /// (`written_after`), or, if one arrived only before, by using up its
