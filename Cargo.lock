@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "compare"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "criterion",
  "hickory-resolver",
@@ -2105,7 +2105,7 @@ dependencies = [
 
 [[package]]
 name = "sansio-dns"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "compio",
  "criterion",
@@ -2123,7 +2123,7 @@ dependencies = [
 
 [[package]]
 name = "sansio-dns-tokio"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "idna",
  "rcgen",
