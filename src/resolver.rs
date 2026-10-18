@@ -335,11 +335,12 @@ struct Connection {
     /// Decrypted bytes not yet split into messages.
     received: Vec<u8>,
     /// When a query was last written to it or a complete response last
-    /// arrived on it; the idle timeout counts from here once nothing is
-    /// outstanding on it (RFC 7766 §6.2.3, RFC 7828 §3). Partial messages
-    /// and TLS records don't count.
+    /// arrived on it (`next_response`); the idle timeout counts from here
+    /// once nothing is outstanding on it (RFC 7766 §6.2.3, RFC 7828 §3).
+    /// Partial messages and TLS records don't count.
     last_active: Instant,
-    /// How many complete responses have arrived on it, matched or not.
+    /// How many complete responses have arrived on it, matched or not, as
+    /// `next_response` counts them.
     responses: u64,
     /// Queries written to it that left it before their answer came. At
     /// most `MAX_ORPHANS`. Their message IDs stay in use
@@ -394,6 +395,27 @@ impl Connection {
         }
         self.received.extend_from_slice(data);
         Incoming::default()
+    }
+
+    /// Take the next response off `received`, or `None` once no complete
+    /// length-prefixed message is left. A response is a complete message
+    /// whose header and question decode (`Reply::decode`) and that has QR
+    /// set; any other complete message is taken off on the way and
+    /// dropped. Only a response counts, matched or not: it adds one to
+    /// `responses` and sets `last_active`, where the idle timeout counts
+    /// from.
+    fn next_response(&mut self, now: Instant) -> Option<Reply> {
+        loop {
+            let (len, rest) = self.received.split_first_chunk::<2>()?;
+            let len = usize::from(u16::from_be_bytes(*len));
+            let reply = Reply::decode(rest.get(..len)?);
+            self.received.drain(..2 + len);
+            if let Some(reply) = reply.filter(Reply::is_response) {
+                self.responses += 1;
+                self.last_active = now;
+                return Some(reply);
+            }
+        }
     }
 }
 
@@ -698,20 +720,13 @@ impl Resolver {
         conn.closing = closed || failed.is_some();
         let server = conn.server;
         self.queue_write(connection, server, to_send);
-        // One message at a time: acting on an answer may change this
+        // One response at a time: acting on an answer may change this
         // connection too.
-        while let Some(message) = self.next_message(connection) {
-            let Some(mut reply) = Reply::decode(&message) else {
-                continue;
-            };
-            if !reply.is_response() {
-                continue;
-            }
-            let Some(conn) = self.connections.get_mut(&connection) else {
-                return;
-            };
-            conn.responses += 1;
-            conn.last_active = now;
+        while let Some(mut reply) = self
+            .connections
+            .get_mut(&connection)
+            .and_then(|conn| conn.next_response(now))
+        {
             match self.stream_match(connection, &reply) {
                 Some(Matched::Query(id)) => {
                     if let Some(pending) = self.pending.get(&id) {
@@ -1732,17 +1747,6 @@ impl Resolver {
             );
         let only = candidates.next();
         candidates.next().map_or(only, |_| None)
-    }
-
-    /// Take the first complete length-prefixed message off `connection`'s
-    /// buffer, or `None` if there is none yet.
-    fn next_message(&mut self, connection: ConnectionId) -> Option<Vec<u8>> {
-        let conn = self.connections.get_mut(&connection)?;
-        let (len, rest) = conn.received.split_first_chunk::<2>()?;
-        let len = usize::from(u16::from_be_bytes(*len));
-        let message = rest.get(..len)?.to_vec();
-        conn.received.drain(..2 + len);
-        Some(message)
     }
 
     /// `connection` went away without being asked to; see
