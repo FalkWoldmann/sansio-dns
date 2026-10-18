@@ -72,6 +72,38 @@ async fn asked_name(host: &str) -> String {
     query.queries[0].name().to_ascii()
 }
 
+/// A server that ignores the 1232 bytes the query advertises and sends a
+/// datagram of more than 4096: the driver receives it whole, and the
+/// answer is used. (macOS sends no datagram above 9216 bytes by default.)
+#[tokio::test]
+async fn datagram_larger_than_advertised_is_used() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut config = Config::new(server.local_addr().unwrap(), []);
+    config.ip_strategy = sansio_dns::IpStrategy::Ipv4Only;
+    tokio::spawn(async move {
+        let mut buf = [0; 512];
+        while let Ok((n, from)) = server.recv_from(&mut buf).await {
+            let query = Message::from_vec(&buf[..n]).unwrap();
+            let mut response = Message::response(query.metadata.id, OpCode::Query);
+            response.metadata.recursion_available = true;
+            response.add_queries(query.queries.clone());
+            let name = query.queries[0].name().clone();
+            for i in 0..300 {
+                let address = Ipv4Addr::from(0x0a00_0000 + i);
+                response.add_answer(Record::from_rdata(name.clone(), 300, RData::A(A(address))));
+            }
+            let answer = response.to_vec().unwrap();
+            assert!(answer.len() > 4096, "{} bytes", answer.len());
+            server.send_to(&answer, from).await.unwrap();
+        }
+    });
+    let resolver = Resolver::new(config);
+
+    let addresses = resolver.lookup_ip("big.example").await.unwrap();
+
+    assert_eq!(addresses.len(), 300);
+}
+
 /// RFC 4343 §4: an ASCII name keeps its case on the wire, A-labels too.
 #[rstest]
 #[case::plain("App.Example", "App.Example.")]

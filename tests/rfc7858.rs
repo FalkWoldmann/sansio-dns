@@ -255,6 +255,34 @@ impl Server {
         out
     }
 
+    /// The bytes of `answer` on `connection`.
+    fn answer(&mut self, connection: ConnectionId, answer: &Message) -> Vec<u8> {
+        let peer = self.peers.get_mut(&connection).unwrap();
+        peer.session
+            .writer()
+            .write_all(&frame(&encode(answer)))
+            .unwrap();
+        let mut out = Vec::new();
+        flush(&mut peer.session, &mut out);
+        out
+    }
+
+    /// The bytes of a fatal alert from the server on `connection`: it
+    /// takes in a record that doesn't decrypt and answers with
+    /// `bad_record_mac` (RFC 8446 §5.2), which ends its session.
+    fn fatal_alert(&mut self, connection: ConnectionId) -> Vec<u8> {
+        let peer = self.peers.get_mut(&connection).unwrap();
+        let mut record = vec![0x17, 3, 3, 0, 32];
+        record.extend([0; 32]);
+        peer.session.read_tls(&mut &record[..]).unwrap();
+        let error = peer.session.process_new_packets().unwrap_err();
+        assert_eq!(error, rustls::Error::DecryptError);
+        peer.ended = true;
+        let mut out = Vec::new();
+        flush(&mut peer.session, &mut out);
+        out
+    }
+
     /// The bytes of `answer` and then the server's close_notify on
     /// `connection`, as one chunk.
     fn answer_and_close(&mut self, connection: ConnectionId, answer: &Message) -> Vec<u8> {
@@ -676,6 +704,128 @@ fn shutdown_sends_close_notify() {
     assert_eq!(server.close_notifies, 1);
     assert!(resolver.poll_event().is_none());
     assert_eq!(resolver.poll_timeout(), None);
+}
+
+/// RFC 8446 §6.2: after a fatal alert from the server, the resolver closes
+/// the connection at once, sending nothing, not even close_notify. Here the
+/// server knows no ALPN protocol the client offers (RFC 7301 §3.2), on each
+/// attempt.
+#[test]
+fn fatal_alert_closes_at_once() {
+    let trusted = cert("dns.example");
+    let mut client = (*client(&[&trusted])).clone();
+    client.alpn_protocols = vec![b"dot".to_vec()];
+    let mut server_config = (*server_config(&trusted)).clone();
+    server_config.alpn_protocols = vec![b"h2".to_vec()];
+    let now = Instant::now();
+    let mut resolver = tls_resolver(Arc::new(client), now);
+    let mut server = Server::new(Arc::new(server_config));
+
+    let sent = run(&mut resolver, &mut server, now);
+
+    assert_eq!(connects(&sent), [T1, T2, T1, T2]);
+    let writes: Vec<&Transmit> = sent
+        .iter()
+        .filter(|t| matches!(t.transport, Transport::TcpWrite(_)))
+        .collect();
+    assert!(writes.is_empty(), "sent after the alert: {writes:?}");
+    let Some(Event::Failed {
+        error: Error::Tls(message),
+        ..
+    }) = resolver.poll_event()
+    else {
+        panic!("expected a TLS failure");
+    };
+    assert!(message.contains("NoApplicationProtocol"), "{message}");
+}
+
+/// RFC 8446 §6.2, RFC 7858 §3.3: an answer that arrives in the same read as
+/// a fatal alert after it still counts. Then the connection closes at once,
+/// with nothing sent, and the other query on it moves on.
+#[test]
+fn answer_before_a_fatal_alert_counts() {
+    let (client, server_config) = configs();
+    let now = Instant::now();
+    let mut resolver = tls_resolver(client, now);
+    let mut server = Server::new(server_config);
+    server.silent = true;
+    query(&mut resolver, "example.org.", now);
+    let connection = conn(&run(&mut resolver, &mut server, now)[0]);
+    let requests = server.requests();
+
+    let mut bytes = server.answer(connection, &reply_to(&requests[0]));
+    bytes.extend(server.fatal_alert(connection));
+    resolver.handle_stream_data(connection, &bytes, now);
+    let sent: Vec<Transmit> = std::iter::from_fn(|| resolver.poll_transmit()).collect();
+
+    let Some(Event::Response { response, .. }) = resolver.poll_event() else {
+        panic!("expected the answer");
+    };
+    assert_eq!(response.queries, requests[0].queries);
+    assert!(resolver.poll_event().is_none());
+    assert_matches!(
+        sent.as_slice(),
+        [
+            Transmit {
+                transport: Transport::TcpClose(closed),
+                ..
+            },
+            Transmit {
+                transport: Transport::TcpConnect(_),
+                destination,
+                ..
+            },
+        ] if *closed == connection && *destination == T2
+    );
+}
+
+/// RFC 7858 §3.3: an answer that arrived intact counts even when a record
+/// after it, in the same read, doesn't decrypt. The resolver then ends the
+/// session with `bad_record_mac` (RFC 8446 §6.2), closes the connection and
+/// moves the other query on.
+#[test]
+fn answer_before_a_corrupt_record_counts() {
+    let (client, server_config) = configs();
+    let now = Instant::now();
+    let mut resolver = tls_resolver(client, now);
+    let mut server = Server::new(server_config);
+    server.silent = true;
+    query(&mut resolver, "example.org.", now);
+    let connection = conn(&run(&mut resolver, &mut server, now)[0]);
+    let requests = server.requests();
+
+    let mut bytes = server.answer(connection, &reply_to(&requests[0]));
+    let mut corrupt = server.answer(connection, &reply_to(&requests[1]));
+    *corrupt.last_mut().unwrap() ^= 1;
+    bytes.extend(corrupt);
+    resolver.handle_stream_data(connection, &bytes, now);
+    let sent: Vec<Transmit> = std::iter::from_fn(|| resolver.poll_transmit()).collect();
+
+    let Some(Event::Response { response, .. }) = resolver.poll_event() else {
+        panic!("expected the answer");
+    };
+    assert_eq!(response.queries, requests[0].queries);
+    assert!(resolver.poll_event().is_none());
+    assert_matches!(
+        sent.as_slice(),
+        [
+            Transmit {
+                transport: Transport::TcpWrite(alert),
+                ..
+            },
+            Transmit {
+                transport: Transport::TcpClose(closed),
+                ..
+            },
+            Transmit {
+                transport: Transport::TcpConnect(_),
+                destination,
+                ..
+            },
+        ] if *alert == connection && *closed == connection && *destination == T2
+    );
+    server.receive(&sent[0]);
+    assert_eq!(server.alerts, [AlertDescription::BadRecordMac]);
 }
 
 /// §3.4, RFC 8446 §6.1: the server's close_notify retires the connection.

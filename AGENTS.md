@@ -59,10 +59,12 @@ doesn't start with `tests/`) keeps `#![expect(...)]`.
 ## Architecture
 
 The core has eight modules: `src/lib.rs` (crate docs and public types), `src/config.rs`
-(`Config`, resolv.conf), `src/hosts.rs` (hosts file entries), `src/wire.rs` (framing, padding,
-reply matching, special-use answers), `src/resolver.rs` (the state machine), `src/cache.rs`
-(failures and negative answers), `src/lookup.rs` (`IpLookup`) and `src/tls.rs` (DoT sessions
-driven in memory, `tls` feature).
+(`Config`, and its own resolv.conf parser, which follows glibc's `res_init`, with
+`ResolvEnv` for `LOCALDOMAIN`, `RES_OPTIONS` and the host name), `src/hosts.rs` (hosts file
+entries), `src/wire.rs` (framing, padding, reply matching, special-use answers),
+`src/resolver.rs` (the state machine), `src/cache.rs` (failures and negative answers),
+`src/lookup.rs` (`IpLookup`) and `src/tls.rs` (DoT sessions driven in memory, `tls`
+feature).
 The `Resolver` is a state machine over two maps: pending queries
 (`QueryId` -> `Pending`) and stream connections (`ConnectionId` -> `Connection`), plus the
 `Cache`. Inputs are `query`, `handle_datagram(query, from, ..)`, `handle_udp_error`,
@@ -98,11 +100,14 @@ fields in sync with the code.
   sessions (`tls::Session`) live inside `Connection` and are driven in memory through
   `src/tls.rs`; the driver only moves bytes. Queries written during the handshake wait in the
   session's own queue, not rustls' 64 KiB buffer, and `Session::receive` drains the plaintext
-  after every record batch (rustls holds 16 KiB). Every close the resolver starts goes through
-  `shut`, which sends the alert rustls queued for a TLS error, or else the session's
-  close_notify, as a `TcpWrite` before the `TcpClose` (RFC 8446 §6). A TLS error on received
-  bytes or a refused write aborts the connection: `abort` calls `shut`, then `retry` for each
-  query on it. The server's close_notify retires the connection like `handle_stream_closed`
+  after every record batch (rustls holds 16 KiB), and also after a TLS error, so the answers
+  decrypted before it count. Every close the resolver starts goes through `shut`, which sends
+  the alert rustls queued for a TLS error, or else the session's close_notify, as a `TcpWrite`
+  before the `TcpClose` (RFC 8446 §6), and nothing after the server's fatal alert
+  (`Session::alerted`, §6.2). A TLS error on received bytes (after the answers decrypted
+  before it, which can't send on the connection either) or a refused write aborts the
+  connection: `abort` calls `shut`, then `retry` for each query on it. The server's
+  close_notify retires the connection like `handle_stream_closed`
   (`shut`, then `move_off`), after the answers decrypted with it, which can't send on it
   (`Connection::closing`, skipped by `emit` and `channel` through `Connection::is_open_to`).
   `shutdown` drops every query and shuts every connection, for a driver that stops. Over TLS,
@@ -180,24 +185,28 @@ fields in sync with the code.
   connected to its server, with a new one for each server (§9.1), and pass that query with
   each datagram; report a failed bind, connect, send or receive (ICMP errors) with
   `handle_udp_error`, a stream that the server closed with `handle_stream_closed` and an I/O
-  failure with `handle_stream_error`; write each stream payload in one call, with
-  `TCP_NODELAY` set (RFC 7766 §8, §6.2.1.1), and carry out a `TcpClose` only after the
-  writes before it, which over TLS end with the close_notify alert (a connection still
-  connecting may be dropped at once). After reporting a stream closed, still write what was
-  queued for it before the report (the reply to the server's close_notify), and call
-  `shutdown` and carry out its transmits before stopping. Call `flush_cache` when the host's
-  network changes.
+  failure with `handle_stream_error`; receive datagrams into a buffer that holds any (65535
+  bytes), since a server may send more than the 1232 the queries advertise; write each stream
+  payload in one call, with `TCP_NODELAY` set (RFC 7766 §8, §6.2.1.1), and carry out a
+  `TcpClose` only after the writes before it, which over TLS end with the close_notify alert
+  (a connection still connecting may be dropped at once). After reporting a stream closed,
+  still write what was queued for it before the report (the reply to the server's
+  close_notify), and call `shutdown` and carry out its transmits before stopping. Call
+  `flush_cache` when the host's network changes.
 
 `sansio-dns-tokio` runs one background task per `Resolver` (shared by its clones), spawned on
 the runtime of the first lookup. It owns the core resolver and all I/O: a UDP socket per query
-and server, connected to it, with a task forwarding datagrams and receive errors, and a task
-per stream connection. A `TcpClose` drops the connection's write queue, so its task writes
-what is queued (the close_notify over TLS), shuts the stream down and reads until the server
-closes, aborted after `CLOSE_GRACE` (5 s) at the latest; a connection still connecting is
-aborted at once. A task whose server closed the connection reports it and keeps writing
-until its queue is dropped, which `Io::drop_ended` does only after the transmits queued
-before the report are carried out. When the last clone is dropped, the task calls
-`shutdown`, carries out its transmits and gives the connections `CLOSE_GRACE` to finish.
+and server, connected to it, with a task forwarding datagrams (received into one 65535-byte
+buffer per socket) and receive errors, and a task per stream connection. `from_system_conf`
+reads `/etc/resolv.conf`, `/etc/hosts`, `LOCALDOMAIN`, `RES_OPTIONS` and the host name
+(`uname` through rustix) and hands them to `Config::from_resolv_conf_with_env`. A `TcpClose`
+drops the connection's write queue, so its task writes what is queued (the close_notify over
+TLS), shuts the stream down and reads until the server closes, aborted after `CLOSE_GRACE`
+(5 s) at the latest; a connection still connecting is aborted at once. A task whose server
+closed the connection reports it and keeps writing until its queue is dropped, which
+`Io::drop_ended` does only after the transmits queued before the report are carried out.
+When the last clone is dropped, the task calls `shutdown`, carries out its transmits and
+gives the connections `CLOSE_GRACE` to finish.
 Lookups send a request over a channel with a `oneshot` reply; `CancelOnDrop` cancels a lookup
 whose future is dropped, and `Resolver::flush_cache` sends a request that empties the core's
 cache. If the task's runtime shuts down, the next lookup (or a waiting one)

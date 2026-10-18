@@ -19,6 +19,10 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "time", "rt", "macros", "io-util", "sync"] }
 reqwest = { workspace = true, optional = true }
 
+# The host name, whose domain is the default search domain, as for glibc.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["system"] }
+
 [features]
 # Implements reqwest::dns::Resolve for Resolver.
 reqwest = ["dep:reqwest"]

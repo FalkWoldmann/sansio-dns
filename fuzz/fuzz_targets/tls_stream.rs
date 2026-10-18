@@ -7,9 +7,13 @@
 //! padding option, last, to a multiple of 128 octets (RFC 8467 §3, §4.1),
 //! and is sent at most `attempts + 3` times, and at most three times to one
 //! server (RFC 9520 §3.1). Every connection the resolver closes ends its
-//! session first, with close_notify or an alert (RFC 8446 §6). Run with
-//! `-timeout` so a receive loop that stops making progress shows up as a
-//! hang.
+//! session first, with close_notify or an alert (RFC 8446 §6), unless a
+//! fatal alert from the server ended it: the server's own, or one that raw
+//! or tampered bytes may hold while the client still takes a plaintext
+//! alert, before it has decrypted anything. Once the server's own fatal
+//! alert reaches an untampered connection, the resolver writes nothing more
+//! to it (§6.2). Run with `-timeout` so a receive loop that stops making
+//! progress shows up as a hang.
 
 #![no_main]
 
@@ -66,6 +70,11 @@ enum Step {
         plaintext: Vec<u8>,
     },
     CloseNotify {
+        connection: u8,
+    },
+    /// The server takes in a record that doesn't decrypt, so its session
+    /// fails and it queues a fatal alert for the resolver.
+    Reject {
         connection: u8,
     },
     Closed {
@@ -171,6 +180,27 @@ struct Peer {
     /// session instead: the bytes from the resolver are never tampered
     /// with, so a failure on them comes from such an alert.
     ended: bool,
+    /// Whether the server has decrypted application data from the
+    /// resolver, which rustls sends only once its handshake is done: the
+    /// client has then decrypted a record, and takes no plaintext alert any
+    /// more.
+    secure: bool,
+    /// Whether the resolver was fed bytes other than the server's own, in
+    /// order, on this connection.
+    garbled: bool,
+    /// Whether it was fed them before `secure`, so they may have held a
+    /// plaintext fatal alert the client took.
+    tampered: bool,
+    /// After `Step::Reject` on a connection that was never garbled and had
+    /// finished its handshake: how many bytes of `outbox` are left to
+    /// deliver up to the end of the server's alert.
+    alert_end: Option<usize>,
+    /// Whether that alert reached the resolver whole, after which it may
+    /// write nothing more to the connection (RFC 8446 §6.2).
+    alerted: bool,
+    /// Whether the server sent close_notify, after which its session may
+    /// send no alert (a debug assertion of rustls').
+    notified: bool,
 }
 
 impl Peer {
@@ -188,7 +218,9 @@ impl Peer {
             }
         }
         // EOF and WouldBlock both just mean nothing more for now.
+        let before = self.plaintext.len();
         let _ = self.session.reader().read_to_end(&mut self.plaintext);
+        self.secure |= self.plaintext.len() > before;
         while let Some((len, rest)) = self.plaintext.split_first_chunk::<2>() {
             let len = usize::from(u16::from_be_bytes(*len));
             let Some(query) = rest.get(..len) else {
@@ -218,6 +250,25 @@ impl Peer {
         }
     }
 
+    /// Note that the resolver was fed bytes other than the server's own.
+    fn garble(&mut self) {
+        self.garbled = true;
+        self.tampered |= !self.secure;
+        self.alert_end = None;
+    }
+
+    /// Note that the first `len` bytes of `outbox` were delivered intact.
+    fn delivered(&mut self, len: usize) {
+        if let Some(end) = self.alert_end {
+            if len >= end {
+                self.alerted = true;
+                self.alert_end = None;
+            } else {
+                self.alert_end = Some(end - len);
+            }
+        }
+    }
+
     fn flush(&mut self) {
         while self.session.wants_write() {
             if self.session.write_tls(&mut self.outbox).is_err() {
@@ -243,19 +294,29 @@ fn pump(harness: &mut Harness, peers: &mut BTreeMap<ConnectionId, Peer>, sends: 
                     outbox: Vec::new(),
                     failed: false,
                     ended: false,
+                    secure: false,
+                    garbled: false,
+                    tampered: false,
+                    alert_end: None,
+                    alerted: false,
+                    notified: false,
                 };
                 peer.receive(&t.payload, sends);
                 peers.insert(c, peer);
             }
             Transport::TcpWrite(c) => {
                 if let Some(peer) = peers.get_mut(&c) {
+                    assert!(
+                        !peer.alerted,
+                        "{c:?} written after the server's fatal alert"
+                    );
                     peer.receive(&t.payload, sends);
                 }
             }
             Transport::TcpClose(c) => {
                 if let Some(peer) = peers.remove(&c) {
                     assert!(
-                        peer.ended || peer.failed,
+                        peer.ended || peer.failed || peer.tampered,
                         "{c:?} closed without close_notify or an alert"
                     );
                 }
@@ -290,6 +351,9 @@ fuzz_target!(|steps: Vec<Step>| {
         match step {
             Step::Raw { connection, bytes } => {
                 if let Some(c) = harness.open(*connection) {
+                    if let Some(peer) = peers.get_mut(&c) {
+                        peer.garble();
+                    }
                     harness.resolver.handle_stream_data(c, bytes, now);
                 }
             }
@@ -309,7 +373,13 @@ fuzz_target!(|steps: Vec<Step>| {
                     len => len.min(peer.outbox.len()),
                 };
                 let mut bytes: Vec<u8> = peer.outbox.drain(..len).collect();
+                let untouched = bytes.clone();
                 flip(&mut bytes, flips);
+                if bytes == untouched {
+                    peer.delivered(len);
+                } else {
+                    peer.garble();
+                }
                 harness.resolver.handle_stream_data(c, &bytes, now);
             }
             Step::Answer { connection } => {
@@ -344,7 +414,23 @@ fuzz_target!(|steps: Vec<Step>| {
                 let peer = harness.open(*connection).and_then(|c| peers.get_mut(&c));
                 if let Some(peer) = peer.filter(|p| !p.session.is_handshaking()) {
                     peer.session.send_close_notify();
+                    peer.notified = true;
                     peer.flush();
+                }
+            }
+            Step::Reject { connection } => {
+                let peer = harness.open(*connection).and_then(|c| peers.get_mut(&c));
+                if let Some(peer) = peer.filter(|p| !p.failed && !p.notified) {
+                    let armed = !peer.garbled && !peer.session.is_handshaking();
+                    // An application data record of 20 zero bytes.
+                    let record: Vec<u8> = [0x17, 3, 3, 0, 20].into_iter().chain([0; 20]).collect();
+                    if peer.session.read_tls(&mut &record[..]).is_ok() {
+                        peer.failed = peer.session.process_new_packets().is_err();
+                    }
+                    peer.flush();
+                    if armed && peer.failed {
+                        peer.alert_end = Some(peer.outbox.len());
+                    }
                 }
             }
             Step::Closed { connection } => {

@@ -9,6 +9,11 @@
 //! # }
 //! ```
 //!
+//! [`Resolver::from_system_conf`] reads `/etc/resolv.conf`, the
+//! `LOCALDOMAIN` and `RES_OPTIONS` environment variables and the host
+//! name's domain (the default search domain) as glibc's `res_init` does,
+//! and static entries from `/etc/hosts`.
+//!
 //! Clones of a [`Resolver`] share one [`sansio_dns::Resolver`], run by a
 //! background task that the first lookup spawns on its runtime. TCP and TLS
 //! connections stay open between lookups and are shared by concurrent ones,
@@ -18,8 +23,10 @@
 //! to its server, and a new one when it moves to another server: the
 //! kernel then only delivers datagrams from that server to the address the
 //! query was sent from (§9.1), and reports an ICMP error such as port
-//! unreachable, which moves the query on at once. Dropping a lookup's future
-//! cancels its queries.
+//! unreachable, which moves the query on at once. Each socket receives
+//! into a buffer that holds any datagram, so an answer larger than the
+//! 1232 bytes the query advertises arrives whole. Dropping a lookup's
+//! future cancels its queries.
 //!
 //! The background task's [`sansio_dns::Resolver`] caches failures and
 //! negative answers (see `sansio_dns`'s crate docs), so a lookup that just
@@ -60,6 +67,7 @@ mod reqwest;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::ffi::OsString;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -70,7 +78,7 @@ use idna::uts46::{AsciiDenyList, DnsLength, Hyphens, Uts46};
 use sansio_dns::hickory_proto::ProtoError;
 use sansio_dns::hickory_proto::rr::Name;
 use sansio_dns::{
-    Config, ConnectionId, Event, Hosts, IpLookup, Progress, QueryId, Transmit, Transport,
+    Config, ConnectionId, Event, Hosts, IpLookup, Progress, QueryId, ResolvEnv, Transmit, Transport,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -124,16 +132,27 @@ impl Resolver {
         }
     }
 
-    /// A resolver configured like the system's: name servers and search
-    /// domains from `/etc/resolv.conf`, static entries from `/etc/hosts` if
-    /// it can be read. Without `/etc/resolv.conf`, the local host is asked,
-    /// as glibc does; any other error reading it is returned.
+    /// A resolver configured like the system's, as glibc's `res_init`
+    /// configures it: name servers, search domains and options from
+    /// `/etc/resolv.conf` (see `Config::from_resolv_conf`), then the
+    /// environment and the host name (see
+    /// `Config::from_resolv_conf_with_env`): `LOCALDOMAIN` replaces the
+    /// search domains, `RES_OPTIONS` adds options after the file's, and
+    /// without either a search list or `LOCALDOMAIN`, the host name's
+    /// domain, the part after its first dot, is the search domain. Static
+    /// entries come from `/etc/hosts` if it can be read. Without
+    /// `/etc/resolv.conf`, the local host is asked, as glibc does; any
+    /// other error reading it is returned.
     pub fn from_system_conf() -> io::Result<Self> {
         let resolv_conf = match std::fs::read("/etc/resolv.conf") {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
             read => read?,
         };
-        let mut config = Config::from_resolv_conf(&resolv_conf);
+        let mut env = ResolvEnv::default();
+        env.localdomain = std::env::var_os("LOCALDOMAIN").map(OsString::into_encoded_bytes);
+        env.res_options = std::env::var_os("RES_OPTIONS").map(OsString::into_encoded_bytes);
+        env.hostname = hostname();
+        let mut config = Config::from_resolv_conf_with_env(&resolv_conf, &env);
         if let Ok(hosts) = std::fs::read("/etc/hosts") {
             config.hosts = Hosts::parse(&hosts);
         }
@@ -142,7 +161,10 @@ impl Resolver {
 
     /// The addresses of `host`, which may also be an IP address itself, in
     /// the families and order of `Config::ip_strategy` (by default IPv6
-    /// first).
+    /// first). IPv6 comes first even on a host without a global IPv6
+    /// address, such as a container with only a ULA, where `getaddrinfo`
+    /// puts IPv4 first (RFC 6724 §6): there, race the connections (Happy
+    /// Eyeballs, RFC 8305), as hyper does, or set `IpStrategy::Ipv4First`.
     ///
     /// A name with non-ASCII characters is converted to its ASCII form as a
     /// whole, by UTS 46 non-transitional processing, as browsers and the
@@ -230,6 +252,23 @@ impl Resolver {
             requests.send(Request::FlushCache).ok();
         }
     }
+}
+
+/// The host name, as glibc's `gethostname` gets it on Linux: the node name
+/// from `uname`.
+#[cfg(unix)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the same signature as off Unix, where there is none"
+)]
+fn hostname() -> Option<Vec<u8>> {
+    Some(rustix::system::uname().nodename().to_bytes().to_vec())
+}
+
+/// No host name off Unix, where there is no `resolv.conf` either.
+#[cfg(not(unix))]
+fn hostname() -> Option<Vec<u8>> {
+    None
 }
 
 /// `host`, which isn't an IP address, as the name to look up; see
@@ -733,25 +772,28 @@ impl Io {
     }
 }
 
+/// Room for any UDP datagram: a server may send more than the 1232 bytes a
+/// query advertises, and a smaller buffer would cut its answer off.
+const MAX_DATAGRAM: usize = 65535;
+
 /// Forward every datagram `socket`, connected to `server`, receives, and
-/// every error receiving reports, until its query is over. Each datagram is
-/// copied out at its size, so a queue of them holds no spare capacity. An
-/// error, such as an ICMP port unreachable for the last datagram, doesn't
-/// end the socket: it serves the query's attempts to `server` until one
-/// goes to another server.
+/// every error receiving reports, until its query is over. It receives
+/// into one buffer that holds any datagram, and copies each out at its
+/// size, so a queue of them holds no spare capacity. An error, such as an
+/// ICMP port unreachable for the last datagram, doesn't end the socket: it
+/// serves the query's attempts to `server` until one goes to another
+/// server.
 async fn datagrams(
     query: QueryId,
     socket: Arc<UdpSocket>,
     server: SocketAddr,
     input: mpsc::UnboundedSender<Input>,
 ) {
-    let mut buf = [0; 4096];
+    let mut buf = Vec::with_capacity(MAX_DATAGRAM);
     loop {
-        let received = match socket.recv_from(&mut buf).await {
-            Ok((n, from)) => {
-                let data = buf.get(..n).map(<[u8]>::to_vec).unwrap_or_default();
-                Input::Datagram(query, from, data)
-            }
+        buf.clear();
+        let received = match socket.recv_buf_from(&mut buf).await {
+            Ok((_, from)) => Input::Datagram(query, from, buf.clone()),
             Err(error) => Input::UdpError(query, server, error.kind()),
         };
         if input.send(received).is_err() {

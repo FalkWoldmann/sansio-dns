@@ -20,9 +20,11 @@ Complete drivers are in `examples/` (`std`, `tokio`, `compio`), about 150 lines 
 
 For hostnames, `IpLookup` runs the A and AAAA queries and merges the addresses, following
 CNAMEs. `Config::ip_strategy` picks the families and their order: IPv6 first by default, or
-IPv4 first, or only one family. With search domains, the lookup starts the queries for the
-next candidate itself: send the transmits it queues, and route events by `lookup.queries()`
-again after each one.
+IPv4 first, or only one family. IPv6 comes first even on a host without a global IPv6 address,
+such as a container with only a ULA, where `getaddrinfo` puts IPv4 first (RFC 6724 §6): there,
+race the connections (Happy Eyeballs, RFC 8305), as hyper does, or use `IpStrategy::Ipv4First`.
+With search domains, the lookup starts the queries for the next candidate itself: send the
+transmits it queues, and route events by `lookup.queries()` again after each one.
 
 ```rust
 let mut lookup = IpLookup::start(&mut resolver, Name::from_ascii("example.com")?, now)?;
@@ -107,22 +109,38 @@ a zone in `Config::unicast_local_zones`, go to the servers. The rule applies to 
 candidate (RFC 6762 §3), so with search domain `cluster.local` the relative `db.local` is
 sent as `db.local.cluster.local`. mDNS itself is up to the caller.
 
-`Config::from_resolv_conf(&bytes)` reads the text of a `resolv.conf` (you read the file) with
-the [`resolv-conf`](https://crates.io/crates/resolv-conf) crate and applies glibc's rules:
-the first three nameservers, `search`/`domain`, `ndots`, `timeout` and `attempts`, skipping
-lines it can't use instead of failing. Unlike glibc, it takes at most 3 attempts per server
+`Config::from_resolv_conf(&bytes)` reads the text of a `resolv.conf` (you read the file) the way
+glibc's `res_init` does, skipping lines it can't use instead of failing. A keyword counts only
+at the start of a line, so indented lines are ignored. It takes the first three nameservers,
+IPv4 ones in any form `inet_aton` reads (`127.1` is 127.0.0.1), with `0.0.0.0` and `::` asking
+the local host; `search` or `domain`; and the options `ndots`, `timeout`, `attempts`,
+`no-aaaa` and `no-tld-query` (also spelled `no_tld_query`), each known by how it starts, with
+its number read as `strtol` reads it. Unlike glibc, it takes at most 3 attempts per server
 instead of 5, since RFC 9520 §3.1 allows no more than three sends of a query to one server
-over one transport. `options no-aaaa` asks for IPv4 addresses only. With search domains, a
-name without a trailing dot is tried with each of them, before the name as given if it has
-fewer than `ndots` dots and after it otherwise. `options no-tld-query` (`Config::tld_query`)
-leaves out a name of one label as given, so with search domains `db` never asks for a
-top-level domain. For `Resolver::query` the search moves on after NXDOMAIN and after NODATA
-(the name exists without records of the type and class asked for at the end of its CNAME
-chain), until a candidate has data (RFC 1123 §6.1.4.3, RFC 2308 §2.2); when it runs out the
-outcome is the first NODATA, else the last NXDOMAIN. glibc moves on after NODATA only when the
-answer section is empty, so it stops at a CNAME whose target has no data. `IpLookup` asks
-each candidate for both families and moves on when neither has an address, as glibc's
-`getaddrinfo` does, so its addresses are always those of one name.
+over one transport, reads `#` and `;` as starting a comment anywhere on a line, and takes CRLF
+line ends.
+
+`Config::from_resolv_conf_with_env(&bytes, &env)` also applies what glibc reads from the
+environment and the host: `LOCALDOMAIN` replaces the search domains, `RES_OPTIONS` adds options
+after the file's, and without a search list or `LOCALDOMAIN`, the host name's domain (the part
+after its first dot) is the search domain. sansio-dns-tokio's `from_system_conf` fills these in.
+
+`options no-aaaa` asks for IPv4 addresses only. With search domains, a name without a trailing
+dot is tried with each of them, before the name as given if it has fewer than `ndots` dots and
+after it otherwise. `options no-tld-query` (`Config::tld_query`) leaves out a name of one label
+as given, so with search domains `db` never asks for a top-level domain. For `Resolver::query`
+the search moves on after NXDOMAIN and after NODATA (the name exists without records of the
+type and class asked for at the end of its CNAME chain), until a candidate has data (RFC 1123
+§6.1.4.3, RFC 2308 §2.2); when it runs out the outcome is the first NODATA, else the last
+NXDOMAIN. glibc moves on after NODATA only when the answer section is empty, so it stops at a
+CNAME whose target has no data. A failure on a candidate, such as SERVFAIL or REFUSED, ends the
+search with that error, as musl does, so that a temporary failure for the name meant doesn't
+turn into an answer for another name. glibc goes on to the search domains after any failure on
+the name as given when that comes first; among the search domains it moves on only after
+SERVFAIL, and after another failure it stops and still tries the name as given if that comes
+last, unless no server could be reached at all. `IpLookup` asks each candidate for both
+families and moves on when neither has an address, as glibc's `getaddrinfo` does, so its
+addresses are always those of one name.
 
 ## Compared with hickory-resolver
 
@@ -137,7 +155,7 @@ hickory-resolver 0.26.3 and its cache off:
 | `lookup_ip` over UDP | 226 µs | 311 µs |
 | `lookup_ip` after a truncated answer, over TCP | 305 µs | 396 µs |
 | reqwest GET on a new connection | 396 µs | 425 µs |
-| Heap allocations per UDP lookup, incl. 18 by the test server | 61 | 145 |
+| Heap allocations per UDP lookup, incl. 18 by the test server | 67 | 145 |
 | Stripped binary size over reqwest's default resolver | +0.58 MB | +1.44 MB |
 
 On localhost the times are mostly task wakeups; on a real network the round trip to the
@@ -159,7 +177,7 @@ Where the two behave differently:
 | Cache | Failures (1 s, backing off to 30 s) and negative answers, 1024 entries | Positive and negative, 8192 entries |
 | Server order | As configured; one that failed to answer goes after the others for a minute | By measured latency, two servers raced |
 | Transports | UDP, TCP, DoT | Also DoH, DoH3, DoQ and DNSSEC validation |
-| System configuration | `resolv.conf` and hosts | Also Windows, and macOS through SystemConfiguration |
+| System configuration | `resolv.conf` as glibc reads it, `LOCALDOMAIN`, `RES_OPTIONS`, the host name's domain, and hosts | Also Windows, and macOS through SystemConfiguration; no `LOCALDOMAIN` or `RES_OPTIONS` |
 | Tokio lookups | `lookup_ip` | Any record type, reverse lookups, typed helpers |
 
 ## Spec coverage
@@ -176,7 +194,8 @@ and RFC 6895, 8482 and 9824 in its §6.1.3.2 module; RFC 2308 §7.2's cap is in
 `rfc9520.rs`'s §3.2 module; RFC 1123 §6.1.3.3 (3) and (4) are covered by the tests of RFC 9520
 §3.2 and RFC 2308 §5, RFC 2308 §8 by `rfc2308.rs`'s §5 and §6 modules, and RFC 4343 §3 for
 cache keys by both; RFC 1123 §6.1.4.3 (b)'s `no-tld-query` is in `resolv_conf.rs`'s `search`
-module; `rfc6761.rs` has RFC 7686 in its §6.4 module, RFC 6762 in its
+and `options` modules, and that file also has RFC 1122 §3.2.1.3's unspecified address as a
+name server; `rfc6761.rs` has RFC 7686 in its §6.4 module, RFC 6762 in its
 `rfc6762_section_22_1` module, and RFC 6761 §6.1, §6.2, §6.5, RFC 8375 and RFC 9476 in its
 `not_special_to_resolvers` module;
 `rfc7858.rs` holds the RFC 7858, 8310, 8467, 7830, 7871 and 8446 tests as plain functions,
@@ -185,7 +204,8 @@ time out on a connection. `tests/main.rs` builds them all as one crate. The Toki
 `sansio-dns-tokio/tests/tls.rs` checks that its DNS over TLS connections end with close_notify (RFC 8446
 §6.1), when the server closes first and when the resolver is dropped, and
 `sansio-dns-tokio/tests/lookup.rs` has the host name rules of `lookup_ip` (RFC 1123 §2.1, RFC
-4343 §4, RFC 5891).
+4343 §4, RFC 5891), and `sansio-dns-tokio/tests/system_conf.rs` checks that
+`from_system_conf` applies `LOCALDOMAIN` and `RES_OPTIONS`.
 
 | RFC | Section | Behavior |
 |---|---|---|
@@ -203,7 +223,7 @@ time out on a connection. `tests/main.rs` builds them all as one crate. The Toki
 | 1123 | §6.1.3.3 (4) | Negative answers are cached (RFC 2308 §5 below) |
 | 1123 | §6.1.4.3 | Search candidates are tried until one has data of the type and class asked for: NXDOMAIN and NODATA (RFC 2308 §2.2) move on; then the first NODATA is the outcome, else the last NXDOMAIN; a failure ends the search. `IpLookup` asks each candidate for A and AAAA and moves on when neither has an address, so both families come from the same name (§6.1.4.3 (b)) |
 | 1123 | §6.1.4.3 (a) | A candidate with a cached NXDOMAIN or NODATA is passed over without a query, and one with a cached failure ends the search, for `Resolver::query` and `IpLookup` alike |
-| 1123 | §6.1.4.3 (b) | `options no-tld-query` (`Config::tld_query`) keeps a name of one label from being sent as given when there are search domains, as glibc does: a weaker rule than (b)'s two interior dots |
+| 1123 | §6.1.4.3 (b) | `options no-tld-query` or `no_tld_query` (`Config::tld_query`) keeps a name of one label from being sent as given when there are search domains, as glibc does: a weaker rule than (b)'s two interior dots |
 | 2308 | §5 | NXDOMAIN is cached for every type of the name, NODATA for its type, under the last name of the CNAME chain (§1, §2.1), when the authority section has an SOA record, for the lesser of its TTL and MINIMUM, at most `max_negative_ttl` (1 hour). Not cached: an answer without an SOA, a truncated one (RFC 1123 §6.1.3.2), one with a zero TTL (RFC 1123 §6.1.2.1), a looping chain. RFC 8020's NXDOMAIN cut isn't applied |
 | 2308 | §6 | An answer from the cache asks the question asked and has the authority section as received, every TTL counted down by the whole seconds it was cached, AA clear and no OPT record (RFC 6891 §6.2.1) |
 | 2308 | §7 | No single server's failure is cached for a question: a server that answered with an error is asked first again by the next query; one that didn't answer goes after the others for `failure_memory`, at most 5 minutes (§7.2) |
@@ -215,8 +235,9 @@ time out on a connection. `tests/main.rs` builds them all as one crate. The Toki
 | 5452 | §9.1 | Datagrams must match source address, port, ID, QNAME, QTYPE and QCLASS, also when their records don't decode; the driver's socket per query, connected to the server, checks destination address and port. On a stream, a response without a question section matches by ID alone (RFC 7766 §7) |
 | 5452 | §4.6 | The first answer that ends the query wins, and later copies are ignored. A copy of an error answer counts again while the query is still on that server: after a `FORMERR` without OPT made it drop EDNS, a second copy counts as the answer to the query without EDNS |
 | 5452 | §9.2 | IDs from a CSPRNG, avoiding those of outstanding queries, cancelled ones still outstanding on a connection included (16 random picks, then the next free ID); per-query source ports are the driver's job (see below) |
+| 1122 | §3.2.1.3 | A name server at the unspecified address, `0.0.0.0` or `::`, which no datagram may be sent to (RFC 4291 §2.5.2), is asked at the loopback address on its port, as Linux does for glibc, so its replies pass the source check |
 | 6891 | §6.1.3 | BADVERS fails over like any server error: version 0 is the lowest there is |
-| 6891 | §6.2.3 | One OPT record, 1232-byte payload (DNS Flag Day 2020) |
+| 6891 | §6.2.3 | One OPT record, 1232-byte payload (DNS Flag Day 2020); a larger UDP answer that arrives whole is used |
 | 6891 | §7, §6.2.2 | `FORMERR` without OPT → same server once more without EDNS (over TLS: fail over, since EDNS carries the padding); with OPT → fail over |
 | 7873 | §5.3 | No cookie is sent, so BADCOOKIE is a server error and fails over |
 | 7766 | §5 | An open connection to a server carries every query to it, new ones and retries included; a query on it only for that goes back to UDP once it is gone. TCP is supported: a truncated UDP response sends the query to the same server over TCP, and its later attempts stay on TCP (RFC 1123 §6.1.3.2); UDP replies are then ignored |
@@ -224,7 +245,7 @@ time out on a connection. `tests/main.rs` builds them all as one crate. The Toki
 | 7766 | §6.2.2 | At most one connection per server; when it fails, the queries on it that must use a stream share one new connection |
 | 7766 | §6.2.3 | Idle connections closed after `idle_timeout`, counted from the last write or complete response, or from the deadline of a query that left the connection before its answer came (cancelled, or moved on after a timeout); partial messages don't count |
 | 7766 | §6.2.4 | Queries on a lost connection that had answered go to the same server again without using an attempt: every time if it answered after they were written, else once per query |
-| 7766 | §7 | Answers matched in any order, by message ID and question, or by ID alone without a question section; a query that times out closes the connection only if no response arrived on it since the query was written |
+| 7766 | §7 | Answers matched in any order, by message ID and question, or by ID alone without a question section; a query that times out closes the connection only if no complete response, matched or not, arrived on it since the query was written |
 | 7766 | §8 | Two-byte length prefix; replies reassembled from any chunking, up to 65535 octets |
 | 1034 | §3.6.2, §5.2.2 | `addresses` follows the CNAME chain and ignores records owned by other names; a loop is `Error::CnameLoop`, also for `IpLookup` |
 | 3596 | §2.3 | `addresses` takes only records of the type and class asked for at the end of the chain: no A record in an AAAA answer (RFC 1035 §7.4). Records of another class don't count as data for the search either, so an answer with only those is NODATA |
@@ -240,10 +261,10 @@ time out on a connection. `tests/main.rs` builds them all as one crate. The Toki
 | 9476 | §3.2 | `alt.` names are sent like any other |
 | 7858 | §3 | With `tls`: every query over TLS on a stream, never UDP; TLS errors fail the attempt |
 | 7858 | §3.1 | Servers on port 53 are refused |
-| 7858 | §3.3 | Queries written during the handshake wait for it in the resolver, any number of them, and go out whole after it; replies of any size come through the session in any chunking |
+| 7858 | §3.3 | Queries written during the handshake wait for it in the resolver, any number of them, and go out whole after it; replies of any size come through the session in any chunking; an answer that arrived intact counts even when a record after it in the same read doesn't decrypt or is a fatal alert |
 | 7858 | §3.4 | The TLS session is reused for later queries, and resumed on a new connection; the server's close_notify closes the connection and its queries go to a new one, as after any close, and so does a query that an answer arriving with the close_notify moves on to the same server |
-| 8446 | §6.1 | Every connection the resolver closes gets close_notify first, written by the driver before it closes, unless an error alert already ended the session (§6.2); `shutdown` closes them all this way when the driver stops, and the server's close_notify is answered with the resolver's own |
-| 8446 | §6.2 | On a TLS error, the alert rustls queued is sent before the connection closes |
+| 8446 | §6.1 | Every connection the resolver closes gets close_notify first, written by the driver before it closes, unless an error alert, the resolver's or the server's, already ended the session (§6.2); `shutdown` closes them all this way when the driver stops, and the server's close_notify is answered with the resolver's own |
+| 8446 | §6.2 | On a TLS error the resolver detects, such as a bad certificate or a record that doesn't decrypt, the alert rustls queued is sent before the connection closes; after a fatal alert from the server, nothing is sent, not even close_notify, and the connection closes at once |
 | 8310 | §5, §8.1 | Strict profile: the certificate must chain to a trusted root and match the configured name (with the default WebPKI verifier) |
 | 8310 | §7.1 | One authentication name per server (`with_tls_names`) |
 | 8310 | §11.1 | Queries over TLS carry an EDNS Client Subnet option with SOURCE PREFIX-LENGTH 0, FAMILY that of the transport (RFC 7871 §7.1.2) |
@@ -264,11 +285,12 @@ and port.
 
 Stream connections are named by a `ConnectionId`: `TcpConnect(id)` means open a connection
 to the destination and write the payload, `TcpWrite(id)` write to it, `TcpClose(id)` close
-it once the writes before it are done. With TLS the last of them carries the close_notify alert,
-which must reach the server before the close (RFC 8446 §6.1), or the alert for a TLS error
-(§6.2). A connection still connecting when its `TcpClose` comes can be dropped at once, since
-nothing written to it has gone out. Payloads are already length-prefixed or TLS-encrypted: write each in one call (RFC 7766
-§8), and disable Nagle's algorithm (`TCP_NODELAY`) so pipelined queries go out at once
+it once the writes before it are done. With TLS the last of them carries the close_notify
+alert, which must reach the server before the close (RFC 8446 §6.1), or the alert for a TLS
+error (§6.2); after a fatal alert from the server there is none. A connection still
+connecting when its `TcpClose` comes can be dropped at once, since nothing written to it has
+gone out. Payloads are already length-prefixed or TLS-encrypted: write each in one call (RFC
+7766 §8), and disable Nagle's algorithm (`TCP_NODELAY`) so pipelined queries go out at once
 (§6.2.1.1). Pass everything read to `handle_stream_data(id, …)`. Call
 `handle_stream_closed(id, …)` if the server closes the connection, and
 `handle_stream_error(id, kind, …)` if connecting, reading or writing fails, so a query out of
@@ -287,11 +309,15 @@ ignored. A driver that stops calls `shutdown` and carries out its transmits befo
 its connections, so every TLS session ends with close_notify. When binding,
 connecting or sending on a query's socket fails, or receiving on it reports an error such as
 an ICMP port unreachable (RFC 1122 §4.1.3.3), call `handle_udp_error(query, to, kind, …)`,
-so the query moves on at once instead of waiting out its deadline. An error doesn't end the
+so the query moves on at once instead of waiting out its deadline. Not every refused datagram
+draws an error: macOS rate-limits ICMP port unreachable messages, so a datagram refused soon
+after another may get none, and its query waits out its deadline. An error doesn't end the
 socket: keep receiving on it while the query's attempts go to that server, and bind a new one
 when an attempt goes to another. Bind each socket in the destination's address family, pass
 the source address as received (an IPv4 server seen as `::ffff:a.b.c.d` won't match), and
-read datagrams into a buffer of at least 1232 bytes. When the host's network changes, call
+read datagrams into a buffer that holds any UDP datagram, 65535 bytes, not just the 1232 the
+queries advertise: a server may send more, and the resolver uses such an answer. When the
+host's network changes, call
 `flush_cache()`: failures and negative answers from the old network shouldn't hold on the new
 one.
 
@@ -333,11 +359,15 @@ queries and open connections, nothing sent for a question within a second of its
 a timer exactly while something is pending; `datagram`, `stream` and `driver_ops` also bound
 the sends per query and check that queries for one name never start over. `system_files`
 checks the local answers for hosts, special-use and link-local names, the order of the search
-candidates, `no-tld-query` included, and the answer the search ends on, and `tls_stream` checks that every query the server decrypts keeps EDNS, carries the Client
-Subnet privacy option for the server's address family and then one padding option to a
-multiple of 128 octets, and is sent at most `attempts + 3` times, and at most three times to
-one server, and that every connection the resolver closes ends its session with close_notify
-or an alert first. They need nightly:
+candidates, `no-tld-query` included, the answer the search ends on, and that `LOCALDOMAIN`,
+`RES_OPTIONS` and the host name apply as glibc applies them. `tls_stream` checks that every
+query the server decrypts keeps EDNS, carries the Client Subnet privacy option for the
+server's address family and then one padding option to a multiple of 128 octets, and is sent
+at most `attempts + 3` times, and at most three times to one server, that every connection the
+resolver closes ends its session with close_notify or an alert first, unless a fatal alert from
+the server ended it (its own, or one that raw or tampered bytes may hold before the client has
+decrypted anything), and that the resolver writes nothing to a connection once the server's
+fatal alert reached it. They need nightly:
 
 ```sh
 cd fuzz && cargo fuzz run driver_ops -- -max_total_time=60 -timeout=5

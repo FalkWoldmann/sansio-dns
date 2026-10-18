@@ -1,7 +1,7 @@
 //! Resolver settings, and reading them from a `resolv.conf`.
 
 use std::collections::VecDeque;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV6};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::num::NonZeroUsize;
 #[cfg(feature = "tls")]
 use std::sync::Arc;
@@ -33,6 +33,13 @@ pub enum IpStrategy {
     /// with a global IPv6 source address: it puts IPv4 before ULA, 6to4
     /// and Teredo destinations (§2.1), and its rules also weigh scope and
     /// prefix length (§6), which this order ignores.
+    ///
+    /// It is the default even on a host without a global IPv6 address,
+    /// such as a container with only a ULA, where `getaddrinfo`'s RFC 6724
+    /// sorting puts IPv4 first (§6 rule 5): a client there that tries the
+    /// addresses one at a time waits on each IPv6 one. Race the
+    /// connections (Happy Eyeballs, RFC 8305), or use
+    /// [`IpStrategy::Ipv4First`] on such hosts.
     #[default]
     Ipv6First,
 }
@@ -159,8 +166,8 @@ pub struct Config {
     /// Whether a name of one label, such as `db`, is also tried as given
     /// when there are search domains, which asks the name servers for a
     /// top-level domain. True by default, as in glibc; `options
-    /// no-tld-query` in a `resolv.conf` turns it off. Without search
-    /// domains, such a name is always tried as given.
+    /// no-tld-query` (or `no_tld_query`) in a `resolv.conf` turns it off.
+    /// Without search domains, such a name is always tried as given.
     ///
     /// RFC 1123 §6.1.4.3 asks a search list to keep from sending excessive
     /// queries to the root, by caching negative answers (provision (a)),
@@ -208,8 +215,18 @@ impl Config {
     /// A question that fails is cached for a second, backing off to 30
     /// seconds, and a negative answer for at most an hour, in a cache of
     /// 1024 entries.
+    ///
+    /// A server at the unspecified address, `0.0.0.0` or `::`, is the local
+    /// host, as for glibc: Linux sends its queries for `nameserver 0.0.0.0`
+    /// to the loopback address. No datagram may be sent to the unspecified
+    /// address (RFC 1122 §3.2.1.3, RFC 4291 §2.5.2), and the replies would
+    /// come from the loopback address and fail the source check (RFC 5452
+    /// §9.1), so it is replaced by `127.0.0.1` or `::1`, keeping the port.
     pub fn new(first: SocketAddr, more: impl IntoIterator<Item = SocketAddr>) -> Self {
-        let servers: Vec<SocketAddr> = std::iter::once(first).chain(more).collect();
+        let servers: Vec<SocketAddr> = std::iter::once(first)
+            .chain(more)
+            .map(loopback_if_unspecified)
+            .collect();
         let attempts = NonZeroUsize::new(servers.len() * 2).unwrap_or(NonZeroUsize::MIN);
         Self {
             servers,
@@ -285,7 +302,8 @@ impl Config {
     /// (RFC 8310 §7.1), so servers of different operators can be mixed:
     /// `names` pairs each server's address with the name its certificate
     /// must match. If an address appears more than once, its last name
-    /// counts.
+    /// counts. An unspecified address stands for the loopback address, as
+    /// in [`Config::new`].
     ///
     /// # Errors
     ///
@@ -298,6 +316,9 @@ impl Config {
         client: Arc<rustls::ClientConfig>,
         names: impl IntoIterator<Item = (SocketAddr, rustls::pki_types::ServerName<'static>)>,
     ) -> Result<Self, TlsConfigError> {
+        let names = names
+            .into_iter()
+            .map(|(server, name)| (loopback_if_unspecified(server), name));
         self.tls = Some(tls::Settings::new(client, &self.servers, names)?);
         Ok(self)
     }
@@ -310,61 +331,84 @@ impl Config {
         false
     }
 
-    /// Settings from the text of a `resolv.conf` file, read the way glibc
-    /// reads it: the first three usable `nameserver` lines (port 53),
-    /// `search` or `domain`, `options ndots:` (default 1, at most 15),
-    /// `options timeout:` in seconds (default 5, at most 30),
-    /// `options attempts:` per server (default 2),
-    /// `options no-aaaa` ([`IpStrategy::Ipv4Only`]) and
-    /// `options no-tld-query` (`tld_query` off). Without usable
-    /// `nameserver` lines, the local host is asked (127.0.0.1). Unlike glibc,
-    /// later rounds through the servers wait longer; see `timeout`. And
-    /// where glibc takes up to 5 attempts per server, this takes at most 3,
-    /// since RFC 9520 §3.1 allows no more than three sends of a query to a
-    /// server over one transport.
+    /// Settings from the text of a `resolv.conf` file, read the way glibc's
+    /// `res_init` reads it. [`Config::from_resolv_conf_with_env`] also
+    /// takes what glibc reads from the environment and the host name.
+    ///
+    /// A line counts only if it starts with its keyword, followed by a
+    /// space or a tab: an indented line is ignored, and so is a line that
+    /// starts with `#` or `;`. As in glibc, a NUL byte ends its line. It
+    /// reads these lines:
+    ///
+    /// - `nameserver`: the first three usable ones, on port 53. An IPv4
+    ///   address may take any form `inet_aton` reads, such as `127.1`,
+    ///   `0x7f.0.0.1` or `2130706433`; an IPv6 address may have a numeric
+    ///   scope (`fe80::1%2`). Without a usable one, the local host is asked
+    ///   (127.0.0.1), and `0.0.0.0` or `::` asks it too (see
+    ///   [`Config::new`]).
+    /// - `search` and `domain`: the last of them sets the search domains,
+    ///   `domain` a single one.
+    /// - `options`: `ndots:` (default 1, at most 15), `timeout:` in seconds
+    ///   (default 5, at most 30), `attempts:` per server (default 2),
+    ///   `no-aaaa` ([`IpStrategy::Ipv4Only`]), and `no-tld-query` or
+    ///   `no_tld_query` (`tld_query` off). As in glibc, an option is known
+    ///   by how it starts, so `no-aaaa-x` is `no-aaaa`, a `-` in front of a
+    ///   flag turns it off again (`-no-aaaa`), and a number is read the way
+    ///   `strtol` reads it: `ndots:2x` and `ndots: 2` are 2, and `ndots:x`
+    ///   is 0.
+    ///
+    /// Unlike glibc, later rounds through the servers wait longer; see
+    /// `timeout`. Where glibc takes up to 5 attempts per server, this takes
+    /// at most 3, since RFC 9520 §3.1 allows no more than three sends of a
+    /// query to a server over one transport, and at least 1, where glibc
+    /// would send nothing. A negative `ndots` counts as 0, where glibc keeps
+    /// its low four bits (-2 is 14). And unlike glibc, which reads `#` and
+    /// `;` as a comment only at the start of a line and a carriage return
+    /// as part of the last word, it reads the rest of a line from a `#` or
+    /// `;` on as a comment, and takes lines that end in CRLF.
     ///
     /// Like glibc, it never fails: lines and options it can't use are
-    /// skipped, and so is a link-local server with a named scope
-    /// (`fe80::1%eth0`), since mapping an interface name to its index needs
-    /// a system call; numeric scopes (`fe80::1%2`) work. Other options, such
-    /// as `rotate`, `use-vc` and `edns0` (EDNS is always on), are ignored.
+    /// skipped. So is a server whose scope isn't a number, such as a
+    /// link-local one with a named scope (`fe80::1%eth0`), since mapping an
+    /// interface name to its index needs a system call; glibc maps it, and
+    /// keeps a server whose scope it can't read with scope 0. Other
+    /// options, such as `rotate`, `use-vc` and `edns0` (EDNS is always on),
+    /// are ignored, and so are `sortlist` lines.
     pub fn from_resolv_conf(text: &[u8]) -> Self {
-        let (parsed, _skipped) = resolv_conf::Config::parse_with_errors(text);
+        Self::from_resolv_conf_with_env(text, &ResolvEnv::default())
+    }
+
+    /// [`Config::from_resolv_conf`], with what glibc's `res_init` also reads
+    /// from the process and the host, in [`ResolvEnv`]:
+    ///
+    /// - `LOCALDOMAIN` replaces the file's `search` and `domain` lines, even
+    ///   when it is empty: its words, separated by spaces or tabs up to the
+    ///   first newline, are the search domains.
+    /// - Without it and without a `search` or `domain` line, the search
+    ///   domain is the host name's domain, the part after its first dot.
+    ///   A host name without a dot gives none.
+    /// - `RES_OPTIONS` holds options as an `options` line does, applied
+    ///   after the file's, so they win.
+    pub fn from_resolv_conf_with_env(text: &[u8], env: &ResolvEnv) -> Self {
+        let parsed = ResolvConf::parse(text, env);
         // glibc's MAXNS: later servers are ignored.
-        let mut servers = parsed
-            .nameservers
-            .iter()
-            .filter_map(|ip| match ip {
-                resolv_conf::ScopedIp::V4(v4) => Some(SocketAddr::from((*v4, 53))),
-                resolv_conf::ScopedIp::V6(v6, None) => Some(SocketAddr::from((*v6, 53))),
-                resolv_conf::ScopedIp::V6(v6, Some(scope)) => scope
-                    .parse()
-                    .ok()
-                    .map(|id| SocketAddr::V6(SocketAddrV6::new(*v6, 53, 0, id))),
-            })
-            .take(3);
+        let mut servers = parsed.servers.into_iter().take(3);
         let first = servers
             .next()
             .unwrap_or_else(|| SocketAddr::from((Ipv4Addr::LOCALHOST, 53)));
         let mut config = Self::new(first, servers);
-        config.timeout = Duration::from_secs(u64::from(parsed.timeout.clamp(1, 30)));
+        let options = parsed.options;
+        config.timeout = Duration::from_secs(options.timeout.clamp(1, 30).unsigned_abs());
         let per_server =
-            usize::try_from(parsed.attempts.clamp(1, MAX_SENDS_PER_SERVER.into())).unwrap_or(1);
+            usize::try_from(options.attempts.clamp(1, MAX_SENDS_PER_SERVER.into())).unwrap_or(1);
         config.attempts =
             NonZeroUsize::new(per_server * config.servers.len()).unwrap_or(NonZeroUsize::MIN);
-        config.search = parsed
-            .get_last_search_or_domain()
-            .filter_map(|domain| Name::from_ascii(domain).ok())
-            .map(|mut domain| {
-                domain.set_fqdn(true);
-                domain
-            })
-            .collect();
-        config.ndots = u8::try_from(parsed.ndots.min(15)).unwrap_or(15);
-        if parsed.no_aaaa {
+        config.search = parsed.search.into_iter().filter_map(domain).collect();
+        config.ndots = u8::try_from(options.ndots.clamp(0, 15)).unwrap_or(15);
+        if options.no_aaaa {
             config.ip_strategy = IpStrategy::Ipv4Only;
         }
-        config.tld_query = !parsed.no_tld_query;
+        config.tld_query = !options.no_tld_query;
         config
     }
 
@@ -480,5 +524,305 @@ impl Config {
     #[expect(clippy::indexing_slicing, reason = "servers is never empty")]
     pub(crate) fn server(&self, position: usize) -> SocketAddr {
         self.servers[position % self.servers.len()]
+    }
+}
+
+/// `server`, with the unspecified address replaced by the loopback address
+/// of its family, keeping the port; see [`Config::new`].
+fn loopback_if_unspecified(mut server: SocketAddr) -> SocketAddr {
+    if server.ip().is_unspecified() {
+        server.set_ip(match server {
+            SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        });
+    }
+    server
+}
+
+/// What glibc's `res_init` reads besides `resolv.conf`, for
+/// [`Config::from_resolv_conf_with_env`]: two environment variables and
+/// the host name, each `None` when unset. Each ends at its first NUL byte,
+/// as the C string glibc reads does. The resolver reads none of them
+/// itself; a driver fills this in.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ResolvEnv {
+    /// The `LOCALDOMAIN` environment variable: search domains, separated by
+    /// spaces or tabs, that replace the file's `search` and `domain` lines.
+    /// Only the text before the first newline counts.
+    pub localdomain: Option<Vec<u8>>,
+    /// The `RES_OPTIONS` environment variable: options as on an `options`
+    /// line, applied after the file's.
+    pub res_options: Option<Vec<u8>>,
+    /// The host name, as `gethostname` returns it. Its domain, the part
+    /// after the first dot, is the search domain when neither the file nor
+    /// `LOCALDOMAIN` sets one.
+    pub hostname: Option<Vec<u8>>,
+}
+
+/// What glibc's `res_init` takes from a `resolv.conf` and a [`ResolvEnv`],
+/// before it becomes a [`Config`].
+struct ResolvConf<'a> {
+    /// Every usable `nameserver` line, in order.
+    servers: Vec<SocketAddr>,
+    /// The search domains, as words not yet checked to be names.
+    search: Vec<&'a [u8]>,
+    options: Options,
+}
+
+impl<'a> ResolvConf<'a> {
+    /// Read `text` and `env` as glibc's `res_vinit_1` does, but for the
+    /// comments and line ends described at [`Config::from_resolv_conf`].
+    fn parse(text: &'a [u8], env: &'a ResolvEnv) -> Self {
+        let mut servers = Vec::new();
+        let mut search = None;
+        let mut options = Options::default();
+        for line in text.split(|&byte| byte == b'\n') {
+            // glibc reads each line as a C string.
+            let line = c_str(line);
+            // Unlike glibc: CRLF line ends, and comments after the start of
+            // a line.
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let line = line
+                .split(|&byte| byte == b'#' || byte == b';')
+                .next()
+                .unwrap_or_default();
+            if let Some(rest) = keyword(line, b"nameserver") {
+                servers.extend(words(rest).next().and_then(nameserver));
+            } else if let Some(rest) = keyword(line, b"domain") {
+                search = words(rest).next().map(|domain| vec![domain]).or(search);
+            } else if let Some(rest) = keyword(line, b"search") {
+                let domains: Vec<&[u8]> = words(rest).collect();
+                if !domains.is_empty() {
+                    search = Some(domains);
+                }
+            } else if let Some(rest) = keyword(line, b"options") {
+                options.apply(rest);
+            }
+        }
+        let localdomain = env.localdomain.as_deref().map(|value| {
+            let value = c_str(value)
+                .split(|&byte| byte == b'\n')
+                .next()
+                .unwrap_or_default();
+            words(value).collect()
+        });
+        let search = localdomain.or(search).unwrap_or_else(|| {
+            let hostname = env.hostname.as_deref();
+            hostname.and_then(host_domain).into_iter().collect()
+        });
+        if let Some(text) = env.res_options.as_deref() {
+            options.apply(c_str(text));
+        }
+        Self {
+            servers,
+            search,
+            options,
+        }
+    }
+}
+
+/// The options glibc's `res_setoptions` reads, with its defaults, as it
+/// stores them: the numbers not yet limited.
+#[derive(Clone, Copy, Debug)]
+struct Options {
+    ndots: i64,
+    timeout: i64,
+    attempts: i64,
+    no_aaaa: bool,
+    no_tld_query: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            ndots: 1,
+            timeout: 5,
+            attempts: 2,
+            no_aaaa: false,
+            no_tld_query: false,
+        }
+    }
+}
+
+impl Options {
+    /// Apply the options in `text`, the rest of an `options` line or
+    /// `RES_OPTIONS`, as `res_setoptions` does: an option starts after a
+    /// run of spaces or tabs and is known by how it starts, its number is
+    /// read by `strtol` from there on (which may read past the option's
+    /// end), and a `-` in front of a flag turns it off.
+    fn apply(&mut self, mut text: &[u8]) {
+        loop {
+            text = text
+                .get(text.iter().take_while(|&&byte| is_blank(byte)).count()..)
+                .unwrap_or_default();
+            if text.is_empty() {
+                return;
+            }
+            if let Some(number) = text.strip_prefix(b"ndots:") {
+                self.ndots = strtol(number);
+            } else if let Some(number) = text.strip_prefix(b"timeout:") {
+                self.timeout = strtol(number);
+            } else if let Some(number) = text.strip_prefix(b"attempts:") {
+                self.attempts = strtol(number);
+            } else {
+                let (on, flag) = text
+                    .strip_prefix(b"-")
+                    .map_or((true, text), |flag| (false, flag));
+                if flag.starts_with(b"no-aaaa") {
+                    self.no_aaaa = on;
+                } else if flag.starts_with(b"no-tld-query") || flag.starts_with(b"no_tld_query") {
+                    self.no_tld_query = on;
+                }
+            }
+            let end = text.iter().take_while(|&&byte| !is_blank(byte)).count();
+            text = text.get(end..).unwrap_or_default();
+        }
+    }
+}
+
+/// Whether `byte` separates words on a `resolv.conf` line, as for glibc.
+fn is_blank(byte: u8) -> bool {
+    byte == b' ' || byte == b'\t'
+}
+
+/// The words of `text`, separated by runs of spaces and tabs.
+fn words(text: &[u8]) -> impl Iterator<Item = &[u8]> {
+    text.split(|&byte| is_blank(byte))
+        .filter(|word| !word.is_empty())
+}
+
+/// The rest of `line` after `keyword`, if the line starts with it and a
+/// space or a tab follows, as glibc's `MATCH` asks.
+fn keyword<'a>(line: &'a [u8], keyword: &[u8]) -> Option<&'a [u8]> {
+    let rest = line.strip_prefix(keyword)?;
+    rest.first()
+        .is_some_and(|&byte| is_blank(byte))
+        .then_some(rest)
+}
+
+/// `bytes` up to its first NUL byte, where a C string ends.
+fn c_str(bytes: &[u8]) -> &[u8] {
+    bytes.split(|&byte| byte == 0).next().unwrap_or_default()
+}
+
+/// The domain of `hostname`: the part after its first dot, unless empty.
+fn host_domain(hostname: &[u8]) -> Option<&[u8]> {
+    let hostname = c_str(hostname);
+    let dot = hostname.iter().position(|&byte| byte == b'.')?;
+    hostname.get(dot + 1..).filter(|domain| !domain.is_empty())
+}
+
+/// `word` as an absolute search domain, if it is a valid name.
+fn domain(word: &[u8]) -> Option<Name> {
+    let mut domain = Name::from_ascii(std::str::from_utf8(word).ok()?).ok()?;
+    domain.set_fqdn(true);
+    Some(domain)
+}
+
+/// The server on a `nameserver` line whose address is `word`, on port 53,
+/// as glibc reads it: an IPv4 address in any form `inet_aton` takes, or
+/// else an IPv6 address with an optional scope after `%`. Of the scopes,
+/// only a number is used: an interface name (`fe80::1%eth0`) needs a
+/// system call to map to its index, so such a server is skipped.
+fn nameserver(word: &[u8]) -> Option<SocketAddr> {
+    if let Some(address) = inet_aton(word) {
+        return Some(SocketAddr::from((address, 53)));
+    }
+    let mut parts = word.splitn(2, |&byte| byte == b'%');
+    let address: Ipv6Addr = std::str::from_utf8(parts.next()?).ok()?.parse().ok()?;
+    let scope = match parts.next() {
+        None => 0,
+        Some(scope) if !scope.is_empty() && scope.iter().all(u8::is_ascii_digit) => {
+            std::str::from_utf8(scope).ok()?.parse().ok()?
+        }
+        Some(_) => return None,
+    };
+    Some(SocketAddr::V6(SocketAddrV6::new(address, 53, 0, scope)))
+}
+
+/// `text` as an IPv4 address in any form glibc's `inet_aton` reads, with
+/// nothing after it (`__inet_aton_exact`): one to four numbers separated
+/// by dots, each as [`c_number`] reads it, the last one filling the bytes
+/// the others leave. So `127.1` is 127.0.0.1, `1.2.3` is 1.2.0.3, and
+/// `16843009` is 1.1.1.1.
+fn inet_aton(text: &[u8]) -> Option<Ipv4Addr> {
+    let mut leading = [0u32; 3];
+    let mut count = 0;
+    let mut rest = text;
+    let last = loop {
+        let (number, after) = c_number(rest)?;
+        match after.split_first() {
+            None => break number,
+            Some((b'.', next)) if number <= 0xff => {
+                *leading.get_mut(count)? = number;
+                count += 1;
+                rest = next;
+            }
+            Some(_) => return None,
+        }
+    };
+    if last > u32::MAX >> (8 * count) {
+        return None;
+    }
+    let address = leading
+        .iter()
+        .take(count)
+        .enumerate()
+        .fold(last, |address, (i, byte)| address | byte << (24 - 8 * i));
+    Some(Ipv4Addr::from(address))
+}
+
+/// The number that `text` starts with, as `strtoul` reads it in base 0,
+/// and the rest of `text`: hexadecimal after `0x` or `0X`, octal after a
+/// leading `0`, decimal otherwise. `None` unless `text` starts with a
+/// digit and the number fits in 32 bits.
+fn c_number(text: &[u8]) -> Option<(u32, &[u8])> {
+    let (radix, digits) = match text {
+        [b'0', b'x' | b'X', rest @ ..] if rest.first().is_some_and(u8::is_ascii_hexdigit) => {
+            (16, rest)
+        }
+        [b'0', ..] => (8, text),
+        [first, ..] if first.is_ascii_digit() => (10, text),
+        _ => return None,
+    };
+    let len = digits
+        .iter()
+        .take_while(|&&byte| char::from(byte).is_digit(radix))
+        .count();
+    let (number, rest) = digits.split_at_checked(len)?;
+    let value = number.iter().try_fold(0u32, |value, &byte| {
+        let digit = char::from(byte).to_digit(radix)?;
+        value.checked_mul(radix)?.checked_add(digit)
+    })?;
+    Some((value, rest))
+}
+
+/// The number that `text` starts with, as C's `strtol` reads it in base
+/// 10: after any white space, an optional sign and the digits, saturating
+/// at the bounds; 0 without digits.
+fn strtol(text: &[u8]) -> i64 {
+    let space = |byte: &&u8| matches!(byte, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r');
+    let text = text
+        .get(text.iter().take_while(space).count()..)
+        .unwrap_or_default();
+    let (negative, digits) = match text.split_first() {
+        Some((b'-', rest)) => (true, rest),
+        Some((b'+', rest)) => (false, rest),
+        _ => (false, text),
+    };
+    let value =
+        digits
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .fold(0i64, |value, &digit| {
+                value
+                    .saturating_mul(10)
+                    .saturating_add(i64::from(digit - b'0'))
+            });
+    if negative {
+        value.saturating_neg()
+    } else {
+        value
     }
 }

@@ -1,5 +1,6 @@
 //! DNS over TLS (RFC 7858) sessions, driven with in-memory buffers.
 
+use std::fmt;
 use std::io::{ErrorKind, Read, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -30,11 +31,39 @@ pub enum TlsConfigError {
 
 /// The rustls configuration, and the name each server's certificate must
 /// match.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct Settings {
     client: Arc<rustls::ClientConfig>,
-    /// Each server's authentication domain name (RFC 8310 §7.1).
+    /// Each server's authentication domain name (RFC 8310 §7.1), once per
+    /// server, in the order of the servers.
     names: Vec<(SocketAddr, ServerName<'static>)>,
+}
+
+/// Shows each server's authentication name and the ALPN protocols offered,
+/// not the rustls configuration, which is long and mostly internal.
+impl fmt::Debug for Settings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let alpn: Vec<_> = self
+            .client
+            .alpn_protocols
+            .iter()
+            .map(|protocol| String::from_utf8_lossy(protocol))
+            .collect();
+        f.debug_struct("Settings")
+            .field("names", &Names(&self.names))
+            .field("alpn", &alpn)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Shows the authentication names as a map from server to name.
+struct Names<'a>(&'a [(SocketAddr, ServerName<'static>)]);
+
+impl fmt::Debug for Names<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names = self.0.iter().map(|(server, name)| (server, name.to_str()));
+        f.debug_map().entries(names).finish()
+    }
 }
 
 impl Settings {
@@ -53,25 +82,33 @@ impl Settings {
         if let Some((server, _)) = names.iter().find(|(s, _)| !servers.contains(s)) {
             return Err(TlsConfigError::UnknownServer(*server));
         }
-        if let Some(server) = servers
-            .iter()
-            .find(|s| !names.iter().any(|(named, _)| named == *s))
-        {
-            return Err(TlsConfigError::NoName(*server));
+        // The last name given for an address counts.
+        let mut named: Vec<(SocketAddr, ServerName<'static>)> = Vec::new();
+        for server in servers {
+            if named.iter().any(|(s, _)| s == server) {
+                continue;
+            }
+            let (_, name) = names
+                .iter()
+                .rfind(|(s, _)| s == server)
+                .ok_or(TlsConfigError::NoName(*server))?;
+            named.push((*server, name.clone()));
         }
         for (_, name) in &names {
             ClientConnection::new(Arc::clone(&client), name.clone())?;
         }
-        Ok(Self { client, names })
+        Ok(Self {
+            client,
+            names: named,
+        })
     }
 
     /// A new session with `server`, and its first bytes (the ClientHello).
     pub(crate) fn connect(&self, server: SocketAddr) -> Result<(Session, Vec<u8>), String> {
-        // The last name given for an address counts.
         let name = self
             .names
             .iter()
-            .rfind(|(named, _)| *named == server)
+            .find(|(named, _)| *named == server)
             .map(|(_, name)| name.clone())
             .ok_or_else(|| format!("no authentication name for {server}"))?;
         let mut connection =
@@ -81,6 +118,7 @@ impl Settings {
         let session = Session {
             connection,
             early: Vec::new(),
+            alerted: false,
         };
         Ok((session, hello))
     }
@@ -91,11 +129,12 @@ impl Settings {
 /// It is handshaking first, holding the messages written meanwhile in
 /// `early`, and established once [`Session::receive`] finds the handshake
 /// done, when it sends them. In either phase, the server's close_notify
-/// ([`Received::closed`]) or a TLS error from `receive` or
-/// [`Session::send`] ends it, and the resolver then shuts its connection
-/// in the same call, which sends what [`Session::close`] returns. A
-/// connection the resolver shuts for another reason closes its session
-/// the same way, and one the driver reports gone drops it.
+/// ([`Received::closed`]) or a TLS error from `receive`
+/// ([`Received::error`]) or [`Session::send`] ends it, and the resolver
+/// then shuts its connection in the same call, which sends what
+/// [`Session::close`] returns. A connection the resolver shuts for another
+/// reason closes its session the same way, and one the driver reports gone
+/// drops it.
 #[derive(Debug)]
 pub(crate) struct Session {
     connection: ClientConnection,
@@ -103,19 +142,27 @@ pub(crate) struct Session {
     /// as it has. rustls itself would hold only 64 KiB of them and then
     /// take part of a message, breaking the framing (RFC 7858 §3.3).
     early: Vec<u8>,
+    /// Whether the server sent a fatal alert, after which nothing more may
+    /// be sent (RFC 8446 §6.2). rustls doesn't record it.
+    alerted: bool,
 }
 
 /// What [`Session::receive`] got from the bytes fed to it.
 #[derive(Debug)]
 pub(crate) struct Received {
     /// The bytes to send back, and any messages that waited for the
-    /// handshake.
+    /// handshake. Empty after an error.
     pub(crate) reply: Vec<u8>,
-    /// The decrypted bytes.
+    /// The decrypted bytes, also those decrypted before an error.
     pub(crate) plaintext: Vec<u8>,
     /// Whether the server sent close_notify: it sends nothing more (RFC
     /// 8446 §6.1).
     pub(crate) closed: bool,
+    /// The TLS error that ended the session, such as a bad certificate, a
+    /// record that doesn't decrypt or a fatal alert from the server. The
+    /// records before the one that failed still count: their plaintext is
+    /// in `plaintext`.
+    pub(crate) error: Option<String>,
 }
 
 impl Session {
@@ -133,54 +180,81 @@ impl Session {
         Ok(out)
     }
 
-    /// Feed bytes read from the connection, or fail with the TLS error (a
-    /// bad certificate, say). After an error, [`Session::close`] returns
-    /// the alert that tells the server, if rustls queued one, and otherwise
-    /// close_notify.
-    pub(crate) fn receive(&mut self, mut data: &[u8]) -> Result<Received, String> {
+    /// Feed bytes read from the connection. A TLS error (a bad certificate,
+    /// say) ends the session, and comes back with the plaintext of the
+    /// records before it: an answer that arrived intact is still good
+    /// (RFC 7858 §3.3). After an error, [`Session::close`] returns the
+    /// alert that tells the server, if rustls queued one, nothing if the
+    /// error was the server's fatal alert, and otherwise close_notify.
+    pub(crate) fn receive(&mut self, mut data: &[u8]) -> Received {
         let mut plaintext = Vec::new();
         let mut closed = false;
+        let mut error = None;
         while !data.is_empty() && !closed {
-            let read = self
-                .connection
-                .read_tls(&mut data)
-                .map_err(|e| e.to_string())?;
-            let state = self
-                .connection
-                .process_new_packets()
-                .map_err(|e| e.to_string())?;
+            let read = match self.connection.read_tls(&mut data) {
+                Ok(read) => read,
+                Err(e) => {
+                    error = Some(e.to_string());
+                    break;
+                }
+            };
+            let processed = self.connection.process_new_packets();
             // rustls holds at most 16 KiB of plaintext: take it out before
-            // reading more.
+            // reading more, and after an error, which leaves what the
+            // records before it decrypted.
             match self.connection.reader().read_to_end(&mut plaintext) {
                 Ok(_) => {}
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                Err(e) => return Err(e.to_string()),
+                Err(e) => error = Some(e.to_string()),
             }
-            // After the server's close_notify, what follows is ignored (RFC
-            // 8446 §6.1).
-            closed = state.peer_has_closed();
-            if read == 0 {
+            match processed {
+                // After the server's close_notify, what follows is ignored
+                // (RFC 8446 §6.1).
+                Ok(state) => closed = state.peer_has_closed(),
+                Err(e) => {
+                    self.alerted = matches!(e, rustls::Error::AlertReceived(_));
+                    error = Some(e.to_string());
+                }
+            }
+            if read == 0 || error.is_some() {
                 break;
             }
         }
         let mut reply = Vec::new();
-        flush(&mut self.connection, &mut reply)?;
-        if !self.connection.is_handshaking() && !self.early.is_empty() {
-            let early = std::mem::take(&mut self.early);
-            write(&mut self.connection, &early, &mut reply)?;
+        if error.is_none() {
+            error = self.reply(&mut reply).err();
         }
-        Ok(Received {
+        if error.is_some() {
+            reply.clear();
+        }
+        Received {
             reply,
             plaintext,
             closed,
-        })
+            error,
+        }
+    }
+
+    /// Move into `out` what rustls has to send, and the messages that
+    /// waited for the handshake once it is done.
+    fn reply(&mut self, out: &mut Vec<u8>) -> Result<(), String> {
+        flush(&mut self.connection, out)?;
+        if !self.connection.is_handshaking() && !self.early.is_empty() {
+            let early = std::mem::take(&mut self.early);
+            write(&mut self.connection, &early, out)?;
+        }
+        Ok(())
     }
 
     /// The last bytes to send before closing the connection: the alert
     /// rustls queued for a TLS error, which already ends the session (RFC
     /// 8446 §6.2), or, if it queued none, the close_notify alert (§6.1).
-    /// Empty if rustls can't produce them.
+    /// Nothing after a fatal alert from the server, which ends the session
+    /// at once (§6.2), and nothing if rustls can't produce them.
     pub(crate) fn close(&mut self) -> Vec<u8> {
+        if self.alerted {
+            return Vec::new();
+        }
         self.connection.send_close_notify();
         let mut out = Vec::new();
         // Nothing to send if rustls can't produce it.

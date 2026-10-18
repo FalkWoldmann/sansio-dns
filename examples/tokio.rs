@@ -37,7 +37,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut resolver = Resolver::new(Config::new(server, []));
     let query = resolver.query(name, RecordType::A, Instant::now())?;
 
-    let mut buf = [0; 4096];
+    // Holds any datagram: a server may send more than the 1232 bytes queries advertise.
+    let mut buf = vec![0; 65535];
     loop {
         while let Some(t) = resolver.poll_transmit() {
             match t.transport {

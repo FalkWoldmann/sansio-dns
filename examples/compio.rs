@@ -30,6 +30,9 @@ use compio::time::{timeout, timeout_at};
 use sansio_dns::hickory_proto::rr::{Name, RecordType};
 use sansio_dns::{Config, ConnectionId, Event, Resolver, Transmit, Transport};
 
+/// Holds any datagram: a server may send more than the 1232 bytes queries advertise.
+const BUF: usize = 65535;
+
 #[compio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -41,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut resolver = Resolver::new(Config::new(server, []));
     let query = resolver.query(name, RecordType::A, Instant::now())?;
 
-    let mut buf = Vec::with_capacity(4096);
+    let mut buf = Vec::with_capacity(BUF);
     loop {
         while let Some(t) = resolver.poll_transmit() {
             match t.transport {
@@ -100,7 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(_elapsed) => {
-                    buf = Vec::with_capacity(4096);
+                    buf = Vec::with_capacity(BUF);
                     resolver.handle_timeout(Instant::now());
                     tcp = Some((connection, stream));
                 }
@@ -122,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Err(_elapsed) => {
-                buf = Vec::with_capacity(4096);
+                buf = Vec::with_capacity(BUF);
                 resolver.handle_timeout(Instant::now());
             }
         }

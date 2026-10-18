@@ -372,6 +372,7 @@ mod section_6 {
             .collect();
         assert_eq!(ttls, [(RecordType::SOA, 200), (RecordType::NS, 200)]);
         assert!(response.answers.is_empty() && response.additionals.is_empty());
+        assert_eq!(response.metadata.id, 0, "no message was sent for it");
     }
 }
 

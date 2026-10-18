@@ -103,8 +103,9 @@
 //! else over UDP.
 //!
 //! A query that times out on a stream closes the connection only if no
-//! response has arrived on it since the query was written there; the other
-//! queries on it then move as the table says. If a response has arrived,
+//! complete response, matched or not, has arrived on it since the query
+//! was written there; the other queries on it then move as the table
+//! says. If a response has arrived,
 //! the server is only slow with this query, which RFC 7766 §7 expects of
 //! pipelined queries: the connection stays open, and the query's request
 //! stays outstanding on it. If a later attempt comes back to that
@@ -122,10 +123,18 @@
 //! asked for ends the query. So does `NXDOMAIN` or NODATA with no candidate left:
 //! the outcome is then the first NODATA answer if a candidate gave one,
 //! else the last `NXDOMAIN` (see [`Resolver::query`]). A query that fails
-//! on a candidate ends the search with that error. [`IpLookup`] walks the
-//! candidates itself, with an A and an AAAA query per candidate, and moves
-//! on when neither has an address; a failure, or an answer whose CNAME
-//! chain loops ([`Error::CnameLoop`]), ends its search.
+//! on a candidate, with `SERVFAIL`, `REFUSED` or any other failure, ends
+//! the search with that error, as musl's resolver does: a temporary
+//! failure for the name meant must not turn into an answer for another
+//! name. glibc's `res_search` goes on to the search domains after any
+//! failure on the name as given when that comes first; among the search
+//! domains it moves on only after `SERVFAIL`, and after another failure it
+//! stops and still tries the name as given if that comes last, unless no
+//! server could be reached at all.
+//! [`IpLookup`] walks the candidates itself, with an A and an AAAA query
+//! per candidate, and moves on when neither has an address; a failure, or
+//! an answer whose CNAME chain loops ([`Error::CnameLoop`]), ends its
+//! search.
 //!
 //! Each search candidate is sent at most three times to each server over
 //! each transport, UDP and TCP, or TLS (RFC 9520 §3.1). Every send counts:
@@ -215,9 +224,10 @@
 //! namespace differently. A query the cache answers gets the server's
 //! answer for the question it asks, with the authority section the server
 //! sent (the SOA record, and NS or NSEC records if any), no answer or
-//! additional section and no OPT record (RFC 6891 §6.2.1), AA clear, and
-//! each TTL less the whole seconds the answer has been cached, none above
-//! the entry's lifetime (RFC 2308 §6).
+//! additional section and no OPT record (RFC 6891 §6.2.1), AA clear,
+//! message ID 0, since no message was sent for it, and each TTL less the
+//! whole seconds the answer has been cached, none above the entry's
+//! lifetime (RFC 2308 §6).
 //! In a search, such an answer moves on to the next candidate without a
 //! transmit, so a search list doesn't ask the servers about the same
 //! nonexistent names again and again, which meets RFC 1123 §6.1.4.3 (a)
@@ -246,10 +256,11 @@
 //! [`Transport::TcpClose`], close it once the payloads before it are
 //! written. With TLS the last of them carries the close_notify alert, which
 //! must go out before the connection closes (RFC 8446 §6.1), or the alert
-//! that ends a session that failed (§6.2). A connection still connecting
-//! when its `TcpClose` comes can be dropped at once: nothing written to it
-//! has gone out. Pass everything read from a
-//! connection to [`Resolver::handle_stream_data`]. Call
+//! that ends a session that failed (§6.2); after a fatal alert from the
+//! server, nothing is written before the close (§6.2). A connection still
+//! connecting when its `TcpClose` comes can be dropped at once: nothing
+//! written to it has gone out. Pass everything read from a connection to
+//! [`Resolver::handle_stream_data`]. Call
 //! [`Resolver::handle_stream_closed`] when the server closes it, and
 //! [`Resolver::handle_stream_error`] when connecting, reading or writing
 //! fails. Payloads are already length-prefixed (RFC 7766 §8) or
@@ -299,8 +310,11 @@
 //! [`Resolver::handle_datagram`]; the resolver checks the rest of §9.1:
 //! source address and port, message ID and question. Pass the source
 //! address as received (an IPv4 server seen as `::ffff:a.b.c.d` on a
-//! dual-stack socket won't match), and read into a buffer of at least 1232
-//! bytes, the payload size the queries advertise.
+//! dual-stack socket won't match), and read into a buffer that holds any
+//! UDP datagram, 65535 bytes, not just the 1232 the queries advertise as
+//! their payload size: a server may send more, and the resolver uses such
+//! an answer, which a smaller buffer would cut off so that it doesn't
+//! decode.
 //!
 //! When binding or connecting a query's socket or sending its datagram
 //! fails, or receiving on it reports an error, typically an ICMP port or
@@ -308,7 +322,10 @@
 //! [`Resolver::handle_udp_error`], so the query moves on at once instead of
 //! waiting out its deadline. An error doesn't end the socket: keep
 //! receiving on it while the query's attempts go to that server, and bind
-//! a new one when an attempt goes to another.
+//! a new one when an attempt goes to another. Not every refused datagram
+//! draws an error: macOS, for one, rate-limits ICMP port unreachable
+//! messages, so a datagram refused soon after another may get none, and
+//! its query then waits out its deadline.
 //!
 //! When the host's network changes, such as a new address or a new
 //! default route, call [`Resolver::flush_cache`]: failures and negative
@@ -331,7 +348,7 @@ mod resolver;
 mod tls;
 mod wire;
 
-pub use config::{Config, IpStrategy};
+pub use config::{Config, IpStrategy, ResolvEnv};
 pub use hosts::Hosts;
 pub use lookup::{IpLookup, Progress, addresses};
 pub use resolver::Resolver;
@@ -361,8 +378,9 @@ pub enum Transport {
     /// Close this connection, once the payloads of the transmits before it
     /// are written: over TLS, the last one carries the close_notify alert,
     /// or after a TLS error the alert for that error (RFC 8446 §6.1, §6.2).
-    /// A connection still connecting can be dropped at once. The payload is
-    /// empty.
+    /// After a fatal alert from the server there is none: the connection
+    /// closes at once (§6.2). A connection still connecting can be dropped
+    /// at once. The payload is empty.
     TcpClose(ConnectionId),
 }
 
@@ -384,7 +402,9 @@ pub enum Event {
     /// A server answered with `NOERROR` or `NXDOMAIN`, or the name was
     /// answered locally or from the cache. Empty answers arrive here too;
     /// inspect `response.metadata.response_code`. TTLs received with the
-    /// most significant bit set are zero here (RFC 2181 §8).
+    /// most significant bit set are zero here (RFC 2181 §8). An answer
+    /// given locally or from the cache has message ID 0: no message was
+    /// sent for it.
     Response {
         /// The query that completed.
         query: QueryId,

@@ -10,5 +10,6 @@ mod common;
 mod lookup;
 #[cfg(feature = "reqwest")]
 mod reqwest;
+mod system_conf;
 #[cfg(feature = "tls")]
 mod tls;

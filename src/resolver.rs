@@ -319,7 +319,7 @@ enum Deadline {
 /// |---|---|---|---|
 /// | `handle_stream_closed`, `handle_stream_error` | `lost` | no | sent again or moved on (`move_off`) |
 /// | the server's close_notify, in `handle_stream_data` | `shut` | yes | the same, after the answers that came before it |
-/// | a TLS error on bytes read from it, or a write TLS refuses | `abort` | yes | moved on (`retry`) |
+/// | a TLS error on bytes read from it, the server's fatal alert among them, or a write TLS refuses | `abort` | yes | moved on (`retry`), after the answers decrypted before the error |
 /// | a query on it times out with no response since `written_after`, or one more `Orphan` would go past `MAX_ORPHANS` | `time_out_stream` | yes | sent again if their deadline hasn't passed, they have room and their free resend is left (`use_free_resend`), else moved on |
 /// | its idle deadline passes (`handle_timeout`) | `shut` | yes | none: no query is on it |
 /// | `shutdown` | `shut` | yes | none left |
@@ -346,11 +346,11 @@ struct Connection {
     /// (`Resolver::new_message`), so no two requests outstanding on it
     /// share one unless all 65536 are in use.
     orphans: Vec<Orphan>,
-    /// Whether the server ended it (its close_notify arrived) while the
-    /// answers that came before are still being acted on: nothing more is
-    /// sent on it, and it is closed once they are done. True only within
-    /// the `handle_stream_data` call that took in the close_notify, which
-    /// removes the connection before it returns.
+    /// Whether the session ended, by the server's close_notify or a TLS
+    /// error, while the answers that came before are still being acted on:
+    /// nothing more is sent on it, and it is closed once they are done.
+    /// True only within the `handle_stream_data` call that took in the
+    /// bytes that ended it, which removes the connection before it returns.
     closing: bool,
     /// The TLS session, when using DNS over TLS.
     #[cfg(feature = "tls")]
@@ -367,6 +367,9 @@ struct Incoming {
     /// Whether the server's close_notify arrived: what followed it is
     /// ignored (RFC 8446 §6.1).
     closed: bool,
+    /// The TLS error that ended the session. The bytes decrypted before it
+    /// are kept.
+    failed: Option<Error>,
 }
 
 impl Connection {
@@ -376,24 +379,21 @@ impl Connection {
         self.server == server && !self.closing
     }
 
-    /// Take in `data` read from it, through the TLS session if it has one,
-    /// or fail with the TLS error, keeping nothing.
-    #[cfg_attr(
-        not(feature = "tls"),
-        expect(clippy::unnecessary_wraps, reason = "only a TLS session can fail")
-    )]
-    fn receive(&mut self, data: &[u8]) -> Result<Incoming, Error> {
+    /// Take in `data` read from it, through the TLS session if it has one.
+    /// After a TLS error, it keeps what the records before it decrypted.
+    fn receive(&mut self, data: &[u8]) -> Incoming {
         #[cfg(feature = "tls")]
         if let Some(session) = &mut self.tls {
-            let received = session.receive(data).map_err(Error::Tls)?;
+            let received = session.receive(data);
             self.received.extend_from_slice(&received.plaintext);
-            return Ok(Incoming {
+            return Incoming {
                 to_send: received.reply,
                 closed: received.closed,
-            });
+                failed: received.error.map(Error::Tls),
+            };
         }
         self.received.extend_from_slice(data);
-        Ok(Incoming::default())
+        Incoming::default()
     }
 }
 
@@ -526,10 +526,16 @@ impl Resolver {
     /// When the candidates run out, the event carries the first NODATA
     /// answer if there was one, else the last NXDOMAIN. A query that fails
     /// on a candidate, out of attempts or servers, ends the search with
-    /// that error. Without search domains, `example.com` and
-    /// `example.com.` send the same question, but only a query for the same
-    /// name as given (trailing dot included, case ignored) joins one in
-    /// flight.
+    /// that error, whatever the error, `SERVFAIL` and `REFUSED` included,
+    /// as musl's resolver does: a temporary failure for the name meant must
+    /// not turn into an answer for another name. glibc's `res_search` goes
+    /// on to the search domains after any failure on the name as given when
+    /// that comes first; among the search domains it moves on only after
+    /// `SERVFAIL`, and after another failure it stops and still tries the
+    /// name as given if that comes last, unless no server could be reached
+    /// at all. Without search domains, `example.com` and `example.com.`
+    /// send the same question, but only a query for the same name as given
+    /// (trailing dot included, case ignored) joins one in flight.
     ///
     /// Each candidate is looked up in the cache first (see the crate docs):
     /// a cached NXDOMAIN or NODATA moves the search on without a transmit,
@@ -664,9 +670,13 @@ impl Resolver {
     /// trickles bytes can't keep it open. Over TLS, the bytes go through
     /// the session first, which may queue a [`Transport::TcpWrite`]: the
     /// rest of the handshake, and then the queries that waited for it. A
-    /// TLS error closes the connection, after the alert rustls queued for
-    /// it (RFC 8446 §6.2), or its close_notify if it queued none, and moves
-    /// its queries on to their next attempt.
+    /// TLS error, such as a record that doesn't decrypt or a fatal alert
+    /// from the server, ends the session: the answers decrypted before it
+    /// in the same bytes count, and then the connection is closed and its
+    /// queries move on to their next attempt. Before the close, the
+    /// resolver sends the alert rustls queued for the error (RFC 8446
+    /// §6.2), or close_notify if it queued none; after a fatal alert from
+    /// the server it sends nothing and closes at once (§6.2).
     /// When the server's close_notify arrives, the answers before it count
     /// and anything after it is ignored (RFC 8446 §6.1): the resolver
     /// sends its own close_notify, closes the connection and moves its
@@ -679,15 +689,13 @@ impl Resolver {
         let Some(conn) = self.connections.get_mut(&connection) else {
             return;
         };
-        let Incoming { to_send, closed } = match conn.receive(data) {
-            Ok(incoming) => incoming,
-            Err(error) => {
-                self.abort(connection, now, &error);
-                return;
-            }
-        };
+        let Incoming {
+            to_send,
+            closed,
+            failed,
+        } = conn.receive(data);
         // Answers that move a query on must not send it here.
-        conn.closing = closed;
+        conn.closing = closed || failed.is_some();
         let server = conn.server;
         self.queue_write(connection, server, to_send);
         // One message at a time: acting on an answer may change this
@@ -719,7 +727,9 @@ impl Resolver {
                 None => {}
             }
         }
-        if closed && let Some(conn) = self.shut(connection) {
+        if let Some(error) = failed {
+            self.abort(connection, now, &error);
+        } else if closed && let Some(conn) = self.shut(connection) {
             self.move_off(connection, conn.responses, now, &Error::ConnectionClosed);
         }
     }
@@ -769,6 +779,11 @@ impl Resolver {
     /// a late report can't skip an attempt to another server. Report the
     /// failure as soon as it happens: with one server, a late one would
     /// still use up the current attempt.
+    ///
+    /// Not every refused datagram draws an ICMP error: macOS, for one,
+    /// rate-limits port unreachable messages, so a datagram refused soon
+    /// after another may get none, and the query then waits out its
+    /// deadline.
     pub fn handle_udp_error(
         &mut self,
         query: QueryId,
@@ -1269,8 +1284,9 @@ impl Resolver {
     // - neighbour timed out on the connection, or it was closed for holding
     //   too many orphans: `time_out_stream`, then `use_free_resend` and
     //   `emit` (the same `free_resend_used` flag), else `retry`
-    // - connection that never answered lost, TLS error on received bytes,
-    //   TLS write refused (`emit`): `move_off` or `abort`, then `retry`
+    // - connection that never answered lost, TLS error on received bytes
+    //   (after the answers decrypted before it), TLS write refused
+    //   (`emit`): `move_off` or `abort`, then `retry`
     // - NXDOMAIN or NODATA, with candidates left: `search_on`, then
     //   `next_candidate`, which resets all of the above with a new
     //   `Pending`
@@ -1814,11 +1830,12 @@ impl Resolver {
     }
 
     /// Abort `connection`, whose TLS session failed with `error` while
-    /// taking in bytes read from it (`handle_stream_data`) or on a write
-    /// (`emit`): shut it (`shut`), then `retry` every query on it, which
-    /// fails one that is out of attempts or servers with `error`. Not a TCP
-    /// reset: the driver gets the same [`Transport::TcpClose`] as for any
-    /// other close.
+    /// taking in bytes read from it (`handle_stream_data`, once the answers
+    /// decrypted before the error are handled) or on a write (`emit`):
+    /// shut it (`shut`), then `retry` every query on it, which fails one
+    /// that is out of attempts or servers with `error`. Not a TCP reset:
+    /// the driver gets the same [`Transport::TcpClose`] as for any other
+    /// close.
     fn abort(&mut self, connection: ConnectionId, now: Instant, error: &Error) {
         if self.shut(connection).is_none() {
             return;
@@ -1833,7 +1850,7 @@ impl Resolver {
     /// [`Transport::TcpWrite`] the driver writes before closing. They end
     /// with the alert rustls queued for a TLS error, which ends the session
     /// (RFC 8446 §6.2), or, if it queued none, with its close_notify alert
-    /// (§6.1).
+    /// (§6.1). After a fatal alert from the server there are none (§6.2).
     fn shut(&mut self, connection: ConnectionId) -> Option<Connection> {
         #[cfg_attr(
             not(feature = "tls"),

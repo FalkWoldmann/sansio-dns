@@ -35,7 +35,6 @@ tokio = "1"
 
 [dependencies]
 hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
-resolv-conf = "0.7"
 thiserror.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["std"], optional = true }
 

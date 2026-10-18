@@ -1,14 +1,16 @@
 //! RFC 6891, Extension Mechanisms for DNS (EDNS(0)).
 //! <https://rfc-annotations.research.icann.org/rfc6891.html>
 
+use std::net::Ipv4Addr;
 use std::time::Instant;
 
 use crate::common::*;
 use hickory_proto::op::ResponseCode;
-use hickory_proto::rr::RecordType;
+use hickory_proto::rr::rdata::A;
+use hickory_proto::rr::{RData, Record, RecordType};
 use insta::assert_snapshot;
 use rstest::rstest;
-use sansio_dns::Resolver;
+use sansio_dns::{Event, Resolver};
 
 /// §6.1.1 / §6.2.3: the query carries exactly one OPT record advertising a
 /// payload size of at least 512 octets that avoids fragmentation.
@@ -21,6 +23,31 @@ mod section_6_2_3 {
         let edns = sent.edns.expect("query carries OPT");
         assert_eq!(edns.max_payload(), 1232);
         assert_eq!(edns.version(), 0);
+    }
+
+    /// The payload size says what the requestor can take; nothing in the
+    /// RFC has it drop a larger datagram that arrived whole. One from a
+    /// server that ignores the size is used, as glibc, which reads up to
+    /// 64 KiB, uses it too.
+    #[rstest]
+    fn larger_answer_is_used(mut resolver: Resolver) {
+        let now = Instant::now();
+        let sent = start(&mut resolver, now);
+        let mut response = reply(&sent);
+        let name = response.queries[0].name().clone();
+        for i in 1..400 {
+            let address = Ipv4Addr::from(u32::from(ADDR) + i);
+            response.add_answer(Record::from_rdata(name.clone(), 300, RData::A(A(address))));
+        }
+        let bytes = encode(&response);
+        assert!(bytes.len() > 4096, "{} bytes", bytes.len());
+
+        resolver.handle_datagram(udp(&sent), sent.destination, &bytes, now);
+
+        let Some(Event::Response { response, .. }) = resolver.poll_event() else {
+            panic!("expected the answer");
+        };
+        assert_eq!(response.answers.len(), 400);
     }
 }
 

@@ -7,7 +7,10 @@
 //! left out, and a name of one label as given too with `options
 //! no-tld-query`, each answered NXDOMAIN, or NODATA for one of them, until
 //! the one chosen to have data. When none has, the walk ends on the NODATA
-//! answer if there was one.
+//! answer if there was one. The environment glibc reads besides the file
+//! is generated too: `LOCALDOMAIN` must replace the search domains,
+//! `RES_OPTIONS` must win over the file's options, and the host name's
+//! domain must be the search domain when nothing else sets one.
 
 #![no_main]
 
@@ -19,7 +22,7 @@ use libfuzzer_sys::fuzz_target;
 use sansio_dns::hickory_proto::op::{Message, ResponseCode};
 use sansio_dns::hickory_proto::rr::domain::usage::{INVALID, LOCALHOST, ONION};
 use sansio_dns::hickory_proto::rr::{Name, RecordType};
-use sansio_dns::{Config, Event, Hosts, Transport, addresses};
+use sansio_dns::{Config, Event, Hosts, ResolvEnv, Transport, addresses};
 use sansio_dns_fuzz::{Harness, reply};
 
 /// Labels for every generated name, so lookups often hit listed names and
@@ -78,6 +81,25 @@ enum ConfLine<'a> {
     Raw(&'a [u8]),
 }
 
+/// An option in `RES_OPTIONS`.
+#[derive(Arbitrary, Debug)]
+enum EnvOption<'a> {
+    Ndots(u8),
+    /// `no-tld-query`, or with `true` `no_tld_query`.
+    NoTldQuery(bool),
+    /// `-no-tld-query`, which turns it off again.
+    TldQuery,
+    Raw(&'a [u8]),
+}
+
+/// What glibc reads besides `resolv.conf`.
+#[derive(Arbitrary, Debug)]
+struct Env<'a> {
+    localdomain: Option<Vec<Labels>>,
+    res_options: Option<Vec<EnvOption<'a>>>,
+    hostname: Option<Labels>,
+}
+
 #[derive(Arbitrary, Debug)]
 enum HostsLine<'a> {
     Entry(IpAddr, Labels, Vec<Labels>),
@@ -111,6 +133,7 @@ struct Step<'a> {
 struct Input<'a> {
     hosts: Vec<HostsLine<'a>>,
     resolv_conf: Vec<ConfLine<'a>>,
+    env: Env<'a>,
     steps: Vec<Step<'a>>,
 }
 
@@ -154,6 +177,79 @@ fn render_resolv_conf(lines: &[ConfLine<'_>]) -> Vec<u8> {
         };
     }
     text
+}
+
+/// `RES_OPTIONS` and the settings it must leave: `ndots` and `tld_query`,
+/// if it sets them and has no raw bytes that might too.
+fn render_res_options(options: &[EnvOption<'_>]) -> (Vec<u8>, Option<u8>, Option<bool>) {
+    let mut text = Vec::new();
+    let (mut ndots, mut tld_query, mut raw) = (None, None, false);
+    for option in options.iter().take(8) {
+        let _ = match option {
+            EnvOption::Ndots(n) => {
+                ndots = Some((*n).min(15));
+                write!(text, " ndots:{n}")
+            }
+            EnvOption::NoTldQuery(underscores) => {
+                tld_query = Some(false);
+                let option = if *underscores {
+                    "no_tld_query"
+                } else {
+                    "no-tld-query"
+                };
+                write!(text, "\t{option}")
+            }
+            EnvOption::TldQuery => {
+                tld_query = Some(true);
+                write!(text, " -no-tld-query")
+            }
+            EnvOption::Raw(bytes) => {
+                raw = true;
+                text.write_all(b" ").and_then(|()| text.write_all(bytes))
+            }
+        };
+    }
+    if raw {
+        (text, None, None)
+    } else {
+        (text, ndots, tld_query)
+    }
+}
+
+/// `labels` as an absolute name.
+fn absolute(labels: &str) -> Name {
+    let mut name = Name::from_ascii(labels).expect("labels from LABELS");
+    name.set_fqdn(true);
+    name
+}
+
+/// The search domains the environment must leave, if it settles them:
+/// `LOCALDOMAIN`'s, or else the host name's domain when the file sets
+/// none (and has no raw lines that might).
+fn expected_search(env: &Env<'_>, lines: &[ConfLine<'_>]) -> Option<Vec<Name>> {
+    if let Some(domains) = &env.localdomain {
+        return Some(
+            domains
+                .iter()
+                .take(6)
+                .map(|d| absolute(&d.render()))
+                .collect(),
+        );
+    }
+    let file_may_set = lines.iter().take(16).any(|line| match line {
+        ConfLine::Search(domains) => !domains.is_empty(),
+        ConfLine::Domain(_) | ConfLine::Raw(_) => true,
+        _ => false,
+    });
+    if file_may_set {
+        return None;
+    }
+    let hostname = env.hostname.as_ref().map(Labels::render);
+    let domain = hostname
+        .as_deref()
+        .and_then(|h| h.split_once('.'))
+        .map(|(_, d)| absolute(d));
+    Some(domain.into_iter().collect())
 }
 
 fn is_special_use(name: &Name) -> bool {
@@ -267,7 +363,31 @@ fuzz_target!(|input: Input<'_>| {
             "{text} {address} missing from the hosts entries"
         );
     }
-    let mut config = Config::from_resolv_conf(&render_resolv_conf(&input.resolv_conf));
+    let mut env = ResolvEnv::default();
+    env.localdomain = input.env.localdomain.as_ref().map(|domains| {
+        let domains: Vec<String> = domains.iter().take(6).map(Labels::render).collect();
+        domains.join(" ").into_bytes()
+    });
+    let (res_options, ndots, tld_query) = match &input.env.res_options {
+        Some(options) => {
+            let (text, ndots, tld_query) = render_res_options(options);
+            (Some(text), ndots, tld_query)
+        }
+        None => (None, None, None),
+    };
+    env.res_options = res_options;
+    env.hostname = input.env.hostname.as_ref().map(|h| h.render().into_bytes());
+    let mut config =
+        Config::from_resolv_conf_with_env(&render_resolv_conf(&input.resolv_conf), &env);
+    if let Some(search) = expected_search(&input.env, &input.resolv_conf) {
+        assert_eq!(config.search, search, "the environment's search domains");
+    }
+    if let Some(ndots) = ndots {
+        assert_eq!(config.ndots, ndots, "RES_OPTIONS's ndots");
+    }
+    if let Some(tld_query) = tld_query {
+        assert_eq!(config.tld_query, tld_query, "RES_OPTIONS's no-tld-query");
+    }
     config.hosts = hosts.clone();
     let (search, ndots, tld_query) = (config.search.clone(), config.ndots, config.tld_query);
     let mut harness = Harness::new(config, Vec::new(), None);
