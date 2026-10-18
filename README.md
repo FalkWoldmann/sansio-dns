@@ -1,5 +1,9 @@
 # sansio-dns
 
+> [!WARNING]
+> This is an experiment: me trying out sans-IO and the DNS RFCs. It is incomplete and
+> probably incorrect in places, so don't rely on it for anything that matters.
+
 A sans-IO DNS stub resolver built on [`hickory-proto`](https://crates.io/crates/hickory-proto).
 It owns no sockets, timers or tasks, so the same state machine runs on blocking std,
 Tokio, compio, or an embedded event loop.
