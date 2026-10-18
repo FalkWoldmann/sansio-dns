@@ -571,42 +571,47 @@ struct ResolvConf<'a> {
 }
 
 impl<'a> ResolvConf<'a> {
-    /// Read `text` and `env` as glibc's `res_vinit_1` does, but for the
-    /// comments and line ends described at [`Config::from_resolv_conf`].
+    /// Read `text` and `env` in the stages of glibc's `res_vinit_1`:
+    ///
+    /// 1. `LOCALDOMAIN`, which sets the search domains even without a word
+    ///    ([`search_list`]).
+    /// 2. The file, a line at a time ([`lines`]): `domain` and `search`
+    ///    lines ([`line_domains`]), `nameserver` lines ([`nameserver`]) and
+    ///    `options` lines (`res_setoptions`, [`Options::apply`]). glibc
+    ///    then adds the local host if no server was read; here
+    ///    [`Config::from_resolv_conf_with_env`] does that.
+    /// 3. Unless `LOCALDOMAIN` or a line set the search domains, the host
+    ///    name's domain (`domain_from_hostname`, [`host_domain`]).
+    /// 4. `RES_OPTIONS` (`res_setoptions`).
+    ///
+    /// Besides the differences its helpers' docs note (comments and line ends
+    /// in [`lines`], interface scopes in [`nameserver`]), it leaves out an
+    /// empty search domain glibc keeps:
+    ///
+    /// - One in front of `LOCALDOMAIN`'s words, when its text up to the
+    ///   first newline is empty or starts with a space or a tab.
+    /// - The domain of a host name whose first dot ends it (`host.`).
     fn parse(text: &'a [u8], env: &'a ResolvEnv) -> Self {
+        // LOCALDOMAIN replaces the file's `domain` and `search` lines. glibc
+        // skips them when `LOCALDOMAIN` is set (`haveenv`); here they are
+        // read and lose to it below, with the same result.
+        let localdomain = env.localdomain.as_deref().map(search_list);
         let mut servers = Vec::new();
         let mut search = None;
         let mut options = Options::default();
-        for line in text.split(|&byte| byte == b'\n') {
-            // glibc reads each line as a C string.
-            let line = c_str(line);
-            // Unlike glibc: CRLF line ends, and comments after the start of
-            // a line.
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
-            let line = line
-                .split(|&byte| byte == b'#' || byte == b';')
-                .next()
-                .unwrap_or_default();
-            if let Some(rest) = keyword(line, b"nameserver") {
-                servers.extend(words(rest).next().and_then(nameserver));
-            } else if let Some(rest) = keyword(line, b"domain") {
-                search = words(rest).next().map(|domain| vec![domain]).or(search);
+        // The keywords in glibc's order. `sortlist`, which glibc also reads,
+        // is ignored, and so is every other line.
+        for line in lines(text) {
+            if let Some(rest) = keyword(line, b"domain") {
+                search = line_domains(words(rest).take(1)).or(search);
             } else if let Some(rest) = keyword(line, b"search") {
-                let domains: Vec<&[u8]> = words(rest).collect();
-                if !domains.is_empty() {
-                    search = Some(domains);
-                }
+                search = line_domains(words(rest)).or(search);
+            } else if let Some(rest) = keyword(line, b"nameserver") {
+                servers.extend(words(rest).next().and_then(nameserver));
             } else if let Some(rest) = keyword(line, b"options") {
                 options.apply(rest);
             }
         }
-        let localdomain = env.localdomain.as_deref().map(|value| {
-            let value = c_str(value)
-                .split(|&byte| byte == b'\n')
-                .next()
-                .unwrap_or_default();
-            words(value).collect()
-        });
         let search = localdomain.or(search).unwrap_or_else(|| {
             let hostname = env.hostname.as_deref();
             hostname.and_then(host_domain).into_iter().collect()
@@ -681,6 +686,22 @@ impl Options {
     }
 }
 
+/// The lines of `text`, as the keywords see them. As glibc does, it splits
+/// `text` at each newline (`getline`) and ends a line at its first NUL
+/// byte, where the C string glibc reads ends. Unlike glibc, it then strips
+/// one carriage return from the end, so lines may end in CRLF, and cuts the
+/// line at its first `#` or `;`, so a comment may follow a word; glibc
+/// skips only a line that starts with one.
+fn lines(text: &[u8]) -> impl Iterator<Item = &[u8]> {
+    text.split(|&byte| byte == b'\n').map(|line| {
+        let line = c_str(line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        line.split(|&byte| byte == b'#' || byte == b';')
+            .next()
+            .unwrap_or_default()
+    })
+}
+
 /// Whether `byte` separates words on a `resolv.conf` line, as for glibc.
 fn is_blank(byte: u8) -> bool {
     byte == b' ' || byte == b'\t'
@@ -704,6 +725,24 @@ fn keyword<'a>(line: &'a [u8], keyword: &[u8]) -> Option<&'a [u8]> {
 /// `bytes` up to its first NUL byte, where a C string ends.
 fn c_str(bytes: &[u8]) -> &[u8] {
     bytes.split(|&byte| byte == 0).next().unwrap_or_default()
+}
+
+/// The search domains in `LOCALDOMAIN`: its words, up to the first newline
+/// of its C string. Empty when it has none.
+fn search_list(localdomain: &[u8]) -> Vec<&[u8]> {
+    let text = c_str(localdomain)
+        .split(|&byte| byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    words(text).collect()
+}
+
+/// The search domains that a `domain` or `search` line with `line_words`
+/// sets, or `None` for a line without a word, which glibc skips: it keeps
+/// the search domains set before it.
+fn line_domains<'a>(line_words: impl Iterator<Item = &'a [u8]>) -> Option<Vec<&'a [u8]>> {
+    let domains: Vec<&[u8]> = line_words.collect();
+    (!domains.is_empty()).then_some(domains)
 }
 
 /// The domain of `hostname`: the part after its first dot, unless empty.
