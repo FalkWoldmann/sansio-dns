@@ -120,33 +120,40 @@ with the code.
   server's address, RFC 8310 §11.1) and then the padding, last; `emit` runs it again when a
   query moves to a server of the other family. `Config::with_tls_names` holds an
   authentication name per server.
-- Replies go through `handle_reply`. A truncated one over UDP switches the query to TCP
-  (`switch_to_tcp`), even if its records don't decode. Any other reply whose header and
-  question match but whose records don't decode (`wire::Reply::Broken`) is a server error
-  and goes to `reject`; one whose records decode goes to `handle_response`, even a truncated
-  one on a stream. There `NOERROR` with data finishes a query; `NXDOMAIN` and NODATA go to
-  `search_on`, which tries the next candidate and finishes the query once none is left;
-  every other code and an empty `NOERROR` without AA and RA (`wire::is_referral`) go to
-  `reject`.
-- How a query moves on is spread over several functions with different accounting: `retry`
-  (no answer: next server, uses an attempt, marks the server failed for new queries),
-  `reject` (error answer: excludes the server for this search candidate, then the same),
-  both through `advance`, which gives up once out of attempts or servers; `switch_to_tcp`
-  and `drop_edns` (same server, free), the resends in `move_off` (same server, free every time
-  if the connection answered after the query was written, else once per query via
-  `use_free_resend`) and `time_out_stream` (once, via the same `use_free_resend`),
-  `next_candidate` (next search name, fresh attempts, no exclusions), `give_up` and
-  `finish`. `emit` counts every send in `Pending::sends`: a search candidate goes at most
-  three times to a server over one transport (RFC 9520 §3.1), so `advance` skips servers
-  without room (in `try_advance`), and the free sends, a cancel hand-over's resend included,
-  check `Pending::may_send` first (`cancel` directly, the others through `may_resend`) and
-  move on instead. Only `emit` sets a query's deadline (`Config::deadline`; `new_pending`
-  leaves a placeholder): every caller passes `Deadline::Fresh` except `time_out_stream`'s
-  free resend, which passes `Deadline::Kept`. The crate docs' "How a query moves on" table
-  states the rules (at most `attempts + 3` sends per search candidate, not counting a cancel
-  hand-over's resend or the resends after a lost connection that answered since, and at most
-  three per server and transport, all of those included), and a comment above `retry` maps
-  each row to its function: change these functions together and keep the table in sync.
+- Whatever happens to a query's current attempt reaches it as an `Input` to `act_on`: a
+  reply (`handle_reply`, which first takes the server off `Resolver::failed`), no answer
+  (`time_out`, `handle_udp_error`, `abort`), its connection lost or retired (`move_off`),
+  or shut by the resolver (`time_out_stream`). `Pending::decide` picks the move in one
+  `match` and returns an `Action` for `act_on` to carry out. A truncated reply over UDP
+  switches the query to TCP (`decide` sets `stream_only`, then resends), even if its records
+  don't decode. Any other reply whose header and question match but whose records don't
+  decode (`wire::Reply::Broken`) is a server error and goes to `reject`. Of the replies
+  whose records decode, a truncated one on a stream included, `NOERROR` with data finishes
+  a query; `NXDOMAIN` and NODATA go to `search_on`, which tries the next candidate and
+  finishes the query once none is left; every other code and an empty `NOERROR` without AA
+  and RA (`wire::is_referral`) go to `reject`.
+- The moves `decide` picks have different accounting: `retry` (no answer: next server, uses
+  an attempt, marks the server failed for new queries), `reject` (error answer: excludes
+  the server for this search candidate, then the same), both through `advance`, which
+  gives up once out of attempts or servers; the free resends to the same server
+  (`Action::Resend` through `emit`, and `Action::ResendWithoutEdns` through `drop_edns`) after a truncated answer (once,
+  since `stream_only` stays set), FORMERR without OPT (once, since `request.edns` is gone),
+  a lost or retired connection (`Input::Lost`: free every time if the connection answered
+  after the query was written, else once per query via `Pending::use_free_resend`) and a
+  connection the resolver shut (`Input::Shut`: once, via the same `use_free_resend`).
+  Outside `decide` there are `next_candidate` (next search name, fresh attempts, no
+  exclusions), `give_up` and `finish`. `emit` counts every send in `Pending::sends`: a
+  search candidate goes at most three times to a server over one transport (RFC 9520
+  §3.1), so `advance` skips servers without room (in `try_advance`), and the free sends, a
+  cancel hand-over's resend included, check `Pending::may_resend` first (in `cancel` and
+  `decide`) and move on instead. Only `emit` sets a query's deadline (`Config::deadline`;
+  `new_pending` leaves a placeholder): every caller passes `Deadline::Fresh` except the
+  free resend after `Input::Shut`, which passes `Deadline::Kept`. The crate docs' "How a
+  query moves on" table states the rules (at most `attempts + 3` sends per search
+  candidate, not counting a cancel hand-over's resend or the resends after a lost
+  connection that answered since, and at most three per server and transport, all of
+  those included), and a comment above `act_on` maps each row to `decide` and the
+  functions: change them together and keep the table in sync.
 - Every wait is bounded (RFC 1123 §6.1.3.3): `Config::wait` keeps a deadline between 1 s
   and 300 s after backoff, and `Config::failed_for` caps the failure memory at 5
   minutes (RFC 9520 §3.2). Deadlines are plain `Instant`s; nothing waits forever.
@@ -167,7 +174,7 @@ with the code.
   candidates before joining or sending (a cached NXDOMAIN or NODATA goes into the `Outcome`
   and moves on, a cached failure ends the search), and `emit` refuses to send a question
   with a cached failure, failing the query instead. Stores: `give_up` (every failure,
-  `Cache::failed`, with the backoff judged by `Pending::started`), and `handle_response`
+  `Cache::failed`, with the backoff judged by `Pending::started`), and `act_on`
   (`Cache::answered` for data, `Cache::negative` for NXDOMAIN and NODATA, which also ends a
   failure's backoff; error codes and referrals don't). `flush_cache` also clears `Resolver::failed`.
 - Some names are answered without a transmit, in this order: `localhost.`, `invalid.` and
