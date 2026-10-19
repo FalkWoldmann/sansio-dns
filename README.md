@@ -22,22 +22,20 @@ loop {
 
 Complete drivers are in `examples/` (`std`, `tokio`, `compio`), about 150 lines each including TCP.
 
-For hostnames, `IpLookup` runs the A and AAAA queries and merges the addresses, following
-CNAMEs. `Config::ip_strategy` picks the families and their order: IPv6 first by default, or
-IPv4 first, or only one family. IPv6 comes first even on a host without a global IPv6 address,
-such as a container with only a ULA, where `getaddrinfo` puts IPv4 first (RFC 6724 §6): there,
-race the connections (Happy Eyeballs, RFC 8305), as hyper does, or use `IpStrategy::Ipv4First`.
-With search domains, the lookup starts the queries for the next candidate itself: send the
-transmits it queues, and route events by `lookup.queries()` again after each one.
+For hostnames, `Resolver::lookup_ip` runs the A and AAAA queries and merges the addresses,
+following CNAMEs. `Config::ip_strategy` picks the families and their order: IPv6 first by
+default, or IPv4 first, or only one family. IPv6 comes first even on a host without a global
+IPv6 address, such as a container with only a ULA, where `getaddrinfo` puts IPv4 first (RFC
+6724 §6): there, race the connections (Happy Eyeballs, RFC 8305), as hyper does, or use
+`IpStrategy::Ipv4First`. The resolver runs the lookup itself, the next search candidate's
+queries included: send the transmits as usual, and its outcome comes out of `poll_lookup`. Its
+queries still end with events of their own, so the driver can close their sockets.
 
 ```rust
-let mut lookup = IpLookup::start(&mut resolver, Name::from_ascii("example.com")?, now)?;
-// in the event loop:
-while let Some(event) = resolver.poll_event() {
-    lookup = match lookup.handle_event(&mut resolver, &event, now) {
-        Progress::Waiting(lookup) => lookup,
-        Progress::Done(result) => { /* Ok(addresses) or Err(error) */ }
-    };
+let lookup = resolver.lookup_ip(Name::from_ascii("example.com")?, now)?;
+// in the event loop, after draining poll_transmit and poll_event:
+while let Some((id, result)) = resolver.poll_lookup() {
+    /* id == lookup: Ok(addresses) or Err(error) */
 }
 ```
 
@@ -61,13 +59,13 @@ Call `Resolver::flush_cache()` when the host's network changes.
 
 ### Tokio and reqwest
 
-[`sansio-dns-tokio`](sansio-dns-tokio) is a ready-made driver: `lookup_ip(host)` runs an
-`IpLookup` on a background task shared by all clones of the resolver. Each UDP query gets its
-own socket, connected to its server, and TCP or TLS connections stay open between lookups
-until they go idle; when the last clone is dropped, it closes them, over TLS after
-close_notify. Its `flush_cache()` empties the cache, for a network change. Its `tls` feature
-turns on DNS over TLS in `sansio-dns`. With its `reqwest` feature, it plugs into reqwest as the
-DNS resolver:
+[`sansio-dns-tokio`](sansio-dns-tokio) is a ready-made driver: `lookup_ip(host)` runs the
+core's `Resolver::lookup_ip` on a background task shared by all clones of the resolver. Each
+UDP query gets its own socket, connected to its server, and TCP or TLS connections stay open
+between lookups until they go idle; when the last clone is dropped, it closes them, over TLS
+after close_notify. Its `flush_cache()` empties the cache, for a network change. Its `tls`
+feature turns on DNS over TLS in `sansio-dns`. With its `reqwest` feature, it plugs into
+reqwest as the DNS resolver:
 
 ```rust
 let client = reqwest::Client::builder()
@@ -142,8 +140,8 @@ search with that error, as musl does, so that a temporary failure for the name m
 turn into an answer for another name. glibc goes on to the search domains after any failure on
 the name as given when that comes first; among the search domains it moves on only after
 SERVFAIL, and after another failure it stops and still tries the name as given if that comes
-last, unless no server could be reached at all. `IpLookup` asks each candidate for both
-families and moves on when neither has an address, as glibc's `getaddrinfo` does, so its
+last, unless no server could be reached at all. `Resolver::lookup_ip` asks each candidate for
+both families and moves on when neither has an address, as glibc's `getaddrinfo` does, so its
 addresses are always those of one name.
 
 ## Compared with hickory-resolver
@@ -192,9 +190,9 @@ Tests mostly live in `tests/rfc<number>.rs`, with one module per section. The ex
 RFC 1034 is in `tests/lookup.rs`, except §4.3.1, which is tested with the RA bit and RFC 2308
 §2.2's authority-section rule in `rfc1035.rs`'s §4.1.1 module, which also has the extended
 RCODEs of RFC 6891 §6.1.3 and RFC 7873 §5.3; `tests/lookup.rs` also has RFC 3596 §2.3,
-CNAME chains into special-use names and RFC 6762 §22.1 for `IpLookup`; RFC 2308 §2.2's
-NODATA and RFC 1035 §7.4's records of another class are in `rfc1123.rs`'s §6.1.4.3 module,
-and RFC 6895, 8482 and 9824 in its §6.1.3.2 module; RFC 2308 §7.2's cap is in
+CNAME chains into special-use names and RFC 6762 §22.1 for `Resolver::lookup_ip`; RFC 2308
+§2.2's NODATA and RFC 1035 §7.4's records of another class are in `rfc1123.rs`'s §6.1.4.3
+module, and RFC 6895, 8482 and 9824 in its §6.1.3.2 module; RFC 2308 §7.2's cap is in
 `rfc9520.rs`'s §3.2 module; RFC 1123 §6.1.3.3 (3) and (4) are covered by the tests of RFC 9520
 §3.2 and RFC 2308 §5, RFC 2308 §8 by `rfc2308.rs`'s §5 and §6 modules, and RFC 4343 §3 for
 cache keys by both; RFC 1123 §6.1.4.3 (b)'s `no-tld-query` is in `resolv_conf.rs`'s `search`
@@ -225,8 +223,8 @@ time out on a connection. `tests/main.rs` builds them all as one crate. The Toki
 | 1123 | §6.1.3.3 | Retries back off exponentially: each round through the servers waits twice as long, starting at 5 s by default. Each wait lasts at least 1 s and at most 300 s, above the 240 s (twice TCP's maximum segment lifetime) that any limit must exceed, so every query gives up in finite time |
 | 1123 | §6.1.3.3 (3) | Temporary failures are cached (RFC 9520 §3.2 below): 1 s at first and up to 30 s by default, configurable up to 5 minutes; (3) suggests minutes |
 | 1123 | §6.1.3.3 (4) | Negative answers are cached (RFC 2308 §5 below) |
-| 1123 | §6.1.4.3 | Search candidates are tried until one has data of the type and class asked for: NXDOMAIN and NODATA (RFC 2308 §2.2) move on; then the first NODATA is the outcome, else the last NXDOMAIN; a failure ends the search. `IpLookup` asks each candidate for A and AAAA and moves on when neither has an address, so both families come from the same name (§6.1.4.3 (b)) |
-| 1123 | §6.1.4.3 (a) | A candidate with a cached NXDOMAIN or NODATA is passed over without a query, and one with a cached failure ends the search, for `Resolver::query` and `IpLookup` alike |
+| 1123 | §6.1.4.3 | Search candidates are tried until one has data of the type and class asked for: NXDOMAIN and NODATA (RFC 2308 §2.2) move on; then the first NODATA is the outcome, else the last NXDOMAIN; a failure ends the search. `Resolver::lookup_ip` asks each candidate for A and AAAA and moves on when neither has an address, so both families come from the same name (§6.1.4.3 (b)) |
+| 1123 | §6.1.4.3 (a) | A candidate with a cached NXDOMAIN or NODATA is passed over without a query, and one with a cached failure ends the search, for `Resolver::query` and `Resolver::lookup_ip` alike |
 | 1123 | §6.1.4.3 (b) | `options no-tld-query` or `no_tld_query` (`Config::tld_query`) keeps a name of one label from being sent as given when there are search domains, as glibc does: a weaker rule than (b)'s two interior dots |
 | 2308 | §5 | NXDOMAIN is cached for every type of the name, NODATA for its type, under the last name of the CNAME chain (§1, §2.1), when the authority section has an SOA record, for the lesser of its TTL and MINIMUM, at most `max_negative_ttl` (1 hour). Not cached: an answer without an SOA, a truncated one (RFC 1123 §6.1.3.2), one with a zero TTL (RFC 1123 §6.1.2.1), a looping chain. RFC 8020's NXDOMAIN cut isn't applied |
 | 2308 | §6 | An answer from the cache asks the question asked and has the authority section as received, every TTL counted down by the whole seconds it was cached, AA clear and no OPT record (RFC 6891 §6.2.1) |
@@ -251,11 +249,11 @@ time out on a connection. `tests/main.rs` builds them all as one crate. The Toki
 | 7766 | §6.2.4 | Queries on a lost connection that had answered go to the same server again without using an attempt: every time if it answered after they were written, else once per query |
 | 7766 | §7 | Answers matched in any order, by message ID and question, or by ID alone without a question section; a query that times out closes the connection only if no complete response, matched or not, arrived on it since the query was written |
 | 7766 | §8 | Two-byte length prefix; replies reassembled from any chunking, up to 65535 octets |
-| 1034 | §3.6.2, §5.2.2 | `addresses` follows the CNAME chain and ignores records owned by other names; a loop is `Error::CnameLoop`, also for `IpLookup` |
+| 1034 | §3.6.2, §5.2.2 | `addresses` follows the CNAME chain and ignores records owned by other names; a loop is `Error::CnameLoop`, also for `Resolver::lookup_ip` |
 | 3596 | §2.3 | `addresses` takes only records of the type and class asked for at the end of the chain: no A record in an AAAA answer (RFC 1035 §7.4). Records of another class don't count as data for the search either, so an answer with only those is NODATA |
-| 1123 | §2.1 | `lookup_ip` takes labels that start with a digit and names of up to 255 octets. It rejects empty names, one to four dotted numbers that aren't an IP address (`127.1`, `01.2.3.4`, `0x7f.0.0.1`, `1.2.3.256`), absolute names whose last label is all digits, and names with a `\` (which would be read as an escape) instead of looking them up. Relative names like `host.123` or `1.2.3.4.5` are looked up, since a search domain may complete them |
-| 4343 | §4 | `lookup_ip` sends an ASCII name in the case given |
-| 5891 | §5.3, §5.4 | `lookup_ip` converts a non-ASCII name with UTS 46 non-transitional processing over the whole name, as browsers do (`bücher。example` is two labels), rejects `--` in the third and fourth positions of a U-label, and checks `xn--` labels in ASCII names. UTS 46 accepts some code points that IDNA2008 marks DISALLOWED, such as `☃`, which §5.4 asks to reject |
+| 1123 | §2.1 | The Tokio driver's `lookup_ip` takes labels that start with a digit and names of up to 255 octets. It rejects empty names, one to four dotted numbers that aren't an IP address (`127.1`, `01.2.3.4`, `0x7f.0.0.1`, `1.2.3.256`), absolute names whose last label is all digits, and names with a `\` (which would be read as an escape) instead of looking them up. Relative names like `host.123` or `1.2.3.4.5` are looked up, since a search domain may complete them |
+| 4343 | §4 | The Tokio driver's `lookup_ip` sends an ASCII name in the case given |
+| 5891 | §5.3, §5.4 | The Tokio driver's `lookup_ip` converts a non-ASCII name with UTS 46 non-transitional processing over the whole name, as browsers do (`bücher。example` is two labels), rejects `--` in the third and fourth positions of a U-label, and checks `xn--` labels in ASCII names. UTS 46 accepts some code points that IDNA2008 marks DISALLOWED, such as `☃`, which §5.4 asks to reject |
 | 6761 | §6.1, §6.2, §6.5 | Private reverse zones, `test.` and `example.` are sent like any other name |
 | 6761 | §6.3 | `localhost` names → loopback for A/AAAA, empty answer otherwise, whatever the hosts file says; nothing sent, and relative ones aren't searched. A CNAME chain that reaches one gives loopback |
 | 6761 | §6.4 | `invalid.` → NXDOMAIN; nothing sent, and relative ones aren't searched |
@@ -337,14 +335,16 @@ one.
 - A cache of answers with data: only failures and negative answers are cached.
 - DNS cookies (RFC 7873): queries carry no COOKIE option.
 - `resolv.conf` options other than the ones above (`rotate`, `use-vc`, `sortlist`, …).
-- Sorting addresses by the host's own ones (RFC 6724 §6); `IpLookup` lists them by family,
-  in the server's order within each.
+- Sorting addresses by the host's own ones (RFC 6724 §6); `Resolver::lookup_ip` lists them by
+  family, in the server's order within each.
 - Once EDNS is dropped for a query, it stays off for that query's remaining attempts,
   including other servers, until the search moves to the next candidate.
 - Multicast DNS (RFC 6762) for `local.` names.
 - Rejecting the code points that IDNA2008 marks DISALLOWED (RFC 5891 §5.4, RFC 5892):
-  `lookup_ip` follows UTS 46, as browsers do, and accepts some of them, such as `☃`.
-- IPv6 addresses with a zone (`fe80::1%eth0`, RFC 4007 §11) in `lookup_ip`.
+  the Tokio driver's `lookup_ip` follows UTS 46, as browsers do, and accepts some of them,
+  such as `☃`.
+- IPv6 addresses with a zone (`fe80::1%eth0`, RFC 4007 §11) in the Tokio driver's
+  `lookup_ip`.
 
 ## Testing
 

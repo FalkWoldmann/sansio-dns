@@ -2,14 +2,12 @@
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::time::Instant;
 
-use hickory_proto::ProtoError;
 use hickory_proto::op::Message;
 use hickory_proto::rr::{Name, RData, RecordType};
 
 use crate::wire::{chain, in_class, is_localhost, is_special_use};
-use crate::{Error, Event, QueryId, Resolver};
+use crate::{Error, Event, LookupId, QueryId};
 
 /// The addresses `response` gives for its question, following the CNAME
 /// chain from the question name (RFC 1034 §3.6.2): the records at the end
@@ -70,42 +68,26 @@ pub fn addresses(response: &Message) -> Result<Vec<IpAddr>, Error> {
     Ok(found.collect())
 }
 
-/// The A and AAAA queries for the same name, as [`Config::ip_strategy`]
-/// picks them, with their addresses merged.
+/// An address lookup the resolver runs for [`Resolver::lookup_ip`]: the A
+/// and AAAA queries for one search candidate at a time, as
+/// [`Config::ip_strategy`] picks them, with their addresses merged.
 ///
-/// With [`Config::search`] domains, the lookup walks the candidates itself,
-/// asking each for both families at once, as glibc's `getaddrinfo` does: it
-/// moves on when neither query found an address, after NXDOMAIN or NODATA
-/// (RFC 1123 §6.1.4.3, RFC 2308 §2.2), and ends on the first candidate
-/// where one did, with the addresses of both families for that name. So
-/// they are those of one host (RFC 1123 §6.1.4.3 (b)). A query that fails,
-/// or gets an answer whose CNAME chain loops, ends the search, and when the
-/// candidates run out the outcome is an empty list. Names that
-/// [`Resolver::query`] answers locally are answered that way, before any
-/// search domain: `localhost`, `invalid.` and `onion.` names and
-/// [`Config::hosts`] entries as given, and link-local names not served
-/// over unicast when none of their search candidates is sent. Search
-/// candidates that wouldn't be sent are left out. Each query goes through
-/// the resolver's cache, as any query does: a candidate whose NXDOMAIN is
-/// cached gets it at once and the search moves on without a transmit, and
-/// one whose failure is cached ends the search with it.
+/// It waits for the outcomes of its queries for the current candidate,
+/// which the resolver hands it from their events at the end of the input
+/// that queued them (`Resolver::run_lookups`, [`Lookup::handle`]). Once
+/// each has its outcome, the lookup moves on to the next candidate if
+/// neither found an address and one is left ([`Step::Next`], whose queries
+/// the resolver starts and hands it with [`Lookup::sent`]), and is done
+/// otherwise ([`Step::Done`]).
 ///
-/// Pass every [`Event`] to [`IpLookup::handle_event`], which hands the
-/// lookup back until it is done, and then the outcome instead. Moving on
-/// to the next candidate starts new queries on the resolver: send the
-/// transmits they queue, and look up [`IpLookup::queries`] again after
-/// each event. Sorting the addresses by the host's own ones (RFC 6724 §6)
-/// and racing connections (RFC 8305) is up to the caller.
-///
+/// [`Resolver::lookup_ip`]: crate::Resolver::lookup_ip
 /// [`Config::ip_strategy`]: crate::Config::ip_strategy
-/// [`Config::search`]: crate::Config::search
-/// [`Config::hosts`]: crate::Config::hosts
-#[derive(Debug, PartialEq, Eq)]
-pub struct IpLookup {
-    /// The record types asked for, in the order their addresses are
-    /// listed; the second is `None` when only one family is asked for.
-    types: [Option<RecordType>; 2],
-    /// The queries for the current search candidate, one per type.
+#[derive(Debug)]
+pub(crate) struct Lookup {
+    pub(crate) id: LookupId,
+    /// The queries for the current search candidate, one per record type
+    /// of `Config::ip_strategy`, in its order; the second is `None` when
+    /// only one family is asked for.
     queries: [Option<QueryId>; 2],
     /// The outcome of each query, filled as its event arrives: `None` while
     /// its query runs, and for a type not asked for, which has no query.
@@ -115,64 +97,39 @@ pub struct IpLookup {
     rest: VecDeque<Name>,
 }
 
-/// Where an [`IpLookup`] stands after an event.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Progress {
-    /// A query is still running: pass the lookup the next event.
-    Waiting(IpLookup),
+/// Where a [`Lookup`] goes after one of its queries ended.
+#[derive(Debug)]
+pub(crate) enum Step {
+    /// Its other query is still running.
+    Wait,
+    /// Neither query found an address: start the queries for this search
+    /// candidate, the next one, and hand them to [`Lookup::sent`]. If they
+    /// can't be encoded, the outcome so far, an empty list, stands.
+    Next(Name),
     /// The lookup is done. The addresses of one family followed by those of
-    /// the other, in the order of [`Config::ip_strategy`], each in the
+    /// the other, in the order of `Config::ip_strategy`, each in the
     /// server's order. An error only if no address was found and a query
     /// failed or got an answer whose CNAME chain loops
     /// ([`Error::CnameLoop`]); no address and no failure (NXDOMAIN, or no
     /// records) is an empty list.
-    ///
-    /// [`Config::ip_strategy`]: crate::Config::ip_strategy
     Done(Result<Vec<IpAddr>, Error>),
 }
 
-impl IpLookup {
-    /// Start the queries for `name` on `resolver`, for the families of its
-    /// [`Config::ip_strategy`](crate::Config::ip_strategy).
-    ///
-    /// # Errors
-    ///
-    /// If a query can't be encoded.
-    pub fn start(resolver: &mut Resolver, name: Name, now: Instant) -> Result<Self, ProtoError> {
-        let (first, second) = resolver.config().ip_strategy.record_types();
-        let types = [Some(first), second];
-        if resolver.is_local(&name) {
-            let mut queries = [None, None];
-            for (query, record_type) in queries.iter_mut().zip(types) {
-                if let Some(record_type) = record_type {
-                    *query = Some(resolver.query(name.clone(), record_type, now)?);
-                }
-            }
-            return Ok(Self {
-                types,
-                queries,
-                results: [None, None],
-                rest: VecDeque::new(),
-            });
-        }
-        let mut rest = resolver.config().candidates(&name);
-        let candidate = rest.pop_front().unwrap_or_else(|| {
-            let mut absolute = name;
-            absolute.set_fqdn(true);
-            absolute
-        });
-        Ok(Self {
-            types,
-            queries: send(resolver, &candidate, types, now)?,
+impl Lookup {
+    /// A lookup waiting for `queries`, with the search candidates in `rest`
+    /// still to try.
+    pub(crate) fn new(id: LookupId, queries: [Option<QueryId>; 2], rest: VecDeque<Name>) -> Self {
+        Self {
+            id,
+            queries,
             results: [None, None],
             rest,
-        })
+        }
     }
 
-    /// The queries still running for the current search candidate, to
-    /// route events to this lookup or to cancel them. They change when the
-    /// search moves on.
-    pub fn queries(&self) -> impl Iterator<Item = QueryId> + use<> {
+    /// The queries still running for the current search candidate. They
+    /// change when the search moves on.
+    pub(crate) fn queries(&self) -> impl Iterator<Item = QueryId> + use<> {
         let running = self
             .queries
             .into_iter()
@@ -180,15 +137,14 @@ impl IpLookup {
         running.filter_map(|(query, running)| query.filter(|_| running))
     }
 
-    /// Take in `event`; events of other queries leave the lookup as it is.
-    /// Once both families have no address for the current search
-    /// candidate, the queries for the next one start on `resolver`.
-    pub fn handle_event(
-        mut self,
-        resolver: &mut Resolver,
-        event: &Event,
-        now: Instant,
-    ) -> Progress {
+    /// Whether `query` is one of its running queries.
+    pub(crate) fn waits_for(&self, query: QueryId) -> bool {
+        self.queries().any(|q| q == query)
+    }
+
+    /// Take in `event`, which ends one of its running queries, and say
+    /// where the lookup goes next.
+    pub(crate) fn handle(&mut self, event: &Event) -> Step {
         let (query, result) = match event {
             Event::Response { query, response } => (query, addresses(response)),
             Event::Failed { query, error } => (query, Err(error.clone())),
@@ -206,51 +162,21 @@ impl IpLookup {
             ([_, None], [Some(only), None]) => only,
             (_, results) => {
                 self.results = results;
-                return Progress::Waiting(self);
+                return Step::Wait;
             }
         };
         let none_found = outcome.as_ref().is_ok_and(Vec::is_empty);
-        let next = self.rest.pop_front().filter(|_| none_found);
-        match next.map(|candidate| send(resolver, &candidate, self.types, now)) {
-            Some(Ok(queries)) => {
-                self.queries = queries;
-                Progress::Waiting(self)
-            }
-            // The current outcome stands if the next candidate can't be
-            // encoded, as in `Resolver::query`'s search.
-            Some(Err(_)) | None => Progress::Done(outcome),
+        match self.rest.pop_front().filter(|_| none_found) {
+            Some(candidate) => Step::Next(candidate),
+            None => Step::Done(outcome),
         }
     }
-}
 
-/// Start the queries of `types` for the search candidate `name`. If the
-/// second can't start, the first is cancelled.
-fn send(
-    resolver: &mut Resolver,
-    name: &Name,
-    types: [Option<RecordType>; 2],
-    now: Instant,
-) -> Result<[Option<QueryId>; 2], ProtoError> {
-    let mut queries = [None, None];
-    for (i, record_type) in types.into_iter().enumerate() {
-        let Some(record_type) = record_type else {
-            continue;
-        };
-        match resolver.query_candidate(name.clone(), record_type, now) {
-            Ok(query) => {
-                if let Some(slot) = queries.get_mut(i) {
-                    *slot = Some(query);
-                }
-            }
-            Err(error) => {
-                for query in queries.into_iter().flatten() {
-                    resolver.cancel(query, now);
-                }
-                return Err(error);
-            }
-        }
+    /// The queries for the search candidate of its last [`Step::Next`]
+    /// started.
+    pub(crate) fn sent(&mut self, queries: [Option<QueryId>; 2]) {
+        self.queries = queries;
     }
-    Ok(queries)
 }
 
 fn merge(

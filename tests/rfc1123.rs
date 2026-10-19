@@ -210,11 +210,11 @@ mod section_6_1_3_3 {
 /// record of the type asked for at the end of the CNAME chain) isn't that,
 /// so the search moves on. (glibc's moves on only when the answer section
 /// is empty.) When it runs out, the first NODATA is the outcome, ahead of a
-/// later NXDOMAIN. `IpLookup` moves on when neither A nor AAAA has an
-/// address; see `lookup::ip_lookup::search`. To keep a search list from
-/// sending "excessive queries to the root", a resolver "MUST have one of,
-/// and SHOULD have both of" (a) a cache of negative answers and (b) two or
-/// more interior dots before a name is sent: cached NXDOMAIN and NODATA
+/// later NXDOMAIN. `Resolver::lookup_ip` moves on when neither A nor AAAA
+/// has an address; see `lookup::ip_lookup::search`. To keep a search list
+/// from sending "excessive queries to the root", a resolver "MUST have one
+/// of, and SHOULD have both of" (a) a cache of negative answers and (b) two
+/// or more interior dots before a name is sent: cached NXDOMAIN and NODATA
 /// answers move the search on without a transmit, and a cached failure ends
 /// it. `Config::tld_query` (glibc's `no-tld-query`, see
 /// `resolv_conf::search`) is a weaker form of (b).

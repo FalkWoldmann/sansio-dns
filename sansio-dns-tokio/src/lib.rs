@@ -78,7 +78,7 @@ use idna::uts46::{AsciiDenyList, DnsLength, Hyphens, Uts46};
 use sansio_dns::hickory_proto::ProtoError;
 use sansio_dns::hickory_proto::rr::Name;
 use sansio_dns::{
-    Config, ConnectionId, Event, Hosts, IpLookup, Progress, QueryId, ResolvEnv, Transmit, Transport,
+    Config, ConnectionId, Event, Hosts, LookupId, QueryId, ResolvEnv, Transmit, Transport,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -434,9 +434,10 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// A lookup the background task is running.
+/// A lookup the background task is running: the id its future cancels it
+/// by, and where its outcome goes.
 struct Running {
-    lookup: IpLookup,
+    id: u64,
     reply: oneshot::Sender<Result<Vec<IpAddr>, Error>>,
 }
 
@@ -453,45 +454,25 @@ async fn run(config: Config, mut requests: mpsc::UnboundedReceiver<Request>) {
         ended: Vec::new(),
         input,
     };
-    let mut lookups: HashMap<u64, Running> = HashMap::new();
-    let mut owners: HashMap<QueryId, u64> = HashMap::new();
+    let mut lookups: HashMap<LookupId, Running> = HashMap::new();
     loop {
         while io.tasks.try_join_next().is_some() {}
         while io.grace.try_join_next().is_some() {}
-        // Sending can queue events, and handling an event can queue
-        // transmits: a lookup moving on to its next search candidate.
-        let mut busy = true;
-        while busy {
-            busy = false;
-            while let Some(transmit) = resolver.poll_transmit() {
-                busy = true;
-                let to = transmit.destination;
-                if let Err((query, error)) = io.send(transmit).await {
-                    resolver.handle_udp_error(query, to, error, Instant::now());
-                }
+        // A datagram that can't be sent moves its query on, which can queue
+        // transmits, events and lookup outcomes.
+        while let Some(transmit) = resolver.poll_transmit() {
+            let to = transmit.destination;
+            if let Err((query, error)) = io.send(transmit).await {
+                resolver.handle_udp_error(query, to, error, Instant::now());
             }
-            while let Some(event) = resolver.poll_event() {
-                busy = true;
-                let (Event::Response { query, .. } | Event::Failed { query, .. }) = &event;
-                io.forget(*query);
-                let Some(running) = owners.remove(query).and_then(|id| {
-                    let running = lookups.remove(&id)?;
-                    Some((id, running))
-                }) else {
-                    continue;
-                };
-                let (id, Running { lookup, reply }) = running;
-                match lookup.handle_event(&mut resolver, &event, Instant::now()) {
-                    Progress::Waiting(lookup) => {
-                        // Moving on to the next search candidate starts new
-                        // queries.
-                        owners.extend(lookup.queries().map(|query| (query, id)));
-                        lookups.insert(id, Running { lookup, reply });
-                    }
-                    Progress::Done(result) => {
-                        reply.send(outcome(result)).ok();
-                    }
-                }
+        }
+        while let Some(event) = resolver.poll_event() {
+            let (Event::Response { query, .. } | Event::Failed { query, .. }) = event;
+            io.forget(query);
+        }
+        while let Some((lookup, result)) = resolver.poll_lookup() {
+            if let Some(Running { reply, .. }) = lookups.remove(&lookup) {
+                reply.send(outcome(result)).ok();
             }
         }
         io.drop_ended();
@@ -504,10 +485,9 @@ async fn run(config: Config, mut requests: mpsc::UnboundedReceiver<Request>) {
                     while let Ok(input) = received.try_recv() {
                         take_in(&mut resolver, &mut io, input);
                     }
-                    match IpLookup::start(&mut resolver, name, Instant::now()) {
+                    match resolver.lookup_ip(name, Instant::now()) {
                         Ok(lookup) => {
-                            owners.extend(lookup.queries().map(|query| (query, id)));
-                            lookups.insert(id, Running { lookup, reply });
+                            lookups.insert(lookup, Running { id, reply });
                         }
                         Err(error) => {
                             reply.send(Err(Error::InvalidName(error))).ok();
@@ -515,10 +495,12 @@ async fn run(config: Config, mut requests: mpsc::UnboundedReceiver<Request>) {
                     }
                 }
                 Some(Request::Cancel(id)) => {
-                    if let Some(Running { lookup, .. }) = lookups.remove(&id) {
-                        for query in lookup.queries() {
-                            resolver.cancel(query, Instant::now());
-                            owners.remove(&query);
+                    let lookup = lookups
+                        .iter()
+                        .find_map(|(lookup, running)| (running.id == id).then_some(*lookup));
+                    if let Some(lookup) = lookup {
+                        lookups.remove(&lookup);
+                        for query in resolver.cancel_lookup(lookup, Instant::now()) {
                             io.forget(query);
                         }
                     }

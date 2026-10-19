@@ -7,10 +7,25 @@
 //! stream connection is a `Connection`, under its `ConnectionId` in
 //! `Resolver::connections`. `Connection` lists the ways it ends, and over
 //! TLS it holds a `tls::Session`, which lists its phases. The cache's
-//! `Entry` and `IpLookup` document theirs where they are defined. The
-//! crate docs' "How a query moves on" table says which server, attempt and
-//! deadline each move of a query takes, and the comment above
-//! `Resolver::retry` maps its rows to the functions here.
+//! `Entry` documents its own where it is defined. The crate docs' "How a
+//! query moves on" table says which server, attempt and deadline each move
+//! of a query takes, and the comment above `Resolver::retry` maps its rows
+//! to the functions here.
+//!
+//! An address lookup (`Resolver::lookup_ip`) is a `lookup::Lookup` in
+//! `Resolver::lookups`, which says how it moves on: it waits for the
+//! queries it started for its current search candidate. Every input that
+//! can end a query ends with `Resolver::run_lookups`, which hands each
+//! event queued during the input (those from `Resolver::handed` on) to the
+//! lookup waiting for its query, in the order they were queued. A lookup
+//! that moves on starts the next candidate's queries there, with the
+//! input's `now`, and their events, if they end at once, are handed over in
+//! turn. So the next candidate's transmits are queued after the input's own
+//! but before the driver has carried those out: the retry of one whose send
+//! fails (`Resolver::handle_udp_error`) comes after them, and the failed
+//! server isn't yet in `Resolver::failed` when they pick theirs. The
+//! queries still come out of `Resolver::poll_event` as any other, so a
+//! driver can close their sockets.
 //!
 //! `Resolver::poll_timeout` is the earliest of the queries' deadlines
 //! (`Pending::deadline`) and the connections' idle deadlines
@@ -26,12 +41,13 @@
 //! before its orphans for a reply with a question; one without a question
 //! matches only if exactly one of them could be its query. Idle
 //! connections, and every connection at `Resolver::shutdown`, close in
-//! `ConnectionId` order.
+//! `ConnectionId` order. `Resolver::lookups` is only searched, by query or
+//! `LookupId`, so its order doesn't show.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
 use hickory_proto::ProtoError;
@@ -40,6 +56,7 @@ use hickory_proto::rr::{Name, RecordType};
 
 use crate::cache::{Cache, Hit};
 use crate::config::MAX_SENDS_PER_SERVER;
+use crate::lookup::{Lookup, Step};
 #[cfg(feature = "tls")]
 use crate::tls;
 use crate::wire::{
@@ -48,7 +65,7 @@ use crate::wire::{
 };
 #[cfg(feature = "tls")]
 use crate::wire::{is_protected_for, protect};
-use crate::{Config, ConnectionId, Error, Event, QueryId, Transmit, Transport};
+use crate::{Config, ConnectionId, Error, Event, LookupId, QueryId, Transmit, Transport};
 
 /// How many requests that left a connection unanswered (`Orphan`s) it may
 /// hold. One more closes it, which frees their message IDs: a server that
@@ -71,9 +88,12 @@ const MAX_ORPHANS: usize = 256;
 /// failure, a TLS session that can't start, a message that doesn't encode)
 /// or move it on (a write TLS refuses). For each input, the first row whose
 /// guard holds applies; an input that no row matches, such as a datagram or
-/// `handle_udp_error` for a query on a stream, is ignored. The crate docs'
-/// "How a query moves on" table says which server, attempt and deadline
-/// each move takes.
+/// `handle_udp_error` for a query on a stream, is ignored. A lookup's
+/// queries start as `query` starts one, through `Resolver::start`, from
+/// `lookup_ip` or from any input whose `Resolver::run_lookups` moves the
+/// lookup on, and `cancel_lookup` cancels them as `cancel` does. The crate
+/// docs' "How a query moves on" table says which server, attempt and
+/// deadline each move takes.
 ///
 /// | State | Input \[guard\] | Next | Also |
 /// |---|---|---|---|
@@ -515,6 +535,15 @@ pub struct Resolver {
     cache: Cache,
     transmits: VecDeque<Transmit>,
     events: VecDeque<Event>,
+    /// How many of `events`, from the front, the lookups were handed
+    /// (`run_lookups`): all of them between inputs.
+    handed: usize,
+    next_lookup: u64,
+    /// The address lookups running. Each waits for queries no other one
+    /// started.
+    lookups: Vec<Lookup>,
+    /// Lookups that are done, with their outcomes, in the order they ended.
+    looked_up: VecDeque<(LookupId, Result<Vec<IpAddr>, Error>)>,
 }
 
 /// Shows the settings and how much is in flight, not the internal state,
@@ -544,15 +573,15 @@ impl Resolver {
             cache: Cache::default(),
             transmits: VecDeque::new(),
             events: VecDeque::new(),
+            handed: 0,
+            next_lookup: 0,
+            lookups: Vec::new(),
+            looked_up: VecDeque::new(),
         }
     }
 
-    /// The settings it was created with.
-    pub(crate) fn config(&self) -> &Config {
-        &self.config
-    }
-
-    // Inputs, from the driver or an `IpLookup`.
+    // Inputs. Each one that can end a query ends with `run_lookups`, which
+    // hands the lookups the events queued during it.
 
     /// Start a recursive lookup of `name`/`record_type`.
     ///
@@ -630,30 +659,79 @@ impl Resolver {
         record_type: RecordType,
         now: Instant,
     ) -> Result<QueryId, ProtoError> {
-        self.start(name, record_type, true, now)
+        let started = self.start(name, record_type, true, now);
+        self.run_lookups(now);
+        started
     }
 
-    /// Start `record_type` for one search candidate of an
-    /// [`IpLookup`](crate::IpLookup): `name` is absolute and sent as it is,
-    /// without [`Config::hosts`], which the lookup checked for the name as
-    /// given. It joins, and is joined by, a query for the same name.
-    pub(crate) fn query_candidate(
+    /// Start looking up the addresses of `name`: the A and AAAA queries, as
+    /// [`Config::ip_strategy`] picks them, with their addresses merged. The
+    /// outcome comes out of [`Resolver::poll_lookup`], at once for a name
+    /// answered locally or from the cache. The queries are queries like any
+    /// other: their transmits come out of
+    /// [`Resolver::poll_transmit`], those of the later search candidates
+    /// too, and each ends with its own event, so a driver can close its
+    /// socket.
+    ///
+    /// With [`Config::search`] domains, the lookup walks the candidates
+    /// itself, asking each for both families at once, as glibc's
+    /// `getaddrinfo` does: it moves on when neither query found an address,
+    /// after NXDOMAIN or NODATA (RFC 1123 §6.1.4.3, RFC 2308 §2.2), and
+    /// ends on the first candidate where one did, with the addresses of
+    /// both families for that name. So they are those of one host (RFC 1123
+    /// §6.1.4.3 (b)). A query that fails, or gets an answer whose CNAME
+    /// chain loops, ends the search, and when the candidates run out the
+    /// outcome is an empty list. Names that [`Resolver::query`] answers
+    /// locally are answered that way, before any search domain:
+    /// `localhost`, `invalid.` and `onion.` names and [`Config::hosts`]
+    /// entries as given, and link-local names not served over unicast when
+    /// none of their search candidates is sent. Search candidates that
+    /// wouldn't be sent are left out. Each candidate is asked for by its
+    /// absolute name, so its queries join, and are joined by, queries for
+    /// that name, and each goes through the cache, as any query does: a
+    /// candidate whose NXDOMAIN is cached gets it at once and the search
+    /// moves on without a transmit, and one whose failure is cached ends
+    /// the search with it.
+    ///
+    /// Sorting the addresses by the host's own ones (RFC 6724 §6) and racing
+    /// connections (RFC 8305) is up to the caller. Cancel a lookup with
+    /// [`Resolver::cancel_lookup`], not by cancelling its queries.
+    ///
+    /// # Errors
+    ///
+    /// If a query for the first search candidate can't be encoded.
+    pub fn lookup_ip(&mut self, name: Name, now: Instant) -> Result<LookupId, ProtoError> {
+        let started = self.start_lookup(name, now);
+        self.run_lookups(now);
+        started
+    }
+
+    /// The queries `lookup` is still waiting for, those of its current
+    /// search candidate. They change when the search moves on, and there
+    /// are none once it is done or cancelled.
+    pub fn lookup_queries(&self, lookup: LookupId) -> impl Iterator<Item = QueryId> + use<> {
+        let lookup = self.lookups.iter().find(|l| l.id == lookup);
+        lookup.map(Lookup::queries).into_iter().flatten()
+    }
+
+    /// Stop `lookup`: its running queries are cancelled as by
+    /// [`Resolver::cancel`], and no outcome comes for it from now on, not
+    /// even one already queued for [`Resolver::poll_lookup`]. Returns the
+    /// queries it cancelled, so a driver can close their sockets: none for
+    /// a lookup that is done.
+    pub fn cancel_lookup(
         &mut self,
-        name: Name,
-        record_type: RecordType,
+        lookup: LookupId,
         now: Instant,
-    ) -> Result<QueryId, ProtoError> {
-        self.start(name, record_type, false, now)
-    }
-
-    /// Whether `name`, as given, is answered without the network: see
-    /// [`Resolver::query`].
-    pub(crate) fn is_local(&self, name: &Name) -> bool {
-        let mut absolute = name.clone();
-        absolute.set_fqdn(true);
-        is_special_use(&absolute)
-            || self.config.hosts.lookup(&absolute).is_some()
-            || self.config.never_sent_as_given(name)
+    ) -> impl Iterator<Item = QueryId> + use<> {
+        self.looked_up.retain(|(id, _)| *id != lookup);
+        let index = self.lookups.iter().position(|l| l.id == lookup);
+        let lookup = index.map(|index| self.lookups.swap_remove(index));
+        for query in lookup.iter().flat_map(Lookup::queries) {
+            self.cancel_query(query, now);
+        }
+        self.run_lookups(now);
+        lookup.into_iter().flat_map(|lookup| lookup.queries())
     }
 
     /// Process a datagram received from `from` on the socket of `query`,
@@ -689,6 +767,7 @@ impl Resolver {
         };
         if reply.answers(pending.request.metadata.id, &pending.request.queries) {
             self.handle_reply(query, reply, now);
+            self.run_lookups(now);
         }
     }
 
@@ -767,6 +846,7 @@ impl Resolver {
             Some(Ending::CloseNotify) => self.retire(connection, now),
             Some(Ending::Failed(error)) => self.abort(connection, now, &error),
         }
+        self.run_lookups(now);
     }
 
     /// The server closed `connection`, or reading from it ended.
@@ -788,6 +868,7 @@ impl Resolver {
     /// [`Error::ConnectionClosed`]. No [`Transport::TcpClose`] follows.
     pub fn handle_stream_closed(&mut self, connection: ConnectionId, now: Instant) {
         self.lost(connection, now, &Error::ConnectionClosed);
+        self.run_lookups(now);
     }
 
     /// Connecting, reading or writing failed on `connection` with `error`.
@@ -801,6 +882,7 @@ impl Resolver {
         now: Instant,
     ) {
         self.lost(connection, now, &Error::Io(error));
+        self.run_lookups(now);
     }
 
     /// Binding or connecting the socket of `query`, sending its datagram to
@@ -831,6 +913,7 @@ impl Resolver {
         };
         if pending.route == Route::Udp && pending.server(&self.config) == to {
             self.retry(query, now, Error::Io(error));
+            self.run_lookups(now);
         }
     }
 
@@ -871,6 +954,7 @@ impl Resolver {
             self.time_out(id, now);
         }
         self.close_idle_connections(now);
+        self.run_lookups(now);
     }
 
     /// Stop tracking a query. No event is queued for it from now on (one
@@ -900,6 +984,13 @@ impl Resolver {
     /// and its other queries move as when one of them times out with no
     /// response since (see [`Resolver::handle_timeout`]).
     pub fn cancel(&mut self, id: QueryId, now: Instant) {
+        self.cancel_query(id, now);
+        self.run_lookups(now);
+    }
+
+    /// [`Resolver::cancel`], without handing the lookups the events it
+    /// queues.
+    fn cancel_query(&mut self, id: QueryId, now: Instant) {
         let Some(mut pending) = self.pending.remove(&id) else {
             for p in self.pending.values_mut() {
                 p.followers.retain(|&follower| follower != id);
@@ -954,14 +1045,16 @@ impl Resolver {
     }
 
     /// Stop: forget every query in flight, as [`Resolver::cancel`] does but
-    /// without handing any over, and close every open connection, over TLS
-    /// after its close_notify alert (RFC 8446 §6.1). For a driver that is
-    /// about to drop its connections: carry out the transmits this queues
-    /// first. Events already queued still come out of
-    /// [`Resolver::poll_event`], and the resolver takes new queries
-    /// afterwards.
+    /// without handing any over, and every lookup, as
+    /// [`Resolver::cancel_lookup`] does, and close every open connection,
+    /// over TLS after its close_notify alert (RFC 8446 §6.1). For a driver
+    /// that is about to drop its connections: carry out the transmits this
+    /// queues first. Events and lookup outcomes already queued still come
+    /// out of [`Resolver::poll_event`] and [`Resolver::poll_lookup`], and
+    /// the resolver takes new queries afterwards.
     pub fn shutdown(&mut self) {
         self.pending.clear();
+        self.lookups.clear();
         let connections: Vec<ConnectionId> = self.connections.keys().copied().collect();
         for connection in connections {
             self.shut(connection);
@@ -976,9 +1069,23 @@ impl Resolver {
         self.transmits.pop_front()
     }
 
-    /// Next completed query, if any.
+    /// Next completed query, if any. The queries of the lookups started
+    /// with [`Resolver::lookup_ip`] are among them.
     pub fn poll_event(&mut self) -> Option<Event> {
-        self.events.pop_front()
+        let event = self.events.pop_front()?;
+        self.handed = self.handed.saturating_sub(1);
+        Some(event)
+    }
+
+    /// Next lookup started with [`Resolver::lookup_ip`] that is done, if
+    /// any, with its outcome: the addresses of one family followed by those
+    /// of the other, in the order of [`Config::ip_strategy`], each in the
+    /// server's order. An error only if no address was found and a query
+    /// failed or got an answer whose CNAME chain loops
+    /// ([`Error::CnameLoop`]); no address and no failure (NXDOMAIN, or no
+    /// records) is an empty list.
+    pub fn poll_lookup(&mut self) -> Option<(LookupId, Result<Vec<IpAddr>, Error>)> {
+        self.looked_up.pop_front()
     }
 
     /// Earliest instant at which [`Resolver::handle_timeout`] must be called.
@@ -992,6 +1099,95 @@ impl Resolver {
             .keys()
             .filter_map(|c| self.idle_deadline(*c));
         queries.chain(idle).min()
+    }
+
+    // Lookups: starting their queries, and handing them the events of the
+    // queries that end.
+
+    /// [`Resolver::lookup_ip`], without handing the lookups the events it
+    /// queues. A name answered locally is asked for as given, as
+    /// [`Resolver::query`] asks; any other by its first search candidate
+    /// (the absolute name if none is left), without [`Config::hosts`],
+    /// which applies only to the name as given.
+    fn start_lookup(&mut self, name: Name, now: Instant) -> Result<LookupId, ProtoError> {
+        let mut absolute = name.clone();
+        absolute.set_fqdn(true);
+        let local = is_special_use(&absolute)
+            || self.config.hosts.lookup(&absolute).is_some()
+            || self.config.never_sent_as_given(&name);
+        let (first, rest) = if local {
+            (name, VecDeque::new())
+        } else {
+            let mut rest = self.config.candidates(&name);
+            (rest.pop_front().unwrap_or(absolute), rest)
+        };
+        let queries = self.start_lookup_queries(&first, local, now)?;
+        let id = LookupId(self.next_lookup);
+        self.next_lookup += 1;
+        self.lookups.push(Lookup::new(id, queries, rest));
+        Ok(id)
+    }
+
+    /// Start a lookup's queries for `name`, one per record type of
+    /// [`Config::ip_strategy`], in its order, with [`Config::hosts`] if
+    /// `hosts`. If the second can't start, the first is cancelled.
+    fn start_lookup_queries(
+        &mut self,
+        name: &Name,
+        hosts: bool,
+        now: Instant,
+    ) -> Result<[Option<QueryId>; 2], ProtoError> {
+        let (first, second) = self.config.ip_strategy.record_types();
+        let mut queries = [None, None];
+        for (slot, record_type) in queries.iter_mut().zip([Some(first), second]) {
+            let Some(record_type) = record_type else {
+                continue;
+            };
+            match self.start(name.clone(), record_type, hosts, now) {
+                Ok(query) => *slot = Some(query),
+                Err(error) => {
+                    for query in queries.into_iter().flatten() {
+                        self.cancel_query(query, now);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(queries)
+    }
+
+    /// Hand each event queued since the last call to the lookup waiting for
+    /// its query, if any, in the order they were queued. A lookup that is
+    /// done goes to `looked_up`. One that moves on starts the queries for
+    /// its next search candidate, whose events, if they end at once, are
+    /// handed over in turn.
+    fn run_lookups(&mut self, now: Instant) {
+        while let Some(event) = self.events.get(self.handed) {
+            self.handed += 1;
+            let (Event::Response { query, .. } | Event::Failed { query, .. }) = event;
+            let Some(index) = self.lookups.iter().position(|l| l.waits_for(*query)) else {
+                continue;
+            };
+            let mut lookup = self.lookups.swap_remove(index);
+            let outcome = match lookup.handle(event) {
+                Step::Wait => None,
+                Step::Next(candidate) => match self.start_lookup_queries(&candidate, false, now) {
+                    Ok(queries) => {
+                        lookup.sent(queries);
+                        None
+                    }
+                    // The outcome so far, an empty list, stands if the next
+                    // candidate can't be encoded, as in `Resolver::query`'s
+                    // search.
+                    Err(_) => Some(Ok(Vec::new())),
+                },
+                Step::Done(outcome) => Some(outcome),
+            };
+            match outcome {
+                Some(outcome) => self.looked_up.push_back((lookup.id, outcome)),
+                None => self.lookups.push(lookup),
+            }
+        }
     }
 
     // A query's transitions: starting a search candidate, acting on its

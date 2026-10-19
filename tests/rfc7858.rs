@@ -975,7 +975,7 @@ fn lost_connection_is_reestablished() {
 }
 
 /// A query started during the handshake waits for it on the same
-/// connection, as with the A and AAAA queries of an `IpLookup`.
+/// connection, as with the A and AAAA queries of `Resolver::lookup_ip`.
 #[test]
 fn query_during_handshake_waits_for_it() {
     let (client, server_config) = configs();

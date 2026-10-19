@@ -14,12 +14,14 @@ use crate::Hosts;
 use crate::tls::{self, TlsConfigError};
 use crate::wire::{is_link_local, is_special_use, is_under_link_local};
 
-/// Which address families an [`IpLookup`](crate::IpLookup) asks for, and the
-/// order of its addresses.
+/// Which address families [`Resolver::lookup_ip`] asks for, and the order
+/// of its addresses.
 ///
 /// With both families, the addresses of the first come first. Clients that
 /// race connections (RFC 8305), such as hyper's, try that family first and
 /// the other one shortly after.
+///
+/// [`Resolver::lookup_ip`]: crate::Resolver::lookup_ip
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum IpStrategy {
     /// Only A queries.
@@ -160,8 +162,9 @@ pub struct Config {
     /// Static entries answered before DNS, like `/etc/hosts`. Empty by
     /// default; fill it with [`Hosts::parse`].
     pub hosts: Hosts,
-    /// Which addresses an [`IpLookup`](crate::IpLookup) asks for, and which
-    /// come first. [`IpStrategy::Ipv6First`] by default.
+    /// Which addresses [`Resolver::lookup_ip`](crate::Resolver::lookup_ip)
+    /// asks for, and which come first. [`IpStrategy::Ipv6First`] by
+    /// default.
     pub ip_strategy: IpStrategy,
     /// Whether a name of one label, such as `db`, is also tried as given
     /// when there are search domains, which asks the name servers for a

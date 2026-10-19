@@ -2,14 +2,16 @@
 //!
 //! [`Resolver`] owns no sockets, timers or tasks. The caller drives it:
 //!
-//! 1. Start a lookup with [`Resolver::query`].
+//! 1. Start a lookup with [`Resolver::query`], or an address lookup with
+//!    [`Resolver::lookup_ip`].
 //! 2. Send everything returned by [`Resolver::poll_transmit`], over the
 //!    [`Transport`] it names.
 //! 3. Feed received datagrams to [`Resolver::handle_datagram`], and bytes
 //!    read from TCP connections to [`Resolver::handle_stream_data`].
 //! 4. Call [`Resolver::handle_timeout`] once the instant from
 //!    [`Resolver::poll_timeout`] has passed.
-//! 5. Collect results from [`Resolver::poll_event`].
+//! 5. Collect results from [`Resolver::poll_event`], and those of address
+//!    lookups from [`Resolver::poll_lookup`].
 //! 6. Before stopping, call [`Resolver::shutdown`] and send its transmits,
 //!    which close the open connections.
 //!
@@ -21,9 +23,9 @@
 //! servers serve them; other special-use names, such as `test.` or
 //! `home.arpa.`, are sent like any other. See [`Resolver::query`].
 //!
-//! For hostnames, [`IpLookup`] runs the A and AAAA queries and collects the
-//! addresses, following CNAMEs; [`Config::ip_strategy`] picks the families
-//! and their order.
+//! For hostnames, [`Resolver::lookup_ip`] runs the A and AAAA queries and
+//! collects the addresses, following CNAMEs; [`Config::ip_strategy`] picks
+//! the families and their order.
 //!
 //! With the `tls` feature, `Config::with_tls` and `Config::with_tls_names`
 //! send every query over DNS over TLS (RFC 7858) instead.
@@ -131,10 +133,10 @@
 //! domains it moves on only after `SERVFAIL`, and after another failure it
 //! stops and still tries the name as given if that comes last, unless no
 //! server could be reached at all.
-//! [`IpLookup`] walks the candidates itself, with an A and an AAAA query
-//! per candidate, and moves on when neither has an address; a failure, or
-//! an answer whose CNAME chain loops ([`Error::CnameLoop`]), ends its
-//! search.
+//! [`Resolver::lookup_ip`] walks the candidates itself, with an A and an
+//! AAAA query per candidate, and moves on when neither has an address; a
+//! failure, or an answer whose CNAME chain loops ([`Error::CnameLoop`]),
+//! ends its search.
 //!
 //! Each search candidate is sent at most three times to each server over
 //! each transport, UDP and TCP, or TLS (RFC 9520 §3.1). Every send counts:
@@ -165,9 +167,9 @@
 //!
 //! A query for the same name (as given, trailing dot included, case ignored)
 //! and type as one in flight joins it instead of being sent, unless the
-//! cache answers it, and gets its outcome. An [`IpLookup`] asks for each
-//! candidate by its absolute name, so its queries join, and are joined by,
-//! queries for that name. If the first one runs out of attempts or
+//! cache answers it, and gets its outcome. [`Resolver::lookup_ip`] asks for
+//! each candidate by its absolute name, so its queries join, and are joined
+//! by, queries for that name. If the first one runs out of attempts or
 //! servers, every query that joined it fails with it, however late it
 //! joined: the failure is cached, so a query issued just after would fail
 //! the same way, without being sent (RFC 9520 §3.2). [`Resolver::cancel`]
@@ -181,11 +183,11 @@
 //! 4343 §3), a type and a class. A failure is cached for the search
 //! candidate as sent, a negative answer for the name it denies (see
 //! below). Every search candidate is looked up before it is sent, for
-//! [`Resolver::query`] and [`IpLookup`] alike. The cache reads time only
-//! from the `now` passed in, so it adds no deadline: an expired negative
-//! answer is dropped when it is looked up, and an expired failure is kept
-//! for the backoff below until it is replaced, an answer ends it or the
-//! cache needs room.
+//! [`Resolver::query`] and [`Resolver::lookup_ip`] alike. The cache reads
+//! time only from the `now` passed in, so it adds no deadline: an expired
+//! negative answer is dropped when it is looked up, and an expired failure
+//! is kept for the backoff below until it is replaced, an answer ends it or
+//! the cache needs room.
 //!
 //! A search candidate fails to resolve (RFC 9520 §2) when its query runs
 //! out of attempts or servers, or its TLS session can't start, whatever
@@ -352,7 +354,7 @@ mod wire;
 
 pub use config::{Config, IpStrategy, ResolvEnv};
 pub use hosts::Hosts;
-pub use lookup::{IpLookup, Progress, addresses};
+pub use lookup::addresses;
 pub use resolver::Resolver;
 #[cfg(feature = "tls")]
 pub use rustls;
@@ -362,6 +364,10 @@ pub use tls::TlsConfigError;
 /// Handle for an in-flight query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct QueryId(u64);
+
+/// Handle for an address lookup started with [`Resolver::lookup_ip`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LookupId(u64);
 
 /// Handle for a stream connection; see the crate docs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -469,8 +475,8 @@ pub enum Error {
     NoRecursion,
     /// The answer's CNAME chain comes back to a name on it, which RFC 1034
     /// §3.6.2 and §5.2.2 ask to report as an error. Only from
-    /// [`addresses`] and [`IpLookup`]; [`Resolver::query`] passes the
-    /// answer on as it is.
+    /// [`addresses`] and [`Resolver::lookup_ip`]; [`Resolver::query`] passes
+    /// the answer on as it is.
     #[error("CNAME chain loops")]
     CnameLoop,
 }

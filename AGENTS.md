@@ -63,17 +63,19 @@ The core has eight modules: `src/lib.rs` (crate docs and public types), `src/con
 `ResolvEnv` for `LOCALDOMAIN`, `RES_OPTIONS` and the host name), `src/hosts.rs` (hosts file
 entries), `src/wire.rs` (framing, padding, reply matching, special-use answers),
 `src/resolver.rs` (the state machine), `src/cache.rs` (failures and negative answers),
-`src/lookup.rs` (`IpLookup`) and `src/tls.rs` (DoT sessions driven in memory, `tls`
-feature).
+`src/lookup.rs` (`addresses`, and the `Lookup` the resolver runs for `lookup_ip`) and
+`src/tls.rs` (DoT sessions driven in memory, `tls` feature).
 The `Resolver` is a state machine over two maps: pending queries
 (`QueryId` -> `Pending`) and stream connections (`ConnectionId` -> `Connection`), plus the
-`Cache`. Inputs are `query`, `handle_datagram(query, from, ..)`, `handle_udp_error`,
-`handle_stream_data/closed/error`, `handle_timeout`, `cancel`, `flush_cache` and `shutdown`;
-outputs are drained with `poll_transmit`, `poll_event` and `poll_timeout`. The module docs of
-`src/resolver.rs` say where each entity documents its states (`Pending`'s table, the ways a
-`Connection` ends, `tls::Session`, the cache's `Entry`, `IpLookup`), what `poll_timeout` is
-made of, and where map order shows in the outputs; keep them and the invariants on the
-fields in sync with the code.
+`Cache` and the address lookups it runs (`Resolver::lookups`, a `Vec<lookup::Lookup>`).
+Inputs are `query`, `lookup_ip`, `handle_datagram(query, from, ..)`, `handle_udp_error`,
+`handle_stream_data/closed/error`, `handle_timeout`, `cancel`, `cancel_lookup`, `flush_cache`
+and `shutdown`; outputs are drained with `poll_transmit`, `poll_event`, `poll_lookup` and
+`poll_timeout`. The module docs of `src/resolver.rs` say where each entity documents its
+states (`Pending`'s table, the ways a `Connection` ends, `tls::Session`, the cache's `Entry`,
+`lookup::Lookup`), how lookups get their queries' events, what `poll_timeout` is made of,
+and where map order shows in the outputs; keep them and the invariants on the fields in sync
+with the code.
 
 - A query's current server is `Config::server(position)` (the list, rotated). `position`
   starts at `first`, the first server not in `Resolver::failed` (no answer within
@@ -174,13 +176,25 @@ fields in sync with the code.
   under a search domain below one of those zones or under `Config::unicast_local_zones`
   (`Config::never_sent`, which filters every search candidate, the name as given included;
   `Config::never_sent_as_given` answers a relative name locally only when no candidate is
-  left, since RFC 6762 §3 judges the name actually queried). `IpLookup`
-  (`src/lookup.rs`) walks the search candidates itself: per candidate it starts an A and an
-  AAAA query for the absolute name (`Resolver::query_candidate`, which skips `Config::hosts`;
-  the lookup checks the name as given with `Resolver::is_local` first, and the cache applies
-  as for any query), merges the addresses from the events it is fed, and moves on when
-  neither has one, so `handle_event` takes the resolver. `addresses` follows the CNAME chain, stops at a special-use name, keeps only the
-  question's type and class, and reports a loop as `Error::CnameLoop`.
+  left, since RFC 6762 §3 judges the name actually queried). `Resolver::lookup_ip` checks
+  the name as given for those first (`start_lookup`, which then asks for it as given), and
+  otherwise walks the search candidates: per candidate it starts an A and an AAAA query for
+  the absolute name (`start_lookup_queries`, through `start` without `Config::hosts`; the
+  cache applies as for any query). The `lookup::Lookup` merges the addresses of its queries'
+  events and returns a `Step`: wait for the other query, `Next(candidate)` when neither has
+  an address, or `Done`. Every input that can end a query ends with `run_lookups`, which
+  hands each event queued during the input (from `Resolver::handed` on) to the lookup waiting
+  for its query, in queue order, starts the next candidate's queries on `Step::Next`, and
+  queues the outcome for `poll_lookup` on `Step::Done`. So a lookup moves on within the
+  input that ended its queries, with that input's `now`: the next candidate's transmits come
+  after the input's own, but before the driver reports a failed send of those, whose retry
+  then comes after them. The 0.1 Tokio driver fed its `IpLookup`s events only once it had
+  sent everything queued, so since 0.2 its next candidate goes out earlier after a failed
+  send, and after inputs it takes in before starting a new lookup (which can flip who joins
+  whom when both ask for the same name). Its queries still queue their events, which the
+  Tokio driver needs to close their sockets.
+  `addresses` follows the CNAME chain, stops at a special-use name, keeps only the question's
+  type and class, and reports a loop as `Error::CnameLoop`.
 - The Tokio driver's `lookup_ip` turns a host into a `Name` itself (`host_name`): UTS 46 over
   the whole name for non-ASCII input (the `idna` crate), A-label checks for ASCII input, which
   is otherwise used as given, and RFC 1123 §2.1 rejections of empty and numeric hosts.
@@ -211,9 +225,11 @@ closed the connection reports it and keeps writing until its queue is dropped, w
 `Io::drop_ended` does only after the transmits queued before the report are carried out.
 When the last clone is dropped, the task calls `shutdown`, carries out its transmits and
 gives the connections `CLOSE_GRACE` to finish.
-Lookups send a request over a channel with a `oneshot` reply; `CancelOnDrop` cancels a lookup
-whose future is dropped, and `Resolver::flush_cache` sends a request that empties the core's
-cache. If the task's runtime shuts down, the next lookup (or a waiting one)
+Lookups send a request over a channel with a `oneshot` reply; the task starts each with the
+core's `lookup_ip` and answers it from `poll_lookup`, and on an event only closes the query's
+socket. `CancelOnDrop` cancels a lookup whose future is dropped (`cancel_lookup`, then it
+closes the sockets of the queries that returns), and `Resolver::flush_cache` sends a request
+that empties the core's cache. If the task's runtime shuts down, the next lookup (or a waiting one)
 restarts it on its own runtime.
 A resolver shared with an idle current-thread runtime can hang lookups from other runtimes;
 that limitation is documented, not handled.
