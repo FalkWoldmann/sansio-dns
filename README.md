@@ -1,5 +1,8 @@
 # sansio-dns
 
+[![crates.io](https://img.shields.io/crates/v/sansio-dns.svg)](https://crates.io/crates/sansio-dns)
+[![docs.rs](https://docs.rs/sansio-dns/badge.svg)](https://docs.rs/sansio-dns)
+
 > [!WARNING]
 > This is an experiment: me trying out sans-IO and the DNS RFCs. It is incomplete and
 > probably incorrect in places, so don't rely on it for anything that matters.
@@ -59,8 +62,9 @@ Call `Resolver::flush_cache()` when the host's network changes.
 
 ### Tokio and reqwest
 
-[`sansio-dns-tokio`](sansio-dns-tokio) is a ready-made driver: `lookup_ip(host)` runs the
-core's `Resolver::lookup_ip` on a background task shared by all clones of the resolver. Each
+[`sansio-dns-tokio`](https://crates.io/crates/sansio-dns-tokio)
+([docs](https://docs.rs/sansio-dns-tokio)) is a ready-made driver: `lookup_ip(host)` runs
+the core's `Resolver::lookup_ip` on a background task shared by all clones of the resolver. Each
 UDP query gets its own socket, connected to its server, and TCP or TLS connections stay open
 between lookups until they go idle; when the last clone is dropped, it closes them, over TLS
 after close_notify. Its `flush_cache()` empties the cache, for a network change. Its `tls`
