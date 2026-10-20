@@ -3,10 +3,13 @@
 //!
 //! A query in flight is a `Pending`, under its `QueryId` in
 //! `Resolver::pending`, or a `QueryId` that joined one
-//! (`Pending::followers`). `Pending` has the table of a query's states. A
+//! (`Pending::followers`). `Pending` has the table of a query's states; it
+//! holds the search, its current `Candidate` and the current `Attempt` at
+//! it, and `Resolver::emit` sends the attempt the way `Dispatch` says. A
 //! stream connection is a `Connection`, under its `ConnectionId` in
-//! `Resolver::connections`. `Connection` lists the ways it ends, and over
-//! TLS it holds a `tls::Session`, which lists its phases. The cache's
+//! `Resolver::connections`. `Connection` lists the ways it ends, the ones
+//! with queries on it as an `End` that `Resolver::end_connection` carries
+//! out, and over TLS it holds a `tls::Session`, which lists its phases. The cache's
 //! `Entry` documents its own where it is defined. The crate docs' "How a
 //! query moves on" table says which server, attempt and deadline each move
 //! of a query takes, and the comment above `Resolver::act_on` maps its rows
@@ -29,7 +32,7 @@
 //! driver can close their sockets.
 //!
 //! `Resolver::poll_timeout` is the earliest of the queries' deadlines
-//! (`Pending::deadline`) and the connections' idle deadlines
+//! (`Attempt::deadline`) and the connections' idle deadlines
 //! (`Resolver::idle_deadline`). The cache and the failure memory
 //! (`Resolver::failed`) read `now` only when they are used, so they add no
 //! deadline.
@@ -122,7 +125,6 @@ const MAX_ORPHANS: usize = 256;
 /// | Udp | `cancel` [with followers] | the first follower leads, and sends or moves on | |
 #[derive(Debug)]
 struct Pending {
-    // The search, carried over from one candidate to the next.
     /// The name and type as asked, before search domains. A later query
     /// for the same two joins this one instead of being sent. hickory's
     /// `Name` equality ignores case but not the trailing dot.
@@ -137,9 +139,18 @@ struct Pending {
     /// its outcome too. Every `QueryId` in flight is in exactly one place:
     /// a key of `Resolver::pending`, or one leader's followers.
     followers: Vec<QueryId>,
+    /// The search candidate being tried. `Resolver::next_candidate`
+    /// replaces it, and `attempt` with it; the fields above carry over.
+    candidate: Candidate,
+    /// The current attempt at `candidate`.
+    attempt: Attempt,
+}
 
-    // The current search candidate: `Resolver::next_candidate` starts
-    // these over, and the attempt below.
+/// A search candidate as sent, and what its sends have used up so far.
+/// Everything here starts over with the next candidate
+/// (`Resolver::new_candidate`).
+#[derive(Debug)]
+struct Candidate {
     request: Message,
     payload: Vec<u8>,
     /// Where in the server list its attempts start, so it skips servers
@@ -154,7 +165,7 @@ struct Pending {
     /// How often this search candidate was sent to each server over each
     /// channel, free sends included: at most `MAX_SENDS_PER_SERVER` times
     /// (RFC 9520 §3.1). `Resolver::emit` counts each send, and every send
-    /// but a search candidate's first is checked with `Pending::may_send`
+    /// but a search candidate's first is checked with `Candidate::may_send`
     /// before it, for the channel `emit` then takes.
     sends: Vec<(SocketAddr, Channel, u8)>,
     /// Whether every send goes over a stream: after a truncated answer
@@ -172,64 +183,63 @@ struct Pending {
     /// close_notify (`Input::Lost`), or after the resolver shut its
     /// connection (`Input::Shut`). The two share it: after one free
     /// resend, from either, the next one from either uses up an attempt.
-    /// Reset for each search candidate; set by `Pending::use_free_resend`,
-    /// from `Pending::decide`. A connection lost or ended by close_notify
+    /// Set by `Candidate::use_free_resend`, from `Pending::decide`. A connection lost or ended by close_notify
     /// after a response arrived on it since then gives a free resend
     /// without it.
     free_resend_used: bool,
-    /// When this query's current search candidate was first sent, which
-    /// decides whether its failure backs off from a cached one
-    /// (`Cache::failed`).
+    /// When this candidate was first sent, which decides whether its
+    /// failure backs off from a cached one (`Cache::failed`).
     started: Instant,
+}
 
-    // The current attempt.
-    /// Where in the rotation its current attempt is: it goes to
-    /// `Config::server(position)`. Starts at `first` and moves on by one
-    /// per attempt, past the servers in `excluded`, so how often it has
-    /// wrapped around is the number of rounds made.
+/// The current attempt at a search candidate: which server it went to,
+/// how, and until when it waits. `Attempt::first` starts a candidate's
+/// attempts; `Resolver::try_advance` moves to the next.
+#[derive(Debug)]
+struct Attempt {
+    /// Where in the rotation it is: it goes to `Config::server(position)`.
+    /// Starts at `Candidate::first` and moves on by one per attempt, past
+    /// the servers in `Candidate::excluded`, so how often it has wrapped
+    /// around is the number of rounds made.
     position: usize,
-    /// How many attempts it has used up before the current one. Below
+    /// How many attempts the candidate has used up before this one. Below
     /// `Config::attempts` between inputs: a query that would reach it ends
     /// (`Resolver::try_advance`).
-    attempt: usize,
-    /// When the current attempt times out. Only `Resolver::emit` sets it;
-    /// `Resolver::new_pending` leaves a placeholder that the first `emit`
-    /// replaces, or that goes with the query if a cached failure ends it
-    /// there. `emit` starts it over (`Deadline::Fresh`) for every attempt
+    used: usize,
+    /// When the attempt times out. Only `Resolver::emit` sets it;
+    /// `Attempt::first` leaves a placeholder that the candidate's first
+    /// `emit` replaces, or that goes with the query if a cached failure
+    /// ends it there. `emit` starts it over (`Deadline::Fresh`) for every attempt
     /// and resend except the free resend after `Input::Shut`, which keeps
     /// it (`Deadline::Kept`). An heir that takes a cancelled query
     /// over on a stream sends nothing and keeps it too.
     deadline: Instant,
-    /// How the current attempt went out; set by `Resolver::emit`. Between
-    /// inputs a connection it names is in `Resolver::connections` and goes
-    /// to the current server: every path that removes a connection moves
-    /// its queries on in the same call.
+    /// How it went out; set by `Resolver::emit`. Between inputs a
+    /// connection it names is in `Resolver::connections` and goes to the
+    /// current server: every path that removes a connection moves its
+    /// queries on in the same call.
     route: Route,
 }
 
-impl Pending {
-    /// The server of the current attempt.
-    fn server(&self, config: &Config) -> SocketAddr {
-        config.server(self.position)
+impl Attempt {
+    /// A candidate's first attempt, at the server at `first` in the
+    /// rotation. The deadline is a placeholder that the candidate's first
+    /// `Resolver::emit` replaces, or that goes with the query if a cached
+    /// failure ends it there.
+    fn first(first: usize, now: Instant) -> Self {
+        Self {
+            position: first,
+            used: 0,
+            deadline: now,
+            route: Route::Udp,
+        }
     }
+}
 
-    /// Whether its current attempt was written to `connection`.
-    fn is_on(&self, connection: ConnectionId) -> bool {
-        matches!(self.route, Route::Stream { connection: c, .. } if c == connection)
-    }
-
-    /// Start the current attempt's deadline over at `now`:
-    /// `Config::timeout`, doubled each time the attempts have gone round
-    /// the server list (exponential backoff, RFC 1123 §6.1.3.3), within
-    /// the bounds of `Config::wait`.
-    fn restart_deadline(&mut self, config: &Config, now: Instant) {
-        let round = self.position.saturating_sub(self.first) / config.servers().len();
-        self.deadline = config.deadline(round, now);
-    }
-
-    /// Whether this search candidate may be sent to `server` once more,
-    /// over the channel `channel` picks for that send: RFC 9520 §3.1 allows
-    /// three sends in all.
+impl Candidate {
+    /// Whether it may be sent to `server` once more, over the channel
+    /// `channel` picks for that send: RFC 9520 §3.1 allows three sends in
+    /// all.
     fn may_send(
         &self,
         server: SocketAddr,
@@ -254,6 +264,34 @@ impl Pending {
         }
     }
 
+    /// Use up its free resend (`free_resend_used`), which it has once:
+    /// true if it still had it.
+    fn use_free_resend(&mut self) -> bool {
+        !std::mem::replace(&mut self.free_resend_used, true)
+    }
+}
+
+impl Pending {
+    /// The server of the current attempt.
+    fn server(&self, config: &Config) -> SocketAddr {
+        config.server(self.attempt.position)
+    }
+
+    /// Whether its current attempt was written to `connection`.
+    fn is_on(&self, connection: ConnectionId) -> bool {
+        matches!(self.attempt.route, Route::Stream { connection: c, .. } if c == connection)
+    }
+
+    /// Start the current attempt's deadline over at `now`:
+    /// `Config::timeout`, doubled each time the attempts have gone round
+    /// the server list (exponential backoff, RFC 1123 §6.1.3.3), within
+    /// the bounds of `Config::wait`.
+    fn restart_deadline(&mut self, config: &Config, now: Instant) {
+        let round =
+            self.attempt.position.saturating_sub(self.candidate.first) / config.servers().len();
+        self.attempt.deadline = config.deadline(round, now);
+    }
+
     /// Whether its current attempt may go to its server once more, over the
     /// channel that send would take (RFC 9520 §3.1).
     fn may_resend(
@@ -261,13 +299,7 @@ impl Pending {
         config: &Config,
         connections: &BTreeMap<ConnectionId, Connection>,
     ) -> bool {
-        self.may_send(self.server(config), connections)
-    }
-
-    /// Use up its free resend (`free_resend_used`), which it has once per
-    /// search candidate: true if it still had it.
-    fn use_free_resend(&mut self) -> bool {
-        !std::mem::replace(&mut self.free_resend_used, true)
+        self.candidate.may_send(self.server(config), connections)
     }
 
     /// What the query does next, now that `input` happened to its current
@@ -296,8 +328,8 @@ impl Pending {
             // The same server over TCP (RFC 1123 §6.1.3.2), even for a reply
             // whose records don't decode (RFC 2181 §9). Earlier attempts may
             // have used up the room on an open connection.
-            Input::Reply(reply) if reply.is_truncated() && self.route == Route::Udp => {
-                self.stream_only = true;
+            Input::Reply(reply) if reply.is_truncated() && self.attempt.route == Route::Udp => {
+                self.candidate.stream_only = true;
                 if self.may_resend(config, connections) {
                     Action::Resend(Deadline::Fresh)
                 } else {
@@ -312,7 +344,7 @@ impl Pending {
                 // TLS, where EDNS carries the padding (RFC 8467 §4.1).
                 ResponseCode::FormErr if response.edns.is_none() && !config.uses_tls() => {
                     let error = Error::Server(ResponseCode::FormErr);
-                    if self.request.edns.is_none() {
+                    if self.candidate.request.edns.is_none() {
                         Action::Reject(error)
                     } else if self.may_resend(config, connections) {
                         Action::ResendWithoutEdns
@@ -333,11 +365,11 @@ impl Pending {
             // once if it had only answered before.
             Input::Lost { responses, error } => {
                 let progress = matches!(
-                    self.route,
+                    self.attempt.route,
                     Route::Stream { written_after, .. } if responses > written_after
                 );
                 if self.may_resend(config, connections)
-                    && (progress || (responses > 0 && self.use_free_resend()))
+                    && (progress || (responses > 0 && self.candidate.use_free_resend()))
                 {
                     Action::Resend(Deadline::Fresh)
                 } else {
@@ -347,9 +379,9 @@ impl Pending {
             // Free once, shared with `Lost`, and only before its own
             // deadline, which the resend keeps.
             Input::Shut => {
-                if self.deadline > now
+                if self.attempt.deadline > now
                     && self.may_resend(config, connections)
-                    && self.use_free_resend()
+                    && self.candidate.use_free_resend()
                 {
                     Action::Resend(Deadline::Kept)
                 } else {
@@ -447,15 +479,15 @@ enum Input {
     /// its deadline passed, over UDP or on a connection that stays open
     /// (`Resolver::time_out`), its datagram couldn't be sent
     /// (`Resolver::handle_udp_error`), or TLS failed on its connection
-    /// (`Resolver::abort`).
+    /// (`End::TlsError`).
     NoAnswer(Error),
     /// Its connection was lost, or ended by the server's close_notify,
-    /// after `responses` responses (`Resolver::move_off`); `error` if it
-    /// moves on and is out of attempts.
+    /// after `responses` responses (`End::Lost`, `End::CloseNotify`);
+    /// `error` if it moves on and is out of attempts.
     Lost { responses: u64, error: Error },
     /// The resolver shut its connection because a query on it, this one or
     /// another, timed out with no response since, or it held `MAX_ORPHANS`
-    /// orphans (`Resolver::time_out_stream`).
+    /// orphans (`End::TimedOut`).
     Shut,
 }
 
@@ -488,17 +520,20 @@ enum Action {
 ///
 /// | Input | Ends it | `TcpClose` | Its queries |
 /// |---|---|---|---|
-/// | `handle_stream_closed`, `handle_stream_error` | `lost` | no | sent again or moved on (`move_off`) |
-/// | the server's close_notify, with no TLS error (`Ending::CloseNotify`), in `handle_stream_data` | `retire` | yes | the same, after the answers that came before it |
-/// | a TLS error on bytes read from it (`Ending::Failed`), in `handle_stream_data` | `abort` | yes | moved on (`retry`), after the answers decrypted before the error |
-/// | a write to it that TLS refuses, in `emit` | `abort` | yes | moved on (`retry`), the query written included |
-/// | a query on it times out with no response since `written_after`, or one more `Orphan` would go past `MAX_ORPHANS` | `time_out_stream` | yes | sent again if their deadline hasn't passed, they have room and their free resend is left (`Input::Shut`), else moved on |
+/// | `handle_stream_closed`, `handle_stream_error` | `End::Lost` | no | sent again or moved on (`Input::Lost`) |
+/// | the server's close_notify, with no TLS error (`Ending::CloseNotify`), in `handle_stream_data` | `End::CloseNotify` | yes | the same, after the answers that came before it |
+/// | a TLS error on bytes read from it (`Ending::Failed`), in `handle_stream_data` | `End::TlsError` | yes | moved on (`retry`), after the answers decrypted before the error |
+/// | a write to it that TLS refuses, in `emit` | `End::TlsError` | yes | moved on (`retry`), the query written included |
+/// | a query on it times out with no response since `written_after`, or one more `Orphan` would go past `MAX_ORPHANS` | `End::TimedOut` | yes | sent again if their deadline hasn't passed, they have room and their free resend is left (`Input::Shut`), else moved on |
 /// | its idle deadline passes (`handle_timeout`) | `close_idle_connections` | yes | none: no query is on it |
 /// | `shutdown` | `shutdown` | yes | none left |
 ///
-/// Every end but `lost` goes through `shut`, which also queues a TLS
-/// session's last bytes before the `TcpClose`: none after an alert from
-/// the server that rustls reported as the error (`tls::Session::alerted`).
+/// `Resolver::end_connection` carries out an `End`: it forgets the
+/// connection, through `shut` unless the driver reported it gone, and
+/// gives each query on it the input the `End` stands for. `shut`, which
+/// the last two rows call directly, also queues a TLS session's last bytes
+/// before the `TcpClose`: none after an alert from the server that rustls
+/// reported as the error (`tls::Session::alerted`).
 #[derive(Debug)]
 struct Connection {
     /// Between inputs no other connection goes to this server:
@@ -629,15 +664,16 @@ impl Orphan {
     /// The orphan `pending` leaves behind on its connection.
     fn of(pending: &Pending) -> Self {
         Self {
-            id: pending.request.metadata.id,
-            question: pending.request.queries.clone(),
-            until: pending.deadline,
+            id: pending.candidate.request.metadata.id,
+            question: pending.candidate.request.queries.clone(),
+            until: pending.attempt.deadline,
         }
     }
 
     /// Whether it is `pending`'s own request.
     fn is(&self, pending: &Pending) -> bool {
-        self.id == pending.request.metadata.id && self.question == pending.request.queries
+        self.id == pending.candidate.request.metadata.id
+            && self.question == pending.candidate.request.queries
     }
 }
 
@@ -649,18 +685,95 @@ enum Matched {
     Orphan(usize),
 }
 
-/// Which channel a send of `pending` to `server` takes: a stream if it
+/// Why a connection with queries on it ends: the first rows of the table on
+/// [`Connection`]. `Resolver::end_connection` carries each out.
+#[derive(Debug)]
+enum End {
+    /// The driver reported it closed by the server, or failed with this
+    /// error ([`Resolver::handle_stream_closed`],
+    /// [`Resolver::handle_stream_error`]). No `TcpClose` follows. Its
+    /// queries get `Input::Lost`.
+    Lost(Error),
+    /// The server's close_notify ended its TLS session, with no TLS error
+    /// (`Ending::CloseNotify`): it ends like a lost one, with
+    /// [`Error::ConnectionClosed`], after the answers decrypted before it.
+    CloseNotify,
+    /// Its TLS session failed with this error, on bytes read from it
+    /// (`Ending::Failed`) or on a write to it (`Resolver::emit`). Its
+    /// queries get `Input::NoAnswer`, the query written included.
+    TlsError(Error),
+    /// A query on it timed out with no response since it was written
+    /// (`Resolver::time_out`), or one more `Orphan` would go past
+    /// `MAX_ORPHANS` (`time_out`, `Resolver::cancel`). Its queries get
+    /// `Input::Shut`.
+    TimedOut,
+}
+
+impl End {
+    /// What a query on the connection gets, after `responses` responses
+    /// arrived on it.
+    fn input(&self, responses: u64) -> Input {
+        match self {
+            Self::Lost(error) => Input::Lost {
+                responses,
+                error: error.clone(),
+            },
+            Self::CloseNotify => Input::Lost {
+                responses,
+                error: Error::ConnectionClosed,
+            },
+            Self::TlsError(error) => Input::NoAnswer(error.clone()),
+            Self::TimedOut => Input::Shut,
+        }
+    }
+}
+
+/// Which channel a send of `candidate` to `server` takes: a stream if it
 /// must use one or a connection is open to `server`
 /// (`Connection::is_open_to`), UDP otherwise.
 fn channel(
     connections: &BTreeMap<ConnectionId, Connection>,
-    pending: &Pending,
+    candidate: &Candidate,
     server: SocketAddr,
 ) -> Channel {
-    if pending.stream_only || connections.values().any(|c| c.is_open_to(server)) {
+    if candidate.stream_only || connections.values().any(|c| c.is_open_to(server)) {
         Channel::Stream
     } else {
         Channel::Udp
+    }
+}
+
+/// How `Resolver::emit` sends a query's current attempt: the four ways the
+/// channel rule (`channel`, RFC 7766 §5) comes out.
+#[derive(Debug)]
+enum Dispatch {
+    /// Write it to this open connection to its server.
+    Write(ConnectionId),
+    /// Its own request is still outstanding on this open connection, as the
+    /// orphan at this index: take the request back and wait for its answer
+    /// instead of writing the message ID again (RFC 7766 §6.2.1).
+    TakeBack(ConnectionId, usize),
+    /// No connection to its server is open, and it must use a stream: open
+    /// one with it.
+    Connect,
+    /// Send it as a datagram from the query's socket.
+    Udp,
+}
+
+/// How a send of `pending` to `server` goes out.
+fn dispatch(
+    connections: &BTreeMap<ConnectionId, Connection>,
+    pending: &Pending,
+    server: SocketAddr,
+) -> Dispatch {
+    let open = connections.iter().find(|(_, c)| c.is_open_to(server));
+    match open {
+        Some((&connection, conn)) => match conn.orphans.iter().position(|o| o.is(pending)) {
+            Some(index) => Dispatch::TakeBack(connection, index),
+            None => Dispatch::Write(connection),
+        },
+        None if pending.candidate.stream_only => Dispatch::Connect,
+        None => Dispatch::Udp,
     }
 }
 
@@ -910,13 +1023,16 @@ impl Resolver {
         let Some(pending) = self.pending.get(&query) else {
             return;
         };
-        if pending.route != Route::Udp || pending.server(&self.config) != from {
+        if pending.attempt.route != Route::Udp || pending.server(&self.config) != from {
             return;
         }
         let Some(reply) = Reply::decode(data) else {
             return;
         };
-        if reply.answers(pending.request.metadata.id, &pending.request.queries) {
+        if reply.answers(
+            pending.candidate.request.metadata.id,
+            &pending.candidate.request.queries,
+        ) {
             self.handle_reply(query, reply, now);
             self.run_lookups(now);
         }
@@ -980,7 +1096,7 @@ impl Resolver {
             match self.stream_match(connection, &reply) {
                 Some(Matched::Query(id)) => {
                     if let Some(pending) = self.pending.get(&id) {
-                        reply.fill_question(&pending.request.queries);
+                        reply.fill_question(&pending.candidate.request.queries);
                     }
                     self.handle_reply(id, reply, now);
                 }
@@ -994,8 +1110,10 @@ impl Resolver {
         }
         match ending {
             None => {}
-            Some(Ending::CloseNotify) => self.retire(connection, now),
-            Some(Ending::Failed(error)) => self.abort(connection, now, &error),
+            Some(Ending::CloseNotify) => self.end_connection(connection, &End::CloseNotify, now),
+            Some(Ending::Failed(error)) => {
+                self.end_connection(connection, &End::TlsError(error), now);
+            }
         }
         self.run_lookups(now);
     }
@@ -1018,7 +1136,7 @@ impl Resolver {
     /// its next attempt, and a query out of attempts fails with
     /// [`Error::ConnectionClosed`]. No [`Transport::TcpClose`] follows.
     pub fn handle_stream_closed(&mut self, connection: ConnectionId, now: Instant) {
-        self.lost(connection, now, &Error::ConnectionClosed);
+        self.end_connection(connection, &End::Lost(Error::ConnectionClosed), now);
         self.run_lookups(now);
     }
 
@@ -1032,7 +1150,7 @@ impl Resolver {
         error: io::ErrorKind,
         now: Instant,
     ) {
-        self.lost(connection, now, &Error::Io(error));
+        self.end_connection(connection, &End::Lost(Error::Io(error)), now);
         self.run_lookups(now);
     }
 
@@ -1062,7 +1180,7 @@ impl Resolver {
         let Some(pending) = self.pending.get(&query) else {
             return;
         };
-        if pending.route == Route::Udp && pending.server(&self.config) == to {
+        if pending.attempt.route == Route::Udp && pending.server(&self.config) == to {
             self.act_on(query, Input::NoAnswer(Error::Io(error)), now);
             self.run_lookups(now);
         }
@@ -1098,7 +1216,7 @@ impl Resolver {
         let expired: Vec<QueryId> = self
             .pending
             .iter()
-            .filter(|(_, p)| p.deadline <= now)
+            .filter(|(_, p)| p.attempt.deadline <= now)
             .map(|(id, _)| *id)
             .collect();
         for id in expired {
@@ -1150,19 +1268,19 @@ impl Resolver {
         };
         if pending.followers.is_empty() {
             // Its request is still outstanding on its connection.
-            if let Route::Stream { connection, .. } = pending.route
+            if let Route::Stream { connection, .. } = pending.attempt.route
                 && let Some(conn) = self.connections.get_mut(&connection)
             {
                 if conn.orphans.len() < MAX_ORPHANS {
                     conn.orphans.push(Orphan::of(&pending));
                 } else {
-                    self.time_out_stream(connection, now);
+                    self.end_connection(connection, &End::TimedOut, now);
                 }
             }
             return;
         }
         let heir = pending.followers.remove(0);
-        match pending.route {
+        match pending.attempt.route {
             // Nothing to send: the answer still arrives on the connection,
             // and the heir keeps the deadline.
             Route::Stream { .. } => {
@@ -1243,7 +1361,7 @@ impl Resolver {
     /// connection is waiting out [`Config::idle_timeout`]. An idle
     /// connection keeps a timer running after the last query is done.
     pub fn poll_timeout(&self) -> Option<Instant> {
-        let queries = self.pending.values().map(|p| p.deadline);
+        let queries = self.pending.values().map(|p| p.attempt.deadline);
         let idle = self
             .connections
             .keys()
@@ -1406,8 +1524,15 @@ impl Resolver {
             leader.followers.push(id);
             return Ok(id);
         }
-        let mut pending = self.new_pending(candidate, record_type, rest, asked, now)?;
-        pending.nodata = outcome.nodata;
+        let candidate = self.new_candidate(candidate, record_type, now)?;
+        let pending = Pending {
+            asked,
+            rest,
+            nodata: outcome.nodata,
+            followers: Vec::new(),
+            attempt: Attempt::first(candidate.first, now),
+            candidate,
+        };
         self.pending.insert(id, pending);
         self.emit(id, now, Deadline::Fresh);
         Ok(id)
@@ -1436,15 +1561,14 @@ impl Resolver {
         Next::Done
     }
 
-    /// A fresh first attempt for `name`, with its own message ID.
-    fn new_pending(
+    /// The search candidate `name`, ready for its first attempt, with its
+    /// own message ID.
+    fn new_candidate(
         &self,
         name: Name,
         record_type: RecordType,
-        rest: VecDeque<Name>,
-        asked: Asked,
         now: Instant,
-    ) -> Result<Pending, ProtoError> {
+    ) -> Result<Candidate, ProtoError> {
         let mut request = self.new_message();
         request.metadata.recursion_desired = true;
         request.add_query(Query::query(name, record_type));
@@ -1457,11 +1581,7 @@ impl Resolver {
             protect(&mut request, self.config.server(first))?;
         }
         let payload = request.to_vec()?;
-        Ok(Pending {
-            asked,
-            rest,
-            nodata: None,
-            followers: Vec::new(),
+        Ok(Candidate {
             request,
             payload,
             first,
@@ -1470,11 +1590,6 @@ impl Resolver {
             stream_only: self.config.uses_tls(),
             free_resend_used: false,
             started: now,
-            position: first,
-            attempt: 0,
-            // A placeholder: the caller's `emit` starts the deadline.
-            deadline: now,
-            route: Route::Udp,
         })
     }
 
@@ -1489,10 +1604,9 @@ impl Resolver {
             .unwrap_or(0)
     }
 
-    /// Replace `id`'s attempt with one for the search candidate `name`,
-    /// with fresh attempts and no servers excluded, `rest` to try after it
-    /// and `outcome` so far. If it can't be encoded, the answers so far
-    /// stand.
+    /// Replace `id`'s search candidate with `name`, with fresh attempts and
+    /// no servers excluded, `rest` to try after it and `outcome` so far.
+    /// If it can't be encoded, the answers so far stand.
     fn next_candidate(
         &mut self,
         id: QueryId,
@@ -1501,11 +1615,11 @@ impl Resolver {
         outcome: Outcome,
         now: Instant,
     ) {
-        let Some(asked) = self.pending.get(&id).map(|p| p.asked.clone()) else {
+        let Some(record_type) = self.pending.get(&id).map(|p| p.asked.1) else {
             return;
         };
-        let Ok(mut next) = self.new_pending(name, asked.1, rest, asked, now) else {
-            // Not expected: the fallible calls in `new_pending` (`to_vec`,
+        let Ok(candidate) = self.new_candidate(name, record_type, now) else {
+            // Not expected: the fallible calls in `new_candidate` (`to_vec`,
             // and `protect`'s `pad` under `tls`) only encode the message,
             // and only its name has limits to check. hickory's `Name`
             // keeps each label within 63 octets and the name within 255,
@@ -1515,11 +1629,12 @@ impl Resolver {
             }
             return;
         };
-        if let Some(previous) = self.pending.get_mut(&id) {
-            next.followers = std::mem::take(&mut previous.followers);
+        if let Some(pending) = self.pending.get_mut(&id) {
+            pending.rest = rest;
+            pending.nodata = outcome.nodata;
+            pending.attempt = Attempt::first(candidate.first, now);
+            pending.candidate = candidate;
         }
-        next.nodata = outcome.nodata;
-        self.pending.insert(id, next);
         self.emit(id, now, Deadline::Fresh);
     }
 
@@ -1536,7 +1651,9 @@ impl Resolver {
     /// are interchangeable.
     fn new_message(&self) -> Message {
         let used = |id: u16| {
-            self.pending.values().any(|p| p.request.metadata.id == id)
+            self.pending
+                .values()
+                .any(|p| p.candidate.request.metadata.id == id)
                 || self
                     .connections
                     .values()
@@ -1605,7 +1722,7 @@ impl Resolver {
     //
     // - no answer by its deadline (`time_out`), datagram not sent
     //   (`handle_udp_error`): `Input::NoAnswer`, then `retry`; on a stream,
-    //   `time_out` closes the connection through `time_out_stream` only if
+    //   `time_out` closes the connection (`End::TimedOut`) only if
     //   no response arrived on it since the query was written (or since
     //   `emit` took the request back), or it holds `MAX_ORPHANS` orphans,
     //   and otherwise leaves an `Orphan` there, which `emit` takes back if
@@ -1619,18 +1736,18 @@ impl Resolver {
     // - FORMERR without OPT: `Action::ResendWithoutEdns`, then `drop_edns`,
     //   once because `request.edns` is taken
     // - connection lost after it answered, or closed by the server's
-    //   close_notify (`handle_stream_data`): `move_off`, by way of `lost`
-    //   or `retire`, with `Input::Lost`, then `Action::Resend`, for free
+    //   close_notify (`handle_stream_data`): `End::Lost` or
+    //   `End::CloseNotify`, with `Input::Lost`, then `Action::Resend`, for free
     //   every time if it answered after the query was written or took its
     //   request back (`written_after` in `Route::Stream`), else once by way
-    //   of `Pending::use_free_resend`
+    //   of `Candidate::use_free_resend`
     // - neighbour timed out on the connection, or it was closed for holding
-    //   too many orphans: `time_out_stream`, with `Input::Shut`, then
+    //   too many orphans: `End::TimedOut`, with `Input::Shut`, then
     //   `Action::Resend` by way of `use_free_resend` (the same
     //   `free_resend_used` flag), else `retry`
     // - connection that never answered lost, TLS error on received bytes
     //   (after the answers decrypted before it), TLS write refused
-    //   (`emit`): `move_off` with `Input::Lost`, or `abort` with
+    //   (`emit`): `End::Lost` with `Input::Lost`, or `End::TlsError` with
     //   `Input::NoAnswer`, then `retry`
     // - NXDOMAIN or NODATA, with candidates left: `Action::SearchOn`, then
     //   `search_on` and `next_candidate`, which resets all of the above
@@ -1657,8 +1774,8 @@ impl Resolver {
     //
     // `emit` picks the channel of every send (`channel`: the open
     // connection to the server if there is one, RFC 7766 §5) and counts it
-    // in `Pending::sends`, and no search candidate goes to a server over a
-    // channel more than three times (RFC 9520 §3.1). `Pending::may_send`
+    // in `Candidate::sends`, and no search candidate goes to a server over a
+    // channel more than three times (RFC 9520 §3.1). `Candidate::may_send`
     // checks the room left on the channel `channel` picks for a send:
     // `try_advance` skips servers without room (for `advance`, and for
     // `cancel` when it moves on), and `cancel` and `decide` check it
@@ -1722,7 +1839,7 @@ impl Resolver {
             return;
         };
         let server = pending.server(&self.config);
-        pending.excluded.push(server);
+        pending.candidate.excluded.push(server);
         self.advance(id, now, error);
     }
 
@@ -1746,16 +1863,17 @@ impl Resolver {
         let Some(pending) = self.pending.get_mut(&id) else {
             return true;
         };
-        pending.attempt += 1;
+        pending.attempt.used += 1;
         let servers = config.servers().len();
-        let next = (pending.position + 1..=pending.position + servers).find(|&p| {
+        let next = (pending.attempt.position + 1..=pending.attempt.position + servers).find(|&p| {
             let server = config.server(p);
-            !pending.excluded.contains(&server) && pending.may_send(server, connections)
+            !pending.candidate.excluded.contains(&server)
+                && pending.candidate.may_send(server, connections)
         });
-        let Some(position) = next.filter(|_| pending.attempt < config.attempts.get()) else {
+        let Some(position) = next.filter(|_| pending.attempt.used < config.attempts.get()) else {
             return false;
         };
-        pending.position = position;
+        pending.attempt.position = position;
         self.emit(id, now, Deadline::Fresh);
         true
     }
@@ -1767,12 +1885,12 @@ impl Resolver {
         let Some(pending) = self.pending.get_mut(&id) else {
             return;
         };
-        pending.request.edns = None;
-        let Ok(payload) = pending.request.to_vec() else {
+        pending.candidate.request.edns = None;
+        let Ok(payload) = pending.candidate.request.to_vec() else {
             self.give_up(id, Error::Server(ResponseCode::FormErr), now);
             return;
         };
-        pending.payload = payload;
+        pending.candidate.payload = payload;
         self.emit(id, now, Deadline::Fresh);
     }
 
@@ -1784,10 +1902,15 @@ impl Resolver {
     /// issued now would get the cached failure too.
     fn give_up(&mut self, id: QueryId, error: Error, now: Instant) {
         if let Some(pending) = self.pending.get(&id)
-            && let Some(question) = pending.request.queries.first()
+            && let Some(question) = pending.candidate.request.queries.first()
         {
-            self.cache
-                .failed(question, error.clone(), pending.started, &self.config, now);
+            self.cache.failed(
+                question,
+                error.clone(),
+                pending.candidate.started,
+                &self.config,
+                now,
+            );
         }
         self.finish(id, Err(error));
     }
@@ -1813,22 +1936,22 @@ impl Resolver {
     /// waits on if a response has arrived there since the attempt was
     /// written or took its request back (`written_after`) and the
     /// connection holds fewer than `MAX_ORPHANS` orphans. A connection
-    /// with no response since, or with that many orphans, is closed
-    /// instead (`time_out_stream`), which moves this query on (see there
-    /// for the other queries on it). Does nothing if `id` is no longer pending or its
+    /// with no response since, or with that many orphans, is ended
+    /// instead (`End::TimedOut`), which moves this query on with the
+    /// others on it. Does nothing if `id` is no longer pending or its
     /// deadline is after `now`: a close earlier in the same
     /// `handle_timeout` may have moved it on.
     fn time_out(&mut self, id: QueryId, now: Instant) {
         let Some(pending) = self.pending.get(&id) else {
             return;
         };
-        if pending.deadline > now {
+        if pending.attempt.deadline > now {
             return;
         }
         let Route::Stream {
             connection,
             written_after,
-        } = pending.route
+        } = pending.attempt.route
         else {
             self.act_on(id, Input::NoAnswer(Error::Timeout), now);
             return;
@@ -1838,7 +1961,7 @@ impl Resolver {
                 conn.orphans.push(Orphan::of(pending));
                 self.act_on(id, Input::NoAnswer(Error::Timeout), now);
             }
-            Some(_) => self.time_out_stream(connection, now),
+            Some(_) => self.end_connection(connection, &End::TimedOut, now),
             // Can't happen: every path that removes a connection moves
             // its queries on first. Treated as a plain timeout to be
             // safe.
@@ -1849,7 +1972,7 @@ impl Resolver {
     /// Send `id`'s current attempt and count the send: on the open
     /// connection to its server if there is one (RFC 7766 §5), else over a
     /// new connection if it must use a stream, and as a datagram
-    /// otherwise. If the query's own request is still outstanding on that
+    /// otherwise (`dispatch`). If the query's own request is still outstanding on that
     /// connection, left there by a timeout, nothing is written: the attempt
     /// waits for that answer, since writing the message ID again would put
     /// it on the connection twice (RFC 7766 §6.2.1). Only responses from
@@ -1857,8 +1980,8 @@ impl Resolver {
     /// open at the last timeout. Over TLS, the query is first prepared for
     /// the server's address family (`protect`). Fails the query if a TLS
     /// session can't be started. If a TLS session refuses the write, the
-    /// connection is aborted as after a TLS error on received bytes
-    /// (`abort`), and the query moves on with the others on it.
+    /// connection ends as after a TLS error on received bytes
+    /// (`End::TlsError`), and the query moves on with the others on it.
     ///
     /// With `Deadline::Fresh` the query's deadline starts over, also for an
     /// attempt that takes its request back, though nothing is then written
@@ -1875,6 +1998,7 @@ impl Resolver {
             return;
         };
         if let Some(error) = pending
+            .candidate
             .request
             .queries
             .first()
@@ -1892,51 +2016,50 @@ impl Resolver {
         // did, the bytes from before go out.
         #[cfg(feature = "tls")]
         if self.config.uses_tls()
-            && !is_protected_for(&pending.request, server)
-            && let Ok(payload) =
-                protect(&mut pending.request, server).and_then(|()| pending.request.to_vec())
+            && !is_protected_for(&pending.candidate.request, server)
+            && let Ok(payload) = protect(&mut pending.candidate.request, server)
+                .and_then(|()| pending.candidate.request.to_vec())
         {
-            pending.payload = payload;
+            pending.candidate.payload = payload;
         }
-        let open = self
-            .connections
-            .iter_mut()
-            .find(|(_, c)| c.is_open_to(server));
-        let Some((&connection, conn)) = open else {
-            if pending.stream_only {
-                pending.count_send(server, Channel::Stream);
-                let message = frame(&pending.payload);
+        match dispatch(&self.connections, pending, server) {
+            Dispatch::Write(connection) => {
+                pending.candidate.count_send(server, Channel::Stream);
+                let message = frame(&pending.candidate.payload);
+                let written = self.write(connection, &message, now);
+                // Even a write TLS refuses puts the query on the connection,
+                // so that `end_connection` moves it on with the others there.
+                self.written(id, connection);
+                if let Err(error) = written {
+                    self.end_connection(connection, &End::TlsError(error), now);
+                }
+            }
+            Dispatch::TakeBack(connection, index) => {
+                if let Some(conn) = self.connections.get_mut(&connection) {
+                    conn.orphans.swap_remove(index);
+                    pending.attempt.route = Route::Stream {
+                        connection,
+                        written_after: conn.responses,
+                    };
+                }
+            }
+            Dispatch::Connect => {
+                pending.candidate.count_send(server, Channel::Stream);
+                let message = frame(&pending.candidate.payload);
                 match self.connect(server, &message, now) {
                     Ok(connection) => self.written(id, connection),
                     Err(error) => self.give_up(id, error, now),
                 }
-            } else {
-                pending.route = Route::Udp;
-                pending.count_send(server, Channel::Udp);
+            }
+            Dispatch::Udp => {
+                pending.attempt.route = Route::Udp;
+                pending.candidate.count_send(server, Channel::Udp);
                 self.transmits.push_back(Transmit {
                     transport: Transport::Udp(id),
                     destination: server,
-                    payload: pending.payload.clone(),
+                    payload: pending.candidate.payload.clone(),
                 });
             }
-            return;
-        };
-        if let Some(index) = conn.orphans.iter().position(|o| o.is(pending)) {
-            conn.orphans.swap_remove(index);
-            pending.route = Route::Stream {
-                connection,
-                written_after: conn.responses,
-            };
-            return;
-        }
-        pending.count_send(server, Channel::Stream);
-        let message = frame(&pending.payload);
-        let written = self.write(connection, &message, now);
-        // Even a write TLS refuses puts the query on the connection, so
-        // that `abort` moves it on with the others there.
-        self.written(id, connection);
-        if let Err(error) = written {
-            self.abort(connection, now, &error);
         }
     }
 
@@ -1944,7 +2067,7 @@ impl Resolver {
     fn written(&mut self, id: QueryId, connection: ConnectionId) {
         let written_after = self.connections.get(&connection).map_or(0, |c| c.responses);
         if let Some(pending) = self.pending.get_mut(&id) {
-            pending.route = Route::Stream {
+            pending.attempt.route = Route::Stream {
                 connection,
                 written_after,
             };
@@ -2053,7 +2176,12 @@ impl Resolver {
         let queries = self.pending.iter().filter(|(_, p)| p.is_on(connection));
         if reply.has_question() {
             let query = queries
-                .filter(|(_, p)| reply.answers(p.request.metadata.id, &p.request.queries))
+                .filter(|(_, p)| {
+                    reply.answers(
+                        p.candidate.request.metadata.id,
+                        &p.candidate.request.queries,
+                    )
+                })
                 .map(|(id, _)| Matched::Query(*id));
             let orphan = conn
                 .orphans
@@ -2063,7 +2191,7 @@ impl Resolver {
             return query.chain(orphan).next();
         }
         let mut candidates = queries
-            .filter(|(_, p)| reply.responds_to(p.request.metadata.id))
+            .filter(|(_, p)| reply.responds_to(p.candidate.request.metadata.id))
             .map(|(id, _)| Matched::Query(*id))
             .chain(
                 (0..conn.orphans.len())
@@ -2074,38 +2202,22 @@ impl Resolver {
         candidates.next().map_or(only, |_| None)
     }
 
-    /// `connection` went away without being asked to; see
-    /// [`Resolver::handle_stream_closed`]. Emits no `TcpClose`: the driver
-    /// reported the connection gone.
-    fn lost(&mut self, connection: ConnectionId, now: Instant, error: &Error) {
-        if let Some(conn) = self.connections.remove(&connection) {
-            self.move_off(connection, conn.responses, now, error);
-        }
-    }
-
-    /// The server's close_notify ended `connection`'s TLS session (RFC 8446
-    /// §6.1), and `handle_stream_data` has acted on the answers that came
-    /// before it in the same bytes: shut the connection (`shut`, which
-    /// queues the session's last bytes, if it has any, and the `TcpClose`),
-    /// then move its queries off as `lost` does (`move_off`), with
-    /// [`Error::ConnectionClosed`] for those that move on.
-    fn retire(&mut self, connection: ConnectionId, now: Instant) {
-        if let Some(conn) = self.shut(connection) {
-            self.move_off(connection, conn.responses, now, &Error::ConnectionClosed);
-        }
-    }
-
-    /// Move the queries on `connection`, which was lost (`lost`) or retired
-    /// by the server's close_notify (`retire`) after `responses` responses,
-    /// as [`Resolver::handle_stream_closed`] says (`Input::Lost`): a query
-    /// with room to go to its server again is sent again for free if a
-    /// response arrived since it was written or took its request back
-    /// (`written_after`), or, if one arrived only before, by using up its
-    /// free resend; any other query moves on (`retry`) with `error`.
-    fn move_off(&mut self, connection: ConnectionId, responses: u64, now: Instant, error: &Error) {
+    /// End `connection` for the reason `end`: forget it, with a `TcpClose`
+    /// and the TLS session's last bytes unless the driver reported it gone
+    /// (`End::Lost`, which emits nothing), then give every query on it the
+    /// input `end` stands for (`End::input`), in `QueryId` order, so that
+    /// `Pending::decide` moves each on. Nothing happens for a connection
+    /// already ended.
+    fn end_connection(&mut self, connection: ConnectionId, end: &End, now: Instant) {
+        let conn = match end {
+            End::Lost(_) => self.connections.remove(&connection),
+            End::CloseNotify | End::TlsError(_) | End::TimedOut => self.shut(connection),
+        };
+        let Some(conn) = conn else {
+            return;
+        };
         for id in self.queries_on(connection) {
-            let error = error.clone();
-            self.act_on(id, Input::Lost { responses, error }, now);
+            self.act_on(id, end.input(conn.responses), now);
         }
     }
 
@@ -2116,45 +2228,6 @@ impl Resolver {
             .filter(|(_, p)| p.is_on(connection))
             .map(|(id, _)| *id)
             .collect()
-    }
-
-    /// A query on `connection` timed out with no response on it since the
-    /// query was written, which suggests the connection is dead, or the
-    /// connection holds `MAX_ORPHANS` requests that left it unanswered:
-    /// close it, as RFC 7766 §6.2.4 lets either end do under unusual
-    /// conditions. The queries that timed out move on to their next
-    /// attempt. The others are sent again to the same server, keeping
-    /// their attempt, since another lookup's slow answer is no fault of
-    /// theirs. They keep their deadline too: they have been waiting on the
-    /// same unresponsive server, and a free move must not stretch how long
-    /// it can hold them. The move uses up their free resend
-    /// (`Input::Shut`), and one that has used it already, or has no room to
-    /// go to its server again (`Pending::may_resend`), moves on instead, so
-    /// a server that stops answering costs each query a bounded number of
-    /// sends.
-    fn time_out_stream(&mut self, connection: ConnectionId, now: Instant) {
-        if self.shut(connection).is_none() {
-            return;
-        }
-        for id in self.queries_on(connection) {
-            self.act_on(id, Input::Shut, now);
-        }
-    }
-
-    /// Abort `connection`, whose TLS session failed with `error` while
-    /// taking in bytes read from it (`handle_stream_data`, once the answers
-    /// decrypted before the error are handled) or on a write (`emit`):
-    /// shut it (`shut`), then `retry` every query on it (`Input::NoAnswer`),
-    /// which fails one that is out of attempts or servers with `error`. Not
-    /// a TCP reset: the driver gets the same [`Transport::TcpClose`] as for
-    /// any other close.
-    fn abort(&mut self, connection: ConnectionId, now: Instant, error: &Error) {
-        if self.shut(connection).is_none() {
-            return;
-        }
-        for id in self.queries_on(connection) {
-            self.act_on(id, Input::NoAnswer(error.clone()), now);
-        }
     }
 
     /// Forget `connection` and ask the driver to close it. With TLS, the

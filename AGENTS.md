@@ -77,15 +77,19 @@ states (`Pending`'s table, the ways a `Connection` ends, `tls::Session`, the cac
 and where map order shows in the outputs; keep them and the invariants on the fields in sync
 with the code.
 
-- A query's current server is `Config::server(position)` (the list, rotated). `position`
-  starts at `first`, the first server not in `Resolver::failed` (no answer within
+- A `Pending` holds the search (the name as asked, the candidates left, the first NODATA,
+  the followers), its current `Candidate` (the request and what its sends have used up) and
+  the current `Attempt` at it; `next_candidate` replaces the last two. A query's current
+  server is `Config::server(position)` (the list, rotated). `Attempt::position` starts at
+  `Candidate::first`, the first server not in `Resolver::failed` (no answer within
   `Config::failure_memory`), and moves on by one per attempt, past the servers in
-  `Pending::excluded`; how often it has wrapped around sets the backoff round. `attempt`
-  counts the attempts used, bounded by `Config::attempts`. Its `Route` (how the current
-  attempt went out) is `Udp` or `Stream { connection, written_after }`, set by `emit`: every
-  send goes to the open connection to its server if there is one (RFC 7766 §5), else over a
-  new connection if `Pending::stream_only` (after a truncated answer, or with TLS), else over
-  UDP.
+  `Candidate::excluded`; how often it has wrapped around sets the backoff round.
+  `Attempt::used` counts the attempts used, bounded by `Config::attempts`. Its `Route` (how
+  the attempt went out) is `Udp` or `Stream { connection, written_after }`, set by `emit`,
+  which sends the way `dispatch` picks (`Dispatch`): to the open connection to its server if
+  there is one (RFC 7766 §5), taking its own request back if it is still outstanding there,
+  else over a new connection if `Candidate::stream_only` (after a truncated answer, or with
+  TLS), else over UDP.
 - Streams: one connection per server, shared and pipelined by all queries to it (RFC 7766), with
   answers matched by ID and question, or by ID alone when they have no question (§7). A query
   that leaves a connection before its answer (cancelled, or timed out while the connection
@@ -93,7 +97,7 @@ with the code.
   (`new_message` avoids it, §6.2.1) until the answer comes or the connection ends, it keeps
   the connection busy until its old deadline, and `emit` takes it back instead of writing the
   ID again if a later attempt returns to that connection. A connection holding
-  `MAX_ORPHANS` (256) of them is closed when another would join them (`time_out_stream`),
+  `MAX_ORPHANS` (256) of them is closed when another would join them (`End::TimedOut`),
   so a busy connection can't use up the ID space. `Connection::responses` counts complete
   responses; `Route::Stream`'s `written_after` records it at write time and again when `emit`
   takes an orphan back, so a timeout closes the connection only if no response arrived
@@ -103,18 +107,22 @@ with the code.
   `src/tls.rs`; the driver only moves bytes. Queries written during the handshake wait in the
   session's own queue, not rustls' 64 KiB buffer, and `Session::receive` drains the plaintext
   after every record batch (rustls holds 16 KiB), and also after a TLS error, so the answers
-  decrypted before it count. Every close the resolver starts goes through `shut`, which sends
-  the alert rustls queued for a TLS error, or else the session's close_notify, as a `TcpWrite`
-  before the `TcpClose` (RFC 8446 §6), and nothing after an alert from the server that rustls
-  reports as the error (`AlertReceived`, recorded in `Session::alerted`). A TLS error on
-  received bytes (`tls::Ending::Failed`, after the answers decrypted before it, which can't
-  send on the connection either) or a refused write aborts the connection: `abort` calls
-  `shut`, then `retry` for each query on it. The server's close_notify once the handshake is
-  done (`tls::Ending::CloseNotify`; before then rustls takes it for a TLS error, or ignores it
-  if it is a warning, one of the session's first four, from before the server has chosen TLS
-  1.3) retires the connection like `handle_stream_closed` (`retire`:
-  `shut`, then `move_off`), after the answers decrypted with it, which can't send on it
-  (`Connection::closing`, skipped by `emit` and `channel` through `Connection::is_open_to`).
+  decrypted before it count. A connection with queries on it ends for one of the reasons
+  in `End`, which `end_connection` carries out: it forgets the connection, through `shut`
+  unless the driver reported it gone (`End::Lost`), then gives each query on it the `Input`
+  the `End` stands for (`End::input`). `shut`, which idle closes and `shutdown` call
+  directly, sends the alert rustls queued for a TLS error, or else the session's
+  close_notify, as a `TcpWrite` before the `TcpClose` (RFC 8446 §6), and nothing after an
+  alert from the server that rustls reports as the error (`AlertReceived`, recorded in
+  `Session::alerted`). A TLS error on received bytes (`tls::Ending::Failed`, after the
+  answers decrypted before it, which can't send on the connection either) or a refused write
+  is `End::TlsError`: `Input::NoAnswer`, so `retry`, for each query on it. The server's
+  close_notify once the handshake is done (`tls::Ending::CloseNotify`; before then rustls
+  takes it for a TLS error, or ignores it if it is a warning, one of the session's first
+  four, from before the server has chosen TLS 1.3) is `End::CloseNotify`, which ends the
+  connection like `handle_stream_closed` (`End::Lost`) does, with `Input::Lost`, after the
+  answers decrypted with it, which can't send on it (`Connection::closing`, skipped by `emit`
+  and `channel` through `Connection::is_open_to`).
   `shutdown` drops every query and shuts every connection, for a driver that stops. Over TLS,
   `wire::protect` adds the EDNS Client Subnet privacy option (prefix 0, FAMILY of the
   server's address, RFC 8310 §11.1) and then the padding, last; `emit` runs it again when a
@@ -122,8 +130,9 @@ with the code.
   authentication name per server.
 - Whatever happens to a query's current attempt reaches it as an `Input` to `act_on`: a
   reply (`handle_reply`, which first takes the server off `Resolver::failed`), no answer
-  (`time_out`, `handle_udp_error`, `abort`), its connection lost or retired (`move_off`),
-  or shut by the resolver (`time_out_stream`). `Pending::decide` picks the move in one
+  (`time_out`, `handle_udp_error`, `End::TlsError`), its connection lost or ended by the
+  server's close_notify (`End::Lost`, `End::CloseNotify`), or shut by the resolver
+  (`End::TimedOut`). `Pending::decide` picks the move in one
   `match` and returns an `Action` for `act_on` to carry out. A truncated reply over UDP
   switches the query to TCP (`decide` sets `stream_only`, then resends), even if its records
   don't decode. Any other reply whose header and question match but whose records don't
@@ -139,15 +148,15 @@ with the code.
   (`Action::Resend` through `emit`, and `Action::ResendWithoutEdns` through `drop_edns`) after a truncated answer (once,
   since `stream_only` stays set), FORMERR without OPT (once, since `request.edns` is gone),
   a lost or retired connection (`Input::Lost`: free every time if the connection answered
-  after the query was written, else once per query via `Pending::use_free_resend`) and a
+  after the query was written, else once per query via `Candidate::use_free_resend`) and a
   connection the resolver shut (`Input::Shut`: once, via the same `use_free_resend`).
   Outside `decide` there are `next_candidate` (next search name, fresh attempts, no
-  exclusions), `give_up` and `finish`. `emit` counts every send in `Pending::sends`: a
+  exclusions), `give_up` and `finish`. `emit` counts every send in `Candidate::sends`: a
   search candidate goes at most three times to a server over one transport (RFC 9520
   §3.1), so `advance` skips servers without room (in `try_advance`), and the free sends, a
   cancel hand-over's resend included, check `Pending::may_resend` first (in `cancel` and
   `decide`) and move on instead. Only `emit` sets a query's deadline (`Config::deadline`;
-  `new_pending` leaves a placeholder): every caller passes `Deadline::Fresh` except the
+  `Attempt::first` leaves a placeholder): every caller passes `Deadline::Fresh` except the
   free resend after `Input::Shut`, which passes `Deadline::Kept`. The crate docs' "How a
   query moves on" table states the rules (at most `attempts + 3` sends per search
   candidate, not counting a cancel hand-over's resend or the resends after a lost
@@ -169,12 +178,12 @@ with the code.
   `Negative(Stored)` or `Failed(Failure)`; a positive answer would be one more variant like
   `Negative`. It reads time only from `now`, so `poll_timeout` doesn't change: an expired
   negative entry is dropped on lookup, an expired failure stays for the backoff (until its
-  `forget`, which `Cache::failed` compares with `Pending::started`), and the
+  `forget`, which `Cache::failed` compares with `Candidate::started`), and the
   `Config::cache_entries` bound drops expired entries first, then the oldest by `serial`. Lookups: `start` and `search_on` run `walk` over the search
   candidates before joining or sending (a cached NXDOMAIN or NODATA goes into the `Outcome`
   and moves on, a cached failure ends the search), and `emit` refuses to send a question
   with a cached failure, failing the query instead. Stores: `give_up` (every failure,
-  `Cache::failed`, with the backoff judged by `Pending::started`), and `act_on`
+  `Cache::failed`, with the backoff judged by `Candidate::started`), and `act_on`
   (`Cache::answered` for data, `Cache::negative` for NXDOMAIN and NODATA, which also ends a
   failure's backoff; error codes and referrals don't). `flush_cache` also clears `Resolver::failed`.
 - Some names are answered without a transmit, in this order: `localhost.`, `invalid.` and
