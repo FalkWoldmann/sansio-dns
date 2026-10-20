@@ -205,9 +205,9 @@ with the code.
 - The Tokio driver's `lookup_ip` turns a host into a `Name` itself (`host_name`): UTS 46 over
   the whole name for non-ASCII input (the `idna` crate), A-label checks for ASCII input, which
   is otherwise used as given, and RFC 1123 §2.1 rejections of empty and numeric hosts.
-- Driver obligations (also in the README): bind a fresh UDP socket per query (RFC 5452 §9.2),
-  connected to its server, with a new one for each server (§9.1), and pass that query with
-  each datagram; report a failed bind, connect, send or receive (ICMP errors) with
+- Driver obligations (also in the crate docs, with a checklist in the README): bind a fresh
+  UDP socket per query (RFC 5452 §9.2), connected to its server, with a new one for each
+  server (§9.1), and pass that query with each datagram; report a failed bind, connect, send or receive (ICMP errors) with
   `handle_udp_error`, a stream that the server closed with `handle_stream_closed` and an I/O
   failure with `handle_stream_error`; receive datagrams into a buffer that holds any (65535
   bytes), since a server may send more than the 1232 the queries advertise; write each stream
@@ -243,9 +243,11 @@ that limitation is documented, not handled.
 
 ## Tests
 
-`tests/rfc<number>.rs` mostly hold one module per RFC section (the README lists the
-exceptions), and the README's spec coverage table lists the behaviour each section pins: keep
-the table in sync when behaviour changes.
+`tests/rfc<number>.rs` mostly hold one module per RFC section (`docs/testing.md` lists the
+exceptions), and the spec coverage table in `docs/spec-coverage.md` lists the behaviour each
+section pins: keep the table in sync when behaviour changes. The README's Rust snippets are
+doctests of the core crate (`mod readme` in `src/lib.rs`), so they must compile; the
+reference material lives in `docs/` (`configuration.md`, `spec-coverage.md`, `testing.md`).
 `tests/common/mod.rs` has the fixtures (a resolver with servers `S1`, `S2`, and helpers to
 start a query, build replies, frame and encode them; `start_distinct` for queries that must
 not coalesce; `reply` answers as a recursive server does, with RA set, so an empty answer is
