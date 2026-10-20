@@ -90,17 +90,36 @@ The minimum supported Rust version is 1.88. The core depends only on
 ## Driving the resolver yourself
 
 The core's `Resolver` is a state machine. Every call takes `now: Instant`, and it never
-blocks or waits. A driver loops over five things:
+blocks or waits: the driver does the I/O it asks for and feeds back what happens. One
+query over UDP, with a retry, looks like this; a stream goes the same way through
+`TcpConnect`, `TcpWrite` and `TcpClose` transmits and `handle_stream_data`,
+`handle_stream_closed` and `handle_stream_error`.
 
-1. Start queries with `query` (any record type) or `lookup_ip` (A and AAAA, merged).
-2. Send every `Transmit` from `poll_transmit`, over the transport it names.
-3. Feed what arrives to `handle_datagram` or `handle_stream_data`, and errors to
-   `handle_udp_error`, `handle_stream_closed` or `handle_stream_error`.
-4. Call `handle_timeout` once the instant from `poll_timeout` has passed.
-5. Collect outcomes from `poll_event`, and lookups' from `poll_lookup`.
+```mermaid
+sequenceDiagram
+    participant D as Driver
+    participant R as Resolver
+    D->>R: query(name, type, now)
+    R-->>D: QueryId
+    loop until poll_event() has the query's outcome
+        D->>R: poll_transmit()
+        R-->>D: Transmit { Udp(query), destination, payload }
+        Note over D: bind a socket for the query, connect, send
+        alt a datagram arrives
+            D->>R: handle_datagram(query, from, bytes, now)
+        else poll_timeout() has passed
+            D->>R: handle_timeout(now)
+        else the send or receive failed
+            D->>R: handle_udp_error(query, to, kind, now)
+        end
+        D->>R: poll_event()
+        R-->>D: Response { query, response } or Failed { query, error }
+    end
+```
 
-Before stopping, call `shutdown` and carry out its transmits, which close the open
-connections.
+`lookup_ip` runs the A and AAAA queries the same way and merges their addresses into
+`poll_lookup`. Before stopping, call `shutdown` and carry out its transmits, which close
+the open connections.
 
 A blocking driver for one query over UDP, in full:
 
@@ -242,26 +261,40 @@ and each next attempt to the next server, wrapping around. With `Config::new`'s 
 and two servers, the four attempts wait 5, 5, 10 and 10 seconds, so a query that nobody
 answers fails after 30 seconds; with one server, after 15.
 
-- **No answer** by the deadline, or an ICMP error: the next attempt goes to the next server,
-  and the server is remembered as failed for a minute, so new queries start elsewhere.
-- **A server error** (`SERVFAIL`, `REFUSED`, a reply that doesn't decode, a referral): the
-  server is skipped for the rest of this name, and the next attempt goes to the next one.
-- **A truncated answer** over UDP: the same query goes to the same server over TCP, without
-  using an attempt. `FORMERR` to a query with EDNS: once more without EDNS.
-- **A lost connection** that had answered something: the queries on it are sent again,
-  without using an attempt.
-- **NXDOMAIN or NODATA** with search domains left: the next candidate, with fresh attempts.
-- **Out of attempts or servers**: the query fails with the last error, and so do the queries
-  that joined it. The failure is cached for the question, for 1 s at first and twice as long
-  each time it fails again soon after, up to 30 s. While it is cached, queries for the
-  question fail at once without being sent.
+```mermaid
+stateDiagram-v2
+    direction LR
+    state Waiting {
+        direction LR
+        state "over UDP" as Udp
+        state "on a stream" as Stream
+        Udp --> Udp: no answer, ICMP error or server error (next server)
+        Udp --> Udp: FORMERR without OPT (same server, without EDNS)
+        Udp --> Stream: truncated answer (same server, over TCP)
+        Stream --> Stream: no answer, server error or TLS error (next server)
+        Stream --> Stream: connection lost or shut (same server again)
+        Stream --> Udp: next server has no connection open, and the query may use UDP
+    }
+    [*] --> Waiting: sent
+    [*] --> Response: answered locally, or from the cache
+    [*] --> Failed: a failure is cached for the question
+    Waiting --> Waiting: NXDOMAIN or NODATA, with a search candidate left (fresh attempts)
+    Waiting --> Response: NOERROR with data, or NXDOMAIN or NODATA with no candidate left
+    Waiting --> Failed: out of attempts, or every server skipped
+    Response --> [*]
+    Failed --> [*]
+```
 
-A search candidate is sent at most three times to each server over each transport (RFC
-9520 §3.1), free resends included, and every wait is between 1 s and 300 s, so every query
-ends in bounded time. The crate docs' [How a query moves
+A "next server" move uses up one of the query's attempts and, after no answer, puts the
+server behind the others for a minute; a "same server" move is free, once. A failure is
+cached for the question, 1 s at first and twice as long on each failure soon after, up to
+30 s, and queries for it fail at once meanwhile. A search candidate is sent at most three
+times to each server over each transport (RFC 9520 §3.1), and every wait is between 1 s
+and 300 s, so every query ends in bounded time. The crate docs' [How a query moves
 on](https://docs.rs/sansio-dns/latest/sansio_dns/#how-a-query-moves-on) has the full table,
-and its [Cache](https://docs.rs/sansio-dns/latest/sansio_dns/#cache) section what is cached
-for how long.
+with the attempt and deadline each move takes, and its
+[Cache](https://docs.rs/sansio-dns/latest/sansio_dns/#cache) section what is cached for how
+long.
 
 ## DNS over TLS
 

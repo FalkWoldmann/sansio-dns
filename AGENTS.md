@@ -164,8 +164,9 @@ with the code.
   query moves on" table states the rules (at most `attempts + 3` sends per search
   candidate, not counting a cancel hand-over's resend or the resends after a lost
   connection that answered since, and at most three per server and transport, all of
-  those included), and a comment above `act_on` maps each row to `decide` and the
-  functions: change them together and keep the table in sync.
+  those included), a comment above `act_on` maps each row to `decide` and the
+  functions, and the README draws the states and moves as a Mermaid diagram (coarse: no
+  attempt or deadline accounting): change them together and keep the table in sync.
 - Every wait is bounded (RFC 1123 §6.1.3.3): `Timeout`, `FailureMemory` and `FailureCache`
   clamp to the RFCs' bounds when constructed, so `Config` holds no value out of range, and
   `Config::wait` only caps the backoff at 300 s. Deadlines are plain `Instant`s; nothing

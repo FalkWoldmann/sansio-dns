@@ -7,6 +7,7 @@
 //! is a ready-made Tokio driver; use it if you just want addresses.
 //!
 //! [`sansio_dns_tokio`]: https://docs.rs/sansio-dns-tokio
+//! [README]: https://github.com/FalkWoldmann/sansio-dns#how-a-query-moves-on
 //!
 //! # Driving the resolver
 //!
@@ -221,7 +222,8 @@
 //! # How a query moves on
 //!
 //! A query tries its servers in turn, waiting longer on each round, until one
-//! answers or it runs out of attempts. With [`Config::new`]'s defaults and
+//! answers or it runs out of attempts. The [README] draws the states and the
+//! moves between them; the table here adds what each move costs. With [`Config::new`]'s defaults and
 //! two servers, the four attempts wait 5, 5, 10 and 10 seconds, so a query
 //! that nobody answers fails after 30 seconds; with one server, after 15.
 //! The [table](#the-rules) below has every rule, and the sections around it
