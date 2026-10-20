@@ -473,7 +473,7 @@ async fn dropped_lookup_sends_no_retries() {
     let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let mut config = Config::new(silent.local_addr().unwrap(), []);
     // The shortest wait the core allows; a retry would come after it.
-    config.timeout = Duration::from_secs(1);
+    config.timeout = Duration::from_secs(1).into();
     let resolver = Resolver::new(config);
     let mut buf = [0; 512];
 
@@ -596,7 +596,7 @@ async fn retry_reaches_a_server_of_the_other_family() {
     let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let (server, _) = name_server_on(IpAddr::V6(Ipv6Addr::LOCALHOST), "app.example.", false).await;
     let mut config = Config::new(silent.local_addr().unwrap(), [server]);
-    config.timeout = Duration::from_secs(1);
+    config.timeout = Duration::from_secs(1).into();
     let resolver = Resolver::new(config);
 
     let addresses = resolver.lookup_ip("app.example").await.unwrap();

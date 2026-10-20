@@ -70,7 +70,7 @@ mod section_6_1_3_3 {
     /// `S1` alone, with `timeout` and three attempts.
     fn one_server(timeout: Duration) -> Trace {
         let mut config = Config::new(S1, []);
-        config.timeout = timeout;
+        config.timeout = timeout.into();
         config.attempts = NonZeroUsize::new(3).unwrap();
         Trace::new(Resolver::new(config))
     }
@@ -179,7 +179,7 @@ mod section_6_1_3_3 {
     #[test]
     fn timeout_below_one_second_waits_one() {
         let mut config = Config::new(S1, [S2]);
-        config.timeout = Duration::ZERO;
+        config.timeout = Duration::ZERO.into();
         let mut trace = Trace::new(Resolver::new(config));
         trace.query("example.com.", RecordType::A);
 

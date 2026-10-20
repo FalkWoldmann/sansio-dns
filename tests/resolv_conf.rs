@@ -311,7 +311,7 @@ mod options {
     #[case::negative("options timeout:-1 attempts:-1", 1, 1)]
     fn timeout_and_attempts(#[case] options: &str, #[case] secs: u64, #[case] per_server: usize) {
         let config = config(options);
-        assert_eq!(config.timeout, Duration::from_secs(secs));
+        assert_eq!(config.timeout.get(), Duration::from_secs(secs));
         assert_eq!(config.attempts.get(), per_server);
     }
 }
@@ -392,7 +392,7 @@ mod environment {
         assert_eq!(config.ndots, 4);
         assert_eq!(config.ip_strategy, IpStrategy::Ipv6First);
         assert!(!config.tld_query);
-        assert_eq!(config.timeout, Duration::from_secs(3));
+        assert_eq!(config.timeout.get(), Duration::from_secs(3));
     }
 
     /// `RES_OPTIONS` ends at its first NUL byte, as a C string does.

@@ -19,7 +19,7 @@ fn name(s: &str) -> Name {
 /// changes.
 fn one_server(change: impl FnOnce(&mut Config)) -> Trace {
     let mut config = Config::new(S1, []);
-    config.timeout = Duration::from_secs(2);
+    config.timeout = Duration::from_secs(2).into();
     change(&mut config);
     Trace::new(Resolver::new(config))
 }

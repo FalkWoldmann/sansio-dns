@@ -155,7 +155,7 @@ fuzz_target!(|input: Input| {
     let mut config = Config::new(S1, servers.iter().skip(1).copied());
     let attempts = 1 + usize::from(attempts % 6);
     config.attempts = NonZeroUsize::new(attempts).unwrap_or(NonZeroUsize::MIN);
-    config.timeout = Duration::from_millis(1 + u64::from(timeout_millis));
+    config.timeout = Duration::from_millis(1 + u64::from(timeout_millis)).into();
     config.idle_timeout = Duration::from_millis(1 + u64::from(idle_millis));
     // One send per attempt, plus a switch to TCP, an EDNS downgrade and a
     // free resend, each at most once; the harness leaves out the resends

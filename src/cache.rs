@@ -129,7 +129,7 @@ struct Failure {
     /// How long it was cached for, which the next failure doubles.
     duration: Duration,
     /// Until when a query sent for the question backs off from it if it
-    /// fails too: `Config::failure_cache_max` after `until`.
+    /// fails too: `FailureCache::longest` after `until`.
     forget: Instant,
 }
 
@@ -158,7 +158,7 @@ enum Backoff {
     /// as when two queries for the question were in flight at once: as
     /// long as before, and no earlier than `until`.
     Overlapping { duration: Duration, until: Instant },
-    /// The query was first sent within `Config::failure_cache_max` after
+    /// The query was first sent within `FailureCache::longest` after
     /// the previous failure expired: twice as long as before (RFC 9520
     /// §3.2).
     Doubled(Duration),
@@ -283,9 +283,9 @@ impl Cache {
 
     /// `question` failed at `now` with `error` (RFC 9520 §2), for a query
     /// first sent at `sent`: nothing is sent for it for a while (§3.2).
-    /// That is `Config::failure_cache_min` the first time; twice as long
+    /// That is `FailureCache::shortest` the first time; twice as long
     /// as the previous entry if the query was first sent within
-    /// `Config::failure_cache_max` after that one expired (§3.2's backoff),
+    /// `FailureCache::longest` after that one expired (§3.2's backoff),
     /// up to that maximum, however long its retries took; and as long as
     /// the previous one if the query was sent while it was still live, as
     /// when two queries for the question were in flight at once.
@@ -297,7 +297,10 @@ impl Cache {
         config: &Config,
         now: Instant,
     ) {
-        let (shortest, longest) = config.failure_cache();
+        let (shortest, longest) = (
+            config.failure_cache.shortest(),
+            config.failure_cache.longest(),
+        );
         let (key, _) = Key::of(question);
         // Lookups keep failure entries after they expire, so the previous
         // one is still here unless an answer ended it or the size bound

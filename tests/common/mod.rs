@@ -28,7 +28,7 @@ pub fn resolver() -> Resolver {
 /// The settings of [`resolver`].
 pub fn config() -> Config {
     let mut config = Config::new(S1, [S2]);
-    config.timeout = Duration::from_secs(2);
+    config.timeout = Duration::from_secs(2).into();
     config
 }
 

@@ -15,7 +15,7 @@ use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use insta::assert_snapshot;
 use proptest::prelude::*;
 use rstest::rstest;
-use sansio_dns::{Config, Event, Resolver, Transmit, Transport};
+use sansio_dns::{Config, Event, FailureMemory, Resolver, Transmit, Transport};
 
 /// Start a query and return its transmit on a stream: answer it with TC
 /// set over UDP, unless it went straight to an open connection.
@@ -237,7 +237,7 @@ mod section_5 {
     #[test]
     fn retry_goes_to_the_open_connection() {
         let mut config = config();
-        config.failure_memory = Duration::ZERO;
+        config.failure_memory = FailureMemory::OFF;
         let mut trace = Trace::new(Resolver::new(config));
         trace.query("a.example.", RecordType::A);
         trace.timeout();
@@ -559,7 +559,7 @@ mod section_6_2_3 {
     #[test]
     fn cancelled_query_keeps_the_connection_busy_until_its_deadline() {
         let mut config = config();
-        config.timeout = Duration::from_secs(30);
+        config.timeout = Duration::from_secs(30).into();
         let mut trace = Trace::new(Resolver::new(config));
         let q0 = trace.query("example.com.", RecordType::A);
         let sent = trace.last();
@@ -588,7 +588,7 @@ mod section_6_2_3 {
     #[test]
     fn answer_to_a_cancelled_query_starts_the_idle_time() {
         let mut config = config();
-        config.timeout = Duration::from_secs(30);
+        config.timeout = Duration::from_secs(30).into();
         let mut trace = Trace::new(Resolver::new(config));
         let q0 = trace.query("example.com.", RecordType::A);
         let sent = trace.last();
@@ -1138,7 +1138,7 @@ mod stream_timeout {
     #[test]
     fn with_one_server_the_next_attempt_waits_on_the_connection() {
         let mut config = Config::new(S1, []);
-        config.timeout = Duration::from_secs(2);
+        config.timeout = Duration::from_secs(2).into();
         config.attempts = NonZeroUsize::new(3).unwrap();
         let mut trace = Trace::new(Resolver::new(config));
         let [first, second] = truncate_all(&mut trace, ["a.example.", "b.example."]);
@@ -1180,7 +1180,7 @@ mod stream_timeout {
     #[test]
     fn silent_connection_is_closed_when_the_next_attempt_times_out() {
         let mut config = Config::new(S1, []);
-        config.timeout = Duration::from_secs(2);
+        config.timeout = Duration::from_secs(2).into();
         config.attempts = NonZeroUsize::new(3).unwrap();
         let mut trace = Trace::new(Resolver::new(config));
         let [_, second] = truncate_all(&mut trace, ["a.example.", "b.example."]);
@@ -1219,7 +1219,7 @@ mod stream_timeout {
     #[test]
     fn busy_connection_is_not_idle() {
         let mut config = Config::new(S1, [S2]);
-        config.timeout = Duration::from_secs(30);
+        config.timeout = Duration::from_secs(30).into();
         let mut resolver = Resolver::new(config);
         let now = Instant::now();
         switch_to_tcp(&mut resolver, now);

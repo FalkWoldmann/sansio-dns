@@ -20,7 +20,7 @@
 //! `Resolver::lookups`, which says how it moves on: it waits for the
 //! queries it started for its current search candidate. Every input that
 //! can end a query ends with `Resolver::run_lookups`, which hands each
-//! event queued during the input (those from `Resolver::handed` on) to the
+//! event queued during the input (those `Events::hand` gives it) to the
 //! lookup waiting for its query, in the order they were queued. A lookup
 //! that moves on starts the next candidate's queries there, with the
 //! input's `now`, and their events, if they end at once, are handed over in
@@ -758,6 +758,45 @@ impl Orphan {
     }
 }
 
+/// The events of the queries that ended, in order: for the driver, from
+/// [`Resolver::poll_event`], and before that for the lookups
+/// (`Resolver::run_lookups`), which are handed each event once.
+#[derive(Debug, Default)]
+struct Events {
+    queue: VecDeque<Event>,
+    /// How many of `queue`, from the front, the lookups were handed: all of
+    /// them between inputs.
+    handed: usize,
+}
+
+impl Events {
+    fn push(&mut self, event: Event) {
+        self.queue.push_back(event);
+    }
+
+    fn extend(&mut self, events: impl IntoIterator<Item = Event>) {
+        self.queue.extend(events);
+    }
+
+    /// The next event for the driver.
+    fn pop(&mut self) -> Option<Event> {
+        let event = self.queue.pop_front()?;
+        self.handed = self.handed.saturating_sub(1);
+        Some(event)
+    }
+
+    /// The next event the lookups haven't been handed, which they now are.
+    fn hand(&mut self) -> Option<&Event> {
+        let event = self.queue.get(self.handed)?;
+        self.handed += 1;
+        Some(event)
+    }
+
+    fn len(&self) -> usize {
+        self.queue.len()
+    }
+}
+
 /// The numbers for the handles of one kind, given out in order from zero.
 #[derive(Debug, Default)]
 struct Counter(u64);
@@ -892,10 +931,7 @@ pub struct Resolver {
     /// Resolution failures and negative answers, by question.
     cache: Cache,
     transmits: VecDeque<Transmit>,
-    events: VecDeque<Event>,
-    /// How many of `events`, from the front, the lookups were handed
-    /// (`run_lookups`): all of them between inputs.
-    handed: usize,
+    events: Events,
     lookup_ids: Counter,
     /// The address lookups running. Each waits for queries no other one
     /// started.
@@ -930,8 +966,7 @@ impl Resolver {
             failed: BTreeMap::new(),
             cache: Cache::default(),
             transmits: VecDeque::new(),
-            events: VecDeque::new(),
-            handed: 0,
+            events: Events::default(),
             lookup_ids: Counter::default(),
             lookups: Vec::new(),
             looked_up: VecDeque::new(),
@@ -1434,9 +1469,7 @@ impl Resolver {
     /// Next completed query, if any. The queries of the lookups started
     /// with [`Resolver::lookup_ip`] are among them.
     pub fn poll_event(&mut self) -> Option<Event> {
-        let event = self.events.pop_front()?;
-        self.handed = self.handed.saturating_sub(1);
-        Some(event)
+        self.events.pop()
     }
 
     /// Next lookup started with [`Resolver::lookup_ip`] that is done, if
@@ -1523,8 +1556,7 @@ impl Resolver {
     /// its next search candidate, whose events, if they end at once, are
     /// handed over in turn.
     fn run_lookups(&mut self, now: Instant) {
-        while let Some(event) = self.events.get(self.handed) {
-            self.handed += 1;
+        while let Some(event) = self.events.hand() {
             let (Event::Response { query, .. } | Event::Failed { query, .. }) = event;
             let Some(index) = self.lookups.iter().position(|l| l.waits_for(*query)) else {
                 continue;
@@ -1584,7 +1616,7 @@ impl Resolver {
                 })
         };
         if let Some(response) = local {
-            self.events.push_back(Event::Response {
+            self.events.push(Event::Response {
                 query: id,
                 response,
             });
@@ -1598,12 +1630,12 @@ impl Resolver {
         let candidate = match self.walk(&mut rest, record_type, &mut outcome, now) {
             Next::Send(candidate) => candidate,
             Next::Failed(error) => {
-                self.events.push_back(Event::Failed { query: id, error });
+                self.events.push(Event::Failed { query: id, error });
                 return Ok(id);
             }
             Next::Done => {
                 if let Some(response) = outcome.into_response() {
-                    self.events.push_back(Event::Response {
+                    self.events.push(Event::Response {
                         query: id,
                         response,
                     });
@@ -1916,7 +1948,7 @@ impl Resolver {
         let Some(pending) = self.pending.get(&id) else {
             return;
         };
-        if let Some(until) = now.checked_add(self.config.failed_for()) {
+        if let Some(until) = now.checked_add(self.config.failure_memory.get()) {
             self.failed.insert(pending.server(&self.config), until);
         }
         self.advance(id, now, error);
@@ -2019,7 +2051,7 @@ impl Resolver {
             .flatten()
             .map(|query| event(query, outcome.clone()))
             .collect();
-        self.events.push_back(event(id, outcome));
+        self.events.push(event(id, outcome));
         self.events.extend(copies);
     }
 

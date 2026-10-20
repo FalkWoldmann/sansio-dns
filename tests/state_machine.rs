@@ -45,7 +45,7 @@ use proptest::prelude::*;
 use proptest::sample::Index;
 use proptest::strategy::Union;
 use proptest_state_machine::{ReferenceStateMachine, StateMachineTest, prop_state_machine};
-use sansio_dns::{ConnectionId, Event, QueryId, Resolver, Transmit, Transport};
+use sansio_dns::{ConnectionId, Event, FailureCache, QueryId, Resolver, Transmit, Transport};
 
 /// Names to query. Few, so that queries often join one in flight.
 const NAMES: usize = 3;
@@ -74,9 +74,9 @@ const MAX_SENDS: usize = ATTEMPTS + 3;
 /// the negative answer is cached for that many seconds (RFC 2308 §5).
 const NEGATIVE_TTL: u32 = 3;
 
-/// How long a failure is cached at least and at most: the default
-/// `Config::failure_cache_min`, and a `failure_cache_max` short enough for
-/// the backoff to reach it.
+/// How long a failure is cached at least and at most: `FailureCache`'s
+/// default shortest time, and a longest short enough for the backoff to
+/// reach it.
 const FAILURE_CACHED: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(4));
 
 /// Transmits kept for replies, so late replies to old ones still happen.
@@ -428,7 +428,7 @@ impl Harness {
             resolver: {
                 let mut config = config();
                 config.attempts = NonZeroUsize::new(ATTEMPTS).unwrap();
-                config.failure_cache_max = FAILURE_CACHED.1;
+                config.failure_cache = FailureCache::new(FAILURE_CACHED.0, FAILURE_CACHED.1);
                 Resolver::new(config)
             },
             now: Instant::now(),

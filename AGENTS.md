@@ -166,9 +166,10 @@ with the code.
   connection that answered since, and at most three per server and transport, all of
   those included), and a comment above `act_on` maps each row to `decide` and the
   functions: change them together and keep the table in sync.
-- Every wait is bounded (RFC 1123 §6.1.3.3): `Config::wait` keeps a deadline between 1 s
-  and 300 s after backoff, and `Config::failed_for` caps the failure memory at 5
-  minutes (RFC 9520 §3.2). Deadlines are plain `Instant`s; nothing waits forever.
+- Every wait is bounded (RFC 1123 §6.1.3.3): `Timeout`, `FailureMemory` and `FailureCache`
+  clamp to the RFCs' bounds when constructed, so `Config` holds no value out of range, and
+  `Config::wait` only caps the backoff at 300 s. Deadlines are plain `Instant`s; nothing
+  waits forever.
 - A query for the same name (as given) and type as a pending one joins it as a
   follower (`Pending::followers`) and gets its outcome, failures included however late it
   joined; `cancel(id, now)` hands a query with followers to the first of them, re-sending a
@@ -202,7 +203,7 @@ with the code.
   cache applies as for any query). The `lookup::Lookup` merges the addresses of its queries'
   events and returns a `Step`: wait for the other query, `Next(candidate)` when neither has
   an address, or `Done`. Every input that can end a query ends with `run_lookups`, which
-  hands each event queued during the input (from `Resolver::handed` on) to the lookup waiting
+  hands each event queued during the input (`Events::hand`, in `Resolver::events`) to the lookup waiting
   for its query, in queue order, starts the next candidate's queries on `Step::Next`, and
   queues the outcome for `poll_lookup` on `Step::Done`. So a lookup moves on within the
   input that ended its queries, with that input's `now`: the next candidate's transmits come

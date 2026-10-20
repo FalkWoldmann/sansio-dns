@@ -197,7 +197,7 @@ arrive there too, with their response code in `response.metadata.response_code`.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `timeout` | 5 s | Wait for an answer on the first round; doubled on each round through the servers; clamped to 1 s to 300 s |
+| `timeout` | 5 s | Wait for an answer on the first round; doubled on each round through the servers. A `Timeout`, kept between 1 s and 300 s |
 | `attempts` | 2 per server | Attempts per query, across all servers |
 | `search` | none | Search domains, tried in order |
 | `ndots` | 1 | A name with at least this many dots is tried as given before the search domains |
@@ -206,9 +206,8 @@ arrive there too, with their response code in `response.metadata.response_code`.
 | `hosts` | none | Static entries, from `Hosts::parse` |
 | `ip_strategy` | `Ipv6First` | Which families `lookup_ip` asks for, and which come first |
 | `idle_timeout` | 10 s | Close a stream connection after this long without a query |
-| `failure_memory` | 60 s | A server that didn't answer goes after the others for this long; at most 5 min |
-| `failure_cache_min` | 1 s | A failed question isn't sent again for this long; at least 1 s |
-| `failure_cache_max` | 30 s | The failure cache time doubles up to this on repeated failures; at most 5 min |
+| `failure_memory` | 60 s | A server that didn't answer goes after the others for this long. A `FailureMemory`, at most 5 min |
+| `failure_cache` | 1 s, 30 s | A failed question isn't sent again for the shortest time, doubling up to the longest on repeated failures. A `FailureCache`, both between 1 s and 5 min |
 | `max_negative_ttl` | 1 h | Cap on how long NXDOMAIN and NODATA are cached |
 | `cache_entries` | 1024 | Failures and negative answers held; the oldest are dropped first |
 

@@ -177,7 +177,7 @@ fn cancelled_leader_on_a_stream_hands_over_without_sending(mut trace: Trace) {
 #[test]
 fn late_joiner_gets_the_failure() {
     let mut config = Config::new(S1, []);
-    config.timeout = Duration::from_secs(2);
+    config.timeout = Duration::from_secs(2).into();
     let mut trace = Trace::new(Resolver::new(config));
     trace.query("example.com.", RecordType::A);
     trace.timeout_at(Duration::from_secs(2));
@@ -209,7 +209,7 @@ fn late_joiner_gets_the_failure() {
 #[test]
 fn joined_query_follows_the_search() {
     let mut config = Config::new(S1, []);
-    config.timeout = Duration::from_secs(2);
+    config.timeout = Duration::from_secs(2).into();
     config.search = vec![Name::from_ascii("corp.example.").unwrap()];
     let mut trace = Trace::new(Resolver::new(config));
     trace.query("db", RecordType::A);
@@ -244,7 +244,7 @@ fn joined_query_follows_the_search() {
 #[test]
 fn late_joiner_gets_the_error_answer() {
     let mut config = Config::new(S1, []);
-    config.timeout = Duration::from_secs(2);
+    config.timeout = Duration::from_secs(2).into();
     let mut trace = Trace::new(Resolver::new(config));
     trace.query("example.com.", RecordType::A);
     let sent = trace.last();

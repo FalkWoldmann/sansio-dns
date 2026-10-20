@@ -12,7 +12,7 @@ use hickory_proto::rr::{Name, RData, RecordType};
 use insta::assert_snapshot;
 use proptest::prelude::*;
 use rstest::rstest;
-use sansio_dns::{Config, Error, Event, Resolver};
+use sansio_dns::{Config, Error, Event, FailureMemory, Resolver};
 use std::assert_matches;
 
 /// §2.3.3: name comparisons are case-insensitive, so a server that changes
@@ -570,7 +570,7 @@ mod section_7_2 {
     #[test]
     fn zero_failure_memory_always_starts_at_the_first_server() {
         let mut config = Config::new(S1, [S2]);
-        config.failure_memory = Duration::ZERO;
+        config.failure_memory = FailureMemory::OFF;
         let mut trace = Trace::new(Resolver::new(config));
         trace.query("a.example.", RecordType::A);
         trace.timeout();

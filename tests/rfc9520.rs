@@ -10,7 +10,7 @@ use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::RecordType;
 use insta::assert_snapshot;
 use rstest::rstest;
-use sansio_dns::{Config, Resolver};
+use sansio_dns::{Config, FailureCache, FailureMemory, Resolver};
 
 /// §3.1: "A resolver MUST NOT retry a given query to a server address over
 /// a given DNS transport more than twice (i.e., three queries in total)".
@@ -24,7 +24,7 @@ mod section_3_1 {
     /// `S1` alone, with `attempts` and the fixture's two-second timeout.
     fn one_server(attempts: usize) -> Trace {
         let mut config = Config::new(S1, []);
-        config.timeout = Duration::from_secs(2);
+        config.timeout = Duration::from_secs(2).into();
         config.attempts = NonZeroUsize::new(attempts).unwrap();
         Trace::new(Resolver::new(config))
     }
@@ -321,7 +321,7 @@ mod section_3_1 {
     #[test]
     fn repeated_hand_overs_cache_nothing() {
         let mut config = Config::new(S1, []);
-        config.timeout = Duration::from_secs(2);
+        config.timeout = Duration::from_secs(2).into();
         let mut trace = Trace::new(Resolver::new(config));
         let mut previous = trace.query("example.com.", RecordType::A);
         for at in [300, 600, 900] {
@@ -380,7 +380,7 @@ mod section_3_2 {
     /// changes: a `SERVFAIL` from it fails a query at once.
     fn one_server(change: impl FnOnce(&mut Config)) -> Trace {
         let mut config = Config::new(S1, []);
-        config.timeout = Duration::from_secs(2);
+        config.timeout = Duration::from_secs(2).into();
         change(&mut config);
         Trace::new(Resolver::new(config))
     }
@@ -425,7 +425,9 @@ mod section_3_2 {
     /// long, up to `failure_cache_max`.
     #[test]
     fn repeated_failures_back_off() {
-        let mut trace = one_server(|c| c.failure_cache_max = Duration::from_secs(4));
+        let mut trace = one_server(|c| {
+            c.failure_cache = FailureCache::new(Duration::from_secs(1), Duration::from_secs(4));
+        });
         let mut at = 0;
         for wait in [1, 2, 4, 4] {
             trace.at(Duration::from_secs(at));
@@ -480,8 +482,8 @@ mod section_3_2 {
         ");
     }
 
-    /// The first failure is cached for `failure_cache_min`: never less than
-    /// a second, and never more than five minutes, as `failure_cache_max`.
+    /// The first failure is cached for `FailureCache::shortest`: never less
+    /// than a second, and never more than five minutes, as the longest.
     #[rstest]
     #[case::default(None, None, 1)]
     #[case::configured(Some(5), None, 5)]
@@ -494,12 +496,14 @@ mod section_3_2 {
         #[case] secs: u64,
     ) {
         let mut trace = one_server(|c| {
-            if let Some(min) = min {
-                c.failure_cache_min = Duration::from_secs(min);
-            }
-            if let Some(max) = max {
-                c.failure_cache_max = Duration::from_secs(max);
-            }
+            let (shortest, longest) = (
+                FailureCache::default().shortest(),
+                FailureCache::default().longest(),
+            );
+            c.failure_cache = FailureCache::new(
+                min.map_or(shortest, Duration::from_secs),
+                max.map_or(longest, Duration::from_secs),
+            );
         });
         fail(&mut trace, "example.com.");
         let end = Duration::from_secs(secs);
@@ -517,8 +521,7 @@ mod section_3_2 {
     #[test]
     fn backoff_stops_at_five_minutes() {
         let mut trace = one_server(|c| {
-            c.failure_cache_min = Duration::from_secs(200);
-            c.failure_cache_max = Duration::MAX;
+            c.failure_cache = FailureCache::new(Duration::from_secs(200), Duration::MAX);
         });
         fail(&mut trace, "example.com.");
         trace.at(Duration::from_secs(200));
@@ -684,7 +687,7 @@ mod section_3_2 {
     #[test]
     fn query_in_flight_sends_nothing_more() {
         let mut config = config();
-        config.failure_cache_min = Duration::from_secs(5);
+        config.failure_cache = FailureCache::new(Duration::from_secs(5), Duration::from_secs(30));
         let mut trace = Trace::new(Resolver::new(config));
         trace.query("example.com.", RecordType::A);
         let first = trace.last();
@@ -842,7 +845,7 @@ mod section_3_2 {
     #[test]
     fn flush_forgets_everything() {
         let mut config = config();
-        config.failure_cache_min = Duration::from_secs(10);
+        config.failure_cache = FailureCache::new(Duration::from_secs(10), Duration::from_secs(30));
         let mut trace = Trace::new(Resolver::new(config));
         trace.query("b.example.com.", RecordType::A);
         for _ in 0..2 {
@@ -900,7 +903,7 @@ mod section_3_2 {
     #[test]
     fn failure_memory_is_capped_at_five_minutes() {
         let mut config = config();
-        config.failure_memory = Duration::MAX;
+        config.failure_memory = FailureMemory::new(Duration::MAX);
         let mut trace = Trace::new(Resolver::new(config));
         trace.query("a.example.", RecordType::A);
         trace.timeout();

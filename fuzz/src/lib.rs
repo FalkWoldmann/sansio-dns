@@ -104,9 +104,7 @@ impl Harness {
     /// absolute names.
     #[expect(clippy::disallowed_methods, reason = "the driver owns the clock")]
     pub fn new(config: Config, servers: Vec<SocketAddr>, max_sends: Option<usize>) -> Self {
-        let failure_cache = config
-            .failure_cache_min
-            .clamp(Duration::from_secs(1), Duration::from_secs(300));
+        let failure_cache = config.failure_cache.shortest();
         Self {
             resolver: Resolver::new(config),
             now: Instant::now(),

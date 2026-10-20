@@ -415,9 +415,9 @@
 //! the table): the server may have answered the cancelled queries' sockets.
 //!
 //! Each failure is cached for the candidate's question, for
-//! [`Config::failure_cache_min`] (one second by default, and never less) the
+//! [`FailureCache::shortest`] (one second by default, and never less) the
 //! first time. If the question fails again and was first sent within
-//! [`Config::failure_cache_max`] after its cached failure expired, it is
+//! [`FailureCache::longest`] after its cached failure expired, it is
 //! cached twice as long as the time before (§3.2's backoff), however long its
 //! retries took, up to that maximum: 30 seconds by default, and never more
 //! than five minutes (§3.2). A useful answer for the question, data,
@@ -486,7 +486,7 @@ mod resolver;
 mod tls;
 mod wire;
 
-pub use config::{Config, IpStrategy, ResolvEnv};
+pub use config::{Config, FailureCache, FailureMemory, IpStrategy, ResolvEnv, Timeout};
 pub use hosts::Hosts;
 pub use lookup::addresses;
 pub use resolver::Resolver;

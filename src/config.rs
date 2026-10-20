@@ -104,20 +104,141 @@ const _: () = {
     assert!(MAX_SENDS_PER_SERVER == 3);
 };
 
+/// `value` within `min` and `max`: `Ord::clamp` in a const context.
+const fn clamp(value: Duration, min: Duration, max: Duration) -> Duration {
+    if value.as_nanos() < min.as_nanos() {
+        min
+    } else if value.as_nanos() > max.as_nanos() {
+        max
+    } else {
+        value
+    }
+}
+
+/// How long a query waits for an answer on its first attempt: between one
+/// second and 300, whatever [`Timeout::new`] is given, the bounds RFC 1123
+/// §6.1.3.3 (5) asks for. The upper one is above the 240 seconds that
+/// section's limit must exceed (twice the maximum segment lifetime of RFC
+/// 9293, plus service delay). Each later round through the servers waits
+/// twice as long as the one before, up to 300 seconds, so [`Timeout::MAX`]
+/// waits 300 seconds on every attempt. Five seconds by default: without
+/// measured round trip times, §6.1.3.3 asks for no less.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Timeout(Duration);
+
+impl Timeout {
+    /// One second, the shortest wait.
+    pub const MIN: Self = Self(MIN_WAIT);
+    /// 300 seconds, the longest wait, before and after backoff.
+    pub const MAX: Self = Self(MAX_WAIT);
+
+    /// `wait`, within the bounds.
+    pub const fn new(wait: Duration) -> Self {
+        Self(clamp(wait, MIN_WAIT, MAX_WAIT))
+    }
+
+    /// The wait.
+    pub const fn get(self) -> Duration {
+        self.0
+    }
+}
+
+impl Default for Timeout {
+    fn default() -> Self {
+        Self(Duration::from_secs(5))
+    }
+}
+
+impl From<Duration> for Timeout {
+    fn from(wait: Duration) -> Self {
+        Self::new(wait)
+    }
+}
+
+/// How long a server that failed to answer stays failed: at most five
+/// minutes, whatever [`FailureMemory::new`] is given, the longest RFC 2308
+/// §7.2 and RFC 9520 §3.2 let a server be deemed dead. Zero turns it off.
+/// A minute by default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FailureMemory(Duration);
+
+impl FailureMemory {
+    /// Zero: a server that failed to answer is asked first again at once.
+    pub const OFF: Self = Self(Duration::ZERO);
+    /// Five minutes, the longest.
+    pub const MAX: Self = Self(MAX_FAILURE_MEMORY);
+
+    /// `memory`, within the bounds.
+    pub const fn new(memory: Duration) -> Self {
+        Self(clamp(memory, Duration::ZERO, MAX_FAILURE_MEMORY))
+    }
+
+    /// How long.
+    pub const fn get(self) -> Duration {
+        self.0
+    }
+}
+
+impl Default for FailureMemory {
+    fn default() -> Self {
+        Self(Duration::from_secs(60))
+    }
+}
+
+impl From<Duration> for FailureMemory {
+    fn from(memory: Duration) -> Self {
+        Self::new(memory)
+    }
+}
+
+/// How long resolution failures are cached (RFC 9520 §3.2): the first
+/// failure of a question for the shortest time, and each failure soon
+/// after the last one expired twice as long as before, up to the longest.
+/// Both are between one second and five minutes, whatever
+/// [`FailureCache::new`] is given, the bounds §3.2 sets, and the longest
+/// is never shorter than the shortest. One second and 30 seconds by
+/// default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FailureCache {
+    shortest: Duration,
+    longest: Duration,
+}
+
+impl FailureCache {
+    /// `shortest` and `longest`, within the bounds.
+    pub const fn new(shortest: Duration, longest: Duration) -> Self {
+        let shortest = clamp(shortest, MIN_FAILURE_CACHE, MAX_FAILURE_CACHE);
+        let longest = clamp(longest, shortest, MAX_FAILURE_CACHE);
+        Self { shortest, longest }
+    }
+
+    /// How long the first failure of a question is cached.
+    pub const fn shortest(self) -> Duration {
+        self.shortest
+    }
+
+    /// How long a failure is cached at most, after backoff.
+    pub const fn longest(self) -> Duration {
+        self.longest
+    }
+}
+
+impl Default for FailureCache {
+    fn default() -> Self {
+        Self::new(MIN_FAILURE_CACHE, Duration::from_secs(30))
+    }
+}
+
 /// Resolver settings.
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Name servers, tried in order and rotated on each retry. Never empty.
     servers: Vec<SocketAddr>,
-    /// How long to wait for a response before retrying, on each server's
-    /// first attempt. Each later round through the servers waits twice as
-    /// long as the one before (RFC 1123 §6.1.3.3 (5)). That section also
-    /// asks for a lower and an upper bound: a value below one second counts
-    /// as one second, and no wait is longer than 300 seconds, above the
-    /// 240 that the section's limit must exceed (twice the maximum segment
-    /// lifetime of RFC 9293, plus service delay). So `Duration::MAX` waits
-    /// 300 seconds on every attempt.
-    pub timeout: Duration,
+    /// How long a query waits for an answer on its first attempt, within
+    /// the bounds [`Timeout`] keeps: one to 300 seconds. Each later round
+    /// through the servers waits twice as long as the one before, up to
+    /// 300 seconds (RFC 1123 §6.1.3.3 (5)). Five seconds by default.
+    pub timeout: Timeout,
     /// Total number of attempts per query, across all servers: the first
     /// goes to the first server that hasn't failed recently (see
     /// `failure_memory`), and each next one to the server after, wrapping
@@ -175,12 +296,11 @@ pub struct Config {
     /// network error, stays failed: until then, new queries start at the
     /// next server in the list instead, and their attempts rotate on from
     /// there. An answer from the server, even an error code, ends it early.
-    /// Zero turns it off. At most five minutes: longer values count as five
-    /// minutes, the longest RFC 2308 §7.2 and RFC 9520 §3.2 let a server be
-    /// deemed dead. The failure is kept per server address, for every
-    /// query, as RFC 9520 §3.2 allows for unresponsive servers, and
+    /// A minute by default; [`FailureMemory`] keeps it within five minutes,
+    /// and zero turns it off. The failure is kept per server address, for
+    /// every query, as RFC 9520 §3.2 allows for unresponsive servers, and
     /// [`Resolver::flush_cache`](crate::Resolver::flush_cache) forgets it.
-    pub failure_memory: Duration,
+    pub failure_memory: FailureMemory,
     /// Static entries answered before DNS, like `/etc/hosts`. Empty by
     /// default; fill it with [`Hosts::parse`].
     pub hosts: Hosts,
@@ -207,21 +327,14 @@ pub struct Config {
     /// and then the oldest, which bounds the memory it takes, as RFC 9520
     /// §3.2 asks of a failure cache.
     pub cache_entries: NonZeroUsize,
-    /// How long a resolution failure is cached the first time: while it
-    /// is, nothing is sent for the question and queries for it fail at once
-    /// with the cached error (RFC 9520 §3.2). One second by default, the
-    /// least §3.2 allows: shorter values count as one second, and longer
-    /// ones than five minutes as five minutes.
-    pub failure_cache_min: Duration,
-    /// How long a resolution failure is cached at most. Each time a
-    /// question fails again, and was first sent less than this long after
-    /// its cached failure expired, it is cached twice as long as before
-    /// (the backoff RFC 9520 §3.2 asks for), however long its retries
-    /// took, up to this. A useful answer (data, NXDOMAIN or NODATA) for the
-    /// question starts it over. 30 seconds by default;
-    /// at least `failure_cache_min`, and at most five minutes, the longest
-    /// §3.2 allows.
-    pub failure_cache_max: Duration,
+    /// How long a resolution failure is cached: while it is, nothing is
+    /// sent for the question and queries for it fail at once with the
+    /// cached error (RFC 9520 §3.2). The first failure of a question lasts
+    /// [`FailureCache::shortest`], and each failure soon after the last one
+    /// expired twice as long as before, up to [`FailureCache::longest`]; a
+    /// useful answer (data, NXDOMAIN or NODATA) starts it over. One second
+    /// and 30 seconds by default.
+    pub failure_cache: FailureCache,
     /// How long a negative answer (NXDOMAIN or NODATA) is cached at most,
     /// whatever its SOA record says. One hour by default, the low end of
     /// the one to three hours RFC 2308 §5 recommends; it found more than a
@@ -255,19 +368,18 @@ impl Config {
         let attempts = NonZeroUsize::new(servers.len() * 2).unwrap_or(NonZeroUsize::MIN);
         Self {
             servers,
-            timeout: Duration::from_secs(5),
+            timeout: Timeout::default(),
             attempts,
             search: Vec::new(),
             unicast_local_zones: Vec::new(),
             ndots: 1,
             idle_timeout: Duration::from_secs(10),
-            failure_memory: Duration::from_secs(60),
+            failure_memory: FailureMemory::default(),
             hosts: Hosts::default(),
             ip_strategy: IpStrategy::default(),
             tld_query: true,
             cache_entries: DEFAULT_CACHE_ENTRIES,
-            failure_cache_min: MIN_FAILURE_CACHE,
-            failure_cache_max: Duration::from_secs(30),
+            failure_cache: FailureCache::default(),
             max_negative_ttl: Duration::from_secs(3600),
             #[cfg(feature = "tls")]
             tls: None,
@@ -429,7 +541,9 @@ impl Config {
         let mut config = Self::new(first, servers);
         let options = parsed.options;
         // 30 is glibc's RES_MAXRETRANS.
-        config.timeout = Duration::from_secs(options.timeout.clamp(1, 30).unsigned_abs());
+        config.timeout = Timeout::new(Duration::from_secs(
+            options.timeout.clamp(1, 30).unsigned_abs(),
+        ));
         // At most MAX_SENDS_PER_SERVER, not glibc's RES_MAXRETRY (5).
         let per_server =
             usize::try_from(options.attempts.clamp(1, MAX_SENDS_PER_SERVER.into())).unwrap_or(1);
@@ -511,17 +625,14 @@ impl Config {
     }
 
     /// How long an attempt in `round` waits for an answer: `timeout`,
-    /// doubled for each round through the servers before it, between
-    /// [`MIN_WAIT`] and [`MAX_WAIT`].
+    /// doubled for each round through the servers before it, at most
+    /// [`Timeout::MAX`].
     pub(crate) fn wait(&self, round: usize) -> Duration {
         let factor = u32::try_from(round)
             .ok()
             .and_then(|round| 1u32.checked_shl(round))
             .unwrap_or(u32::MAX);
-        self.timeout
-            .max(MIN_WAIT)
-            .saturating_mul(factor)
-            .min(MAX_WAIT)
+        self.timeout.get().saturating_mul(factor).min(MAX_WAIT)
     }
 
     /// When an attempt in `round` started at `now` times out: [`Config::wait`]
@@ -530,22 +641,6 @@ impl Config {
         // Only an `Instant` within minutes of the end of its range
         // overflows; the attempt then times out at once.
         now.checked_add(self.wait(round)).unwrap_or(now)
-    }
-
-    /// How long a server that failed to answer stays failed.
-    pub(crate) fn failed_for(&self) -> Duration {
-        self.failure_memory.min(MAX_FAILURE_MEMORY)
-    }
-
-    /// The shortest and the longest time a resolution failure is cached:
-    /// `failure_cache_min` and `failure_cache_max` within the bounds of RFC
-    /// 9520 §3.2, the longest no shorter than the shortest.
-    pub(crate) fn failure_cache(&self) -> (Duration, Duration) {
-        let shortest = self
-            .failure_cache_min
-            .clamp(MIN_FAILURE_CACHE, MAX_FAILURE_CACHE);
-        let longest = self.failure_cache_max.clamp(shortest, MAX_FAILURE_CACHE);
-        (shortest, longest)
     }
 
     pub(crate) fn servers(&self) -> &[SocketAddr] {
