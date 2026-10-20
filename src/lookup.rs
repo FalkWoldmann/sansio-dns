@@ -86,15 +86,33 @@ pub fn addresses(response: &Message) -> Result<Vec<IpAddr>, Error> {
 pub(crate) struct Lookup {
     pub(crate) id: LookupId,
     /// The queries for the current search candidate, one per record type
-    /// of `Config::ip_strategy`, in its order; the second is `None` when
-    /// only one family is asked for.
-    queries: [Option<QueryId>; 2],
-    /// The outcome of each query, filled as its event arrives: `None` while
-    /// its query runs, and for a type not asked for, which has no query.
-    /// The search candidate is done once each query has its outcome.
-    results: [Option<Result<Vec<IpAddr>, Error>>; 2],
+    /// of `Config::ip_strategy`, in its order, and how far each got. The
+    /// candidate is done once no slot is [`Slot::Running`].
+    slots: [Slot; 2],
     /// The search candidates still to try, as absolute names.
     rest: VecDeque<Name>,
+}
+
+/// One of the record types a [`Lookup`] may ask for, and how far its query
+/// for the current search candidate got.
+#[derive(Debug)]
+pub(crate) enum Slot {
+    /// Not asked for: `Config::ip_strategy` leaves this family out.
+    NotAsked,
+    /// Its query is running.
+    Running(QueryId),
+    /// Its query ended with these addresses, or this error.
+    Done(Result<Vec<IpAddr>, Error>),
+}
+
+impl Slot {
+    /// Its query, while it runs.
+    pub(crate) const fn running(&self) -> Option<QueryId> {
+        match self {
+            Self::Running(query) => Some(*query),
+            Self::NotAsked | Self::Done(_) => None,
+        }
+    }
 }
 
 /// Where a [`Lookup`] goes after one of its queries ended.
@@ -116,25 +134,20 @@ pub(crate) enum Step {
 }
 
 impl Lookup {
-    /// A lookup waiting for `queries`, with the search candidates in `rest`
-    /// still to try.
-    pub(crate) fn new(id: LookupId, queries: [Option<QueryId>; 2], rest: VecDeque<Name>) -> Self {
-        Self {
-            id,
-            queries,
-            results: [None, None],
-            rest,
-        }
+    /// A lookup waiting for the queries in `slots`, with the search
+    /// candidates in `rest` still to try.
+    pub(crate) const fn new(id: LookupId, slots: [Slot; 2], rest: VecDeque<Name>) -> Self {
+        Self { id, slots, rest }
     }
 
     /// The queries still running for the current search candidate. They
     /// change when the search moves on.
     pub(crate) fn queries(&self) -> impl Iterator<Item = QueryId> + use<> {
-        let running = self
-            .queries
+        self.slots
+            .each_ref()
+            .map(Slot::running)
             .into_iter()
-            .zip(self.results.each_ref().map(Option::is_none));
-        running.filter_map(|(query, running)| query.filter(|_| running))
+            .flatten()
     }
 
     /// Whether `query` is one of its running queries.
@@ -150,18 +163,17 @@ impl Lookup {
             Event::Failed { query, error } => (query, Err(error.clone())),
         };
         let slot = self
-            .queries
-            .iter()
-            .zip(&mut self.results)
-            .find_map(|(q, slot)| (*q == Some(*query) && slot.is_none()).then_some(slot));
+            .slots
+            .iter_mut()
+            .find(|slot| slot.running() == Some(*query));
         if let Some(slot) = slot {
-            *slot = Some(result);
+            *slot = Slot::Done(result);
         }
-        let outcome = match (self.queries, std::mem::take(&mut self.results)) {
-            (_, [Some(first), Some(second)]) => merge(first, second),
-            ([_, None], [Some(only), None]) => only,
-            (_, results) => {
-                self.results = results;
+        let outcome = match std::mem::replace(&mut self.slots, [Slot::NotAsked, Slot::NotAsked]) {
+            [Slot::Done(first), Slot::Done(second)] => merge(first, second),
+            [Slot::Done(only), Slot::NotAsked] | [Slot::NotAsked, Slot::Done(only)] => only,
+            slots => {
+                self.slots = slots;
                 return Step::Wait;
             }
         };
@@ -174,8 +186,8 @@ impl Lookup {
 
     /// The queries for the search candidate of its last [`Step::Next`]
     /// started.
-    pub(crate) fn sent(&mut self, queries: [Option<QueryId>; 2]) {
-        self.queries = queries;
+    pub(crate) fn sent(&mut self, slots: [Slot; 2]) {
+        self.slots = slots;
     }
 }
 

@@ -19,6 +19,9 @@ use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
 /// EDNS UDP payload size recommended by DNS Flag Day 2020.
 pub(crate) const EDNS_PAYLOAD: u16 = 1232;
 
+// RFC 6891 §6.2.5: 512 is the least a requestor may advertise.
+const _: () = assert!(EDNS_PAYLOAD >= 512);
+
 /// Prefix `message` with its two-byte length (RFC 7766 §8).
 pub(crate) fn frame(message: &[u8]) -> Vec<u8> {
     // A single-question query stays below 500 octets, far from the limit.
@@ -314,5 +317,7 @@ pub(crate) fn clamp_ttls(response: &mut Message) {
 /// ANY stays allowed (RFC 8482), and so do the unassigned codes from 129
 /// to 248, which future QTYPEs may take.
 pub(crate) fn is_meta_type(record_type: RecordType) -> bool {
+    // TYPE0, OPT, NXNAME, and TKEY, TSIG, IXFR, AXFR, MAILB, MAILA; hickory
+    // has no variant for some of them.
     matches!(u16::from(record_type), 0 | 41 | 128 | 249..=254)
 }

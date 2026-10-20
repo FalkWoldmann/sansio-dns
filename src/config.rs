@@ -1,7 +1,7 @@
 //! Resolver settings, and reading them from a `resolv.conf`.
 
 use std::collections::VecDeque;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::num::NonZeroUsize;
 #[cfg(feature = "tls")]
 use std::sync::Arc;
@@ -48,7 +48,7 @@ pub enum IpStrategy {
 
 impl IpStrategy {
     /// The record types to ask for, in the order their addresses are listed.
-    pub(crate) fn record_types(self) -> (RecordType, Option<RecordType>) {
+    pub(crate) const fn record_types(self) -> (RecordType, Option<RecordType>) {
         match self {
             Self::Ipv4Only => (RecordType::A, None),
             Self::Ipv6Only => (RecordType::AAAA, None),
@@ -81,6 +81,28 @@ const MAX_FAILURE_CACHE: Duration = Duration::from_secs(300);
 /// How often a search candidate may be sent to one server over one
 /// transport (RFC 9520 §3.1).
 pub(crate) const MAX_SENDS_PER_SERVER: u8 = 3;
+
+/// How many entries the cache holds by default.
+const DEFAULT_CACHE_ENTRIES: NonZeroUsize = NonZeroUsize::new(1024).expect("1024 is not zero");
+
+/// The local host on port 53: the server glibc asks when a `resolv.conf`
+/// names no usable one.
+const LOCALHOST_DNS: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53));
+
+// The bounds above in the relations the RFCs ask for, checked when the
+// crate compiles.
+const _: () = {
+    assert!(MIN_WAIT.as_secs() <= MAX_WAIT.as_secs());
+    // RFC 1123 §6.1.3.3 (5): the longest wait must exceed twice the
+    // maximum segment lifetime of two minutes (RFC 9293 §3.4.2).
+    assert!(MAX_WAIT.as_secs() > 240);
+    assert!(MIN_FAILURE_CACHE.as_secs() <= MAX_FAILURE_CACHE.as_secs());
+    // RFC 9520 §3.2 and RFC 2308 §7.2: five minutes at most.
+    assert!(MAX_FAILURE_CACHE.as_secs() <= 300);
+    assert!(MAX_FAILURE_MEMORY.as_secs() <= 300);
+    // RFC 9520 §3.1: three sends per server and transport.
+    assert!(MAX_SENDS_PER_SERVER == 3);
+};
 
 /// Resolver settings.
 #[derive(Clone, Debug)]
@@ -243,7 +265,7 @@ impl Config {
             hosts: Hosts::default(),
             ip_strategy: IpStrategy::default(),
             tld_query: true,
-            cache_entries: NonZeroUsize::new(1024).unwrap_or(NonZeroUsize::MIN),
+            cache_entries: DEFAULT_CACHE_ENTRIES,
             failure_cache_min: MIN_FAILURE_CACHE,
             failure_cache_max: Duration::from_secs(30),
             max_negative_ttl: Duration::from_secs(3600),
@@ -327,7 +349,7 @@ impl Config {
     }
 
     /// Whether queries go over TLS, and so over a stream from the start.
-    pub(crate) fn uses_tls(&self) -> bool {
+    pub(crate) const fn uses_tls(&self) -> bool {
         #[cfg(feature = "tls")]
         return self.tls.is_some();
         #[cfg(not(feature = "tls"))]
@@ -403,9 +425,7 @@ impl Config {
         let parsed = ResolvConf::parse(text, env);
         // glibc's MAXNS: later servers are ignored.
         let mut servers = parsed.servers.into_iter().take(3);
-        let first = servers
-            .next()
-            .unwrap_or_else(|| SocketAddr::from((Ipv4Addr::LOCALHOST, 53)));
+        let first = servers.next().unwrap_or(LOCALHOST_DNS);
         let mut config = Self::new(first, servers);
         let options = parsed.options;
         // 30 is glibc's RES_MAXRETRANS.
@@ -542,7 +562,7 @@ impl Config {
 
 /// `server`, with the unspecified address replaced by the loopback address
 /// of its family, keeping the port; see [`Config::new`].
-fn loopback_if_unspecified(mut server: SocketAddr) -> SocketAddr {
+const fn loopback_if_unspecified(mut server: SocketAddr) -> SocketAddr {
     if server.ip().is_unspecified() {
         server.set_ip(match server {
             SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -724,7 +744,7 @@ fn lines(text: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 /// Whether `byte` separates words on a `resolv.conf` line, as for glibc.
-fn is_blank(byte: u8) -> bool {
+const fn is_blank(byte: u8) -> bool {
     byte == b' ' || byte == b'\t'
 }
 

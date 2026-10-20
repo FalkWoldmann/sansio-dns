@@ -133,6 +133,39 @@ struct Failure {
     forget: Instant,
 }
 
+impl Failure {
+    /// How a new failure of the question relates to this one, by when its
+    /// query was first sent (`sent`).
+    fn backoff(&self, sent: Instant) -> Backoff {
+        if sent < self.until {
+            Backoff::Overlapping {
+                duration: self.duration,
+                until: self.until,
+            }
+        } else if sent < self.forget {
+            Backoff::Doubled(self.duration)
+        } else {
+            Backoff::Fresh
+        }
+    }
+}
+
+/// How long to cache a failure of a question, given the one cached before
+/// it, if any (`Failure::backoff`).
+#[derive(Debug)]
+enum Backoff {
+    /// The query was first sent while the previous failure was still live,
+    /// as when two queries for the question were in flight at once: as
+    /// long as before, and no earlier than `until`.
+    Overlapping { duration: Duration, until: Instant },
+    /// The query was first sent within `Config::failure_cache_max` after
+    /// the previous failure expired: twice as long as before (RFC 9520
+    /// §3.2).
+    Doubled(Duration),
+    /// No previous failure, or one long expired: the shortest time.
+    Fresh,
+}
+
 /// What the cache holds for a question.
 #[derive(Debug)]
 pub(crate) enum Hit {
@@ -266,24 +299,21 @@ impl Cache {
     ) {
         let (shortest, longest) = config.failure_cache();
         let (key, _) = Key::of(question);
-        let previous = self.entries.get(&key).and_then(|slot| match &slot.entry {
-            Entry::Failed(previous) => Some((previous.until, previous.duration, previous.forget)),
-            Entry::Negative(_) => None,
-        });
         // Lookups keep failure entries after they expire, so the previous
         // one is still here unless an answer ended it or the size bound
         // needed room.
-        let (duration, at_least) = match previous {
-            Some((until, duration, _)) if sent < until => (duration, Some(until)),
-            Some((_, duration, forget)) if sent < forget => {
-                (duration.saturating_mul(2).clamp(shortest, longest), None)
-            }
-            _ => (shortest, None),
+        let backoff = match self.entries.get(&key).map(|slot| &slot.entry) {
+            Some(Entry::Failed(previous)) => previous.backoff(sent),
+            Some(Entry::Negative(_)) | None => Backoff::Fresh,
         };
-        let until = now
-            .checked_add(duration)
-            .unwrap_or(now)
-            .max(at_least.unwrap_or(now));
+        let (duration, at_least) = match backoff {
+            Backoff::Overlapping { duration, until } => (duration, until),
+            Backoff::Doubled(previous) => {
+                (previous.saturating_mul(2).clamp(shortest, longest), now)
+            }
+            Backoff::Fresh => (shortest, now),
+        };
+        let until = now.checked_add(duration).unwrap_or(now).max(at_least);
         let forget = until.checked_add(longest).unwrap_or(until);
         let entry = Entry::Failed(Failure {
             error,
@@ -357,6 +387,6 @@ fn negative_ttl(response: &Message, question: &Query, config: &Config) -> Option
 }
 
 /// `ttl`, or zero if its most significant bit is set (RFC 2181 §8).
-fn sane_ttl(ttl: u32) -> u32 {
+const fn sane_ttl(ttl: u32) -> u32 {
     if ttl & (1 << 31) == 0 { ttl } else { 0 }
 }

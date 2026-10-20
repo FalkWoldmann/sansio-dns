@@ -127,7 +127,10 @@ with the code.
   `wire::protect` adds the EDNS Client Subnet privacy option (prefix 0, FAMILY of the
   server's address, RFC 8310 §11.1) and then the padding, last; `emit` runs it again when a
   query moves to a server of the other family. `Config::with_tls_names` holds an
-  authentication name per server.
+  authentication name per server. In `resolver.rs` the TLS session is touched only in
+  `Connection::open` (the ClientHello), `encrypt` (a write), `receive` (bytes read) and
+  `closing_bytes` (the alert or close_notify before a `TcpClose`), and in the two `protect`
+  calls: `connect`, `write` and `shut` have no `cfg`.
 - Whatever happens to a query's current attempt reaches it as an `Input` to `act_on`: a
   reply (`handle_reply`, which first takes the server off `Resolver::failed`), no answer
   (`time_out`, `handle_udp_error`, `End::TlsError`), its connection lost or ended by the
@@ -283,7 +286,11 @@ values. `tests/rfc2308.rs` and `rfc9520.rs`'s §3.2 module hold the cache lifecy
 ## Conventions
 
 - Workspace lints are strict: clippy denies `unwrap`, `expect`, indexing, `panic` and more, and
-  `allow_attributes`, so use `#[expect(..., reason = "...")]` instead of `#[allow]`.
+  `allow_attributes`, so use `#[expect(..., reason = "...")]` instead of `#[allow]`. It also
+  denies `missing_const_for_fn`: make a function `const` when clippy asks, and `expect` the
+  lint under `cfg_attr(not(feature = "tls"), ...)` at a TLS seam where only the session keeps
+  it from being const. Bounds the RFCs set are checked at compile time in `const _: () =
+  assert!(...)` blocks next to the constants; add to those rather than to comments.
 - Dependency versions are pinned to the major version only (`tokio = "1"`, `rustls = "0.23"`);
   `Cargo.lock` holds the exact ones.
 - Error types derive `thiserror::Error`; the core's `Error` stays `Clone + Eq` plain data.

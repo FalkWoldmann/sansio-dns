@@ -60,7 +60,7 @@ use hickory_proto::rr::{Name, RecordType};
 
 use crate::cache::{Cache, Hit};
 use crate::config::MAX_SENDS_PER_SERVER;
-use crate::lookup::{Lookup, Step};
+use crate::lookup::{Lookup, Slot, Step};
 #[cfg(feature = "tls")]
 use crate::tls;
 use crate::wire::{
@@ -76,6 +76,9 @@ use crate::{Config, ConnectionId, Error, Event, LookupId, QueryId, Transmit, Tra
 /// drops some queries on a busy connection, which never goes idle, would
 /// otherwise use up the ID space (RFC 7766 §6.2.1, §6.2.4).
 const MAX_ORPHANS: usize = 256;
+
+// Orphans keep message IDs in use, and there are only 65536 of those.
+const _: () = assert!(MAX_ORPHANS < 1 << 16);
 
 /// A query in flight that is sent, for itself and the queries that joined
 /// it.
@@ -226,7 +229,7 @@ impl Attempt {
     /// rotation. The deadline is a placeholder that the candidate's first
     /// `Resolver::emit` replaces, or that goes with the query if a cached
     /// failure ends it there.
-    fn first(first: usize, now: Instant) -> Self {
+    const fn first(first: usize, now: Instant) -> Self {
         Self {
             position: first,
             used: 0,
@@ -266,7 +269,7 @@ impl Candidate {
 
     /// Use up its free resend (`free_resend_used`), which it has once:
     /// true if it still had it.
-    fn use_free_resend(&mut self) -> bool {
+    const fn use_free_resend(&mut self) -> bool {
         !std::mem::replace(&mut self.free_resend_used, true)
     }
 }
@@ -596,10 +599,88 @@ enum Ending {
 }
 
 impl Connection {
+    /// A connection to `server` opened at `now`, and the bytes to open it
+    /// with: the ClientHello of its TLS session with `config.tls`, none
+    /// without. Fails if rustls can't start the session.
+    #[cfg_attr(
+        not(feature = "tls"),
+        expect(
+            clippy::unnecessary_wraps,
+            clippy::missing_const_for_fn,
+            reason = "only TLS settings can make opening fail, or keep it from being const"
+        )
+    )]
+    fn open(config: &Config, server: SocketAddr, now: Instant) -> Result<(Self, Vec<u8>), Error> {
+        #[cfg(feature = "tls")]
+        let (tls, hello) = match &config.tls {
+            Some(settings) => {
+                let (session, hello) = settings.connect(server).map_err(Error::Tls)?;
+                (Some(Box::new(session)), hello)
+            }
+            None => (None, Vec::new()),
+        };
+        #[cfg(not(feature = "tls"))]
+        let hello = {
+            let _ = config;
+            Vec::new()
+        };
+        let conn = Self {
+            server,
+            received: Vec::new(),
+            last_active: now,
+            responses: 0,
+            orphans: Vec::new(),
+            closing: false,
+            #[cfg(feature = "tls")]
+            tls,
+        };
+        Ok((conn, hello))
+    }
+
     /// Whether it takes queries to `server`: it goes to `server`, and its
     /// TLS session, if it has one, hasn't ended (`closing`).
     fn is_open_to(&self, server: SocketAddr) -> bool {
         self.server == server && !self.closing
+    }
+
+    /// The bytes to write for `message`: its TLS records if it has a
+    /// session, which holds the message until the handshake is done and
+    /// then returns nothing yet, and the message itself without one. On an
+    /// error the session may have taken part of it, so the connection
+    /// can't be used any more.
+    #[cfg_attr(
+        not(feature = "tls"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "only a TLS session can refuse a write"
+        )
+    )]
+    fn encrypt(&mut self, message: &[u8]) -> Result<Vec<u8>, Error> {
+        #[cfg(feature = "tls")]
+        if let Some(session) = &mut self.tls {
+            return session.send(message).map_err(Error::Tls);
+        }
+        Ok(message.to_vec())
+    }
+
+    /// The last bytes to write before closing it: what its TLS session has
+    /// left to send, ending with the alert rustls queued for a TLS error
+    /// (RFC 8446 §6.2) or else close_notify (§6.1), none after an alert
+    /// from the server that rustls reported as the error (§6), and none
+    /// without a session.
+    #[cfg_attr(
+        not(feature = "tls"),
+        expect(
+            clippy::missing_const_for_fn,
+            reason = "only a TLS session keeps it from being const"
+        )
+    )]
+    fn closing_bytes(&mut self) -> Vec<u8> {
+        #[cfg(feature = "tls")]
+        if let Some(session) = &mut self.tls {
+            return session.close();
+        }
+        Vec::new()
     }
 
     /// Take in `data` read from it, through the TLS session if it has one.
@@ -674,6 +755,19 @@ impl Orphan {
     fn is(&self, pending: &Pending) -> bool {
         self.id == pending.candidate.request.metadata.id
             && self.question == pending.candidate.request.queries
+    }
+}
+
+/// The numbers for the handles of one kind, given out in order from zero.
+#[derive(Debug, Default)]
+struct Counter(u64);
+
+impl Counter {
+    /// The next number.
+    const fn issue(&mut self) -> u64 {
+        let number = self.0;
+        self.0 += 1;
+        number
     }
 }
 
@@ -788,9 +882,9 @@ fn event(query: QueryId, outcome: Result<Message, Error>) -> Event {
 /// The resolver state machine. See the crate docs for how to drive it.
 pub struct Resolver {
     config: Config,
-    next_query: u64,
+    query_ids: Counter,
     pending: BTreeMap<QueryId, Pending>,
-    next_connection: u64,
+    connection_ids: Counter,
     connections: BTreeMap<ConnectionId, Connection>,
     /// Servers whose last attempt failed without an answer, and until when
     /// new queries start after them (`Config::failure_memory`).
@@ -802,7 +896,7 @@ pub struct Resolver {
     /// How many of `events`, from the front, the lookups were handed
     /// (`run_lookups`): all of them between inputs.
     handed: usize,
-    next_lookup: u64,
+    lookup_ids: Counter,
     /// The address lookups running. Each waits for queries no other one
     /// started.
     lookups: Vec<Lookup>,
@@ -829,16 +923,16 @@ impl Resolver {
     pub fn new(config: Config) -> Self {
         Self {
             config,
-            next_query: 0,
+            query_ids: Counter::default(),
             pending: BTreeMap::new(),
-            next_connection: 0,
+            connection_ids: Counter::default(),
             connections: BTreeMap::new(),
             failed: BTreeMap::new(),
             cache: Cache::default(),
             transmits: VecDeque::new(),
             events: VecDeque::new(),
             handed: 0,
-            next_lookup: 0,
+            lookup_ids: Counter::default(),
             lookups: Vec::new(),
             looked_up: VecDeque::new(),
         }
@@ -1389,10 +1483,9 @@ impl Resolver {
             let mut rest = self.config.candidates(&name);
             (rest.pop_front().unwrap_or(absolute), rest)
         };
-        let queries = self.start_lookup_queries(&first, local, now)?;
-        let id = LookupId(self.next_lookup);
-        self.next_lookup += 1;
-        self.lookups.push(Lookup::new(id, queries, rest));
+        let slots = self.start_lookup_queries(&first, local, now)?;
+        let id = LookupId(self.lookup_ids.issue());
+        self.lookups.push(Lookup::new(id, slots, rest));
         Ok(id)
     }
 
@@ -1404,24 +1497,24 @@ impl Resolver {
         name: &Name,
         hosts: bool,
         now: Instant,
-    ) -> Result<[Option<QueryId>; 2], ProtoError> {
+    ) -> Result<[Slot; 2], ProtoError> {
         let (first, second) = self.config.ip_strategy.record_types();
-        let mut queries = [None, None];
-        for (slot, record_type) in queries.iter_mut().zip([Some(first), second]) {
+        let mut slots = [Slot::NotAsked, Slot::NotAsked];
+        for (slot, record_type) in slots.iter_mut().zip([Some(first), second]) {
             let Some(record_type) = record_type else {
                 continue;
             };
             match self.start(name.clone(), record_type, hosts, now) {
-                Ok(query) => *slot = Some(query),
+                Ok(query) => *slot = Slot::Running(query),
                 Err(error) => {
-                    for query in queries.into_iter().flatten() {
+                    for query in slots.iter().filter_map(Slot::running) {
                         self.cancel_query(query, now);
                     }
                     return Err(error);
                 }
             }
         }
-        Ok(queries)
+        Ok(slots)
     }
 
     /// Hand each event queued since the last call to the lookup waiting for
@@ -1440,8 +1533,8 @@ impl Resolver {
             let outcome = match lookup.handle(event) {
                 Step::Wait => None,
                 Step::Next(candidate) => match self.start_lookup_queries(&candidate, false, now) {
-                    Ok(queries) => {
-                        lookup.sent(queries);
+                    Ok(slots) => {
+                        lookup.sent(slots);
                         None
                     }
                     // The outcome so far, an empty list, stands if the next
@@ -1477,8 +1570,7 @@ impl Resolver {
         }
         let mut absolute = name.clone();
         absolute.set_fqdn(true);
-        let id = QueryId(self.next_query);
-        self.next_query += 1;
+        let id = QueryId(self.query_ids.issue());
         let local = if is_special_use(&absolute) {
             Some(local_answer(&absolute, record_type))
         } else {
@@ -2077,44 +2169,18 @@ impl Resolver {
     // A connection's transitions: opening, writing, matching what it reads,
     // and closing.
 
-    /// Open a connection to `server` with `message` as its first query.
-    #[cfg_attr(
-        not(feature = "tls"),
-        expect(
-            clippy::unnecessary_wraps,
-            reason = "only TLS settings can make connecting fail"
-        )
-    )]
+    /// Open a connection to `server` with `message` as its first query:
+    /// over TLS the ClientHello goes out and the message waits for the
+    /// handshake. Fails if a TLS session can't be started.
     fn connect(
         &mut self,
         server: SocketAddr,
         message: &[u8],
         now: Instant,
     ) -> Result<ConnectionId, Error> {
-        let connection = ConnectionId(self.next_connection);
-        self.next_connection += 1;
-        #[cfg(feature = "tls")]
-        let (tls, payload) = match &self.config.tls {
-            Some(settings) => {
-                let (mut session, hello) = settings.connect(server).map_err(Error::Tls)?;
-                // Waits for the handshake: nothing comes of it yet.
-                session.send(message).map_err(Error::Tls)?;
-                (Some(Box::new(session)), hello)
-            }
-            None => (None, message.to_vec()),
-        };
-        #[cfg(not(feature = "tls"))]
-        let payload = message.to_vec();
-        let conn = Connection {
-            server,
-            received: Vec::new(),
-            last_active: now,
-            responses: 0,
-            orphans: Vec::new(),
-            closing: false,
-            #[cfg(feature = "tls")]
-            tls,
-        };
+        let connection = ConnectionId(self.connection_ids.issue());
+        let (mut conn, mut payload) = Connection::open(&self.config, server, now)?;
+        payload.extend(conn.encrypt(message)?);
         self.connections.insert(connection, conn);
         self.transmits.push_back(Transmit {
             transport: Transport::TcpConnect(connection),
@@ -2127,13 +2193,6 @@ impl Resolver {
     /// Write `message` to an open connection. Over TLS it waits in the
     /// session until the handshake is done. On an error, the session may
     /// have taken part of it, so the connection can't be used any more.
-    #[cfg_attr(
-        not(feature = "tls"),
-        expect(
-            clippy::unnecessary_wraps,
-            reason = "only a TLS session can refuse a write"
-        )
-    )]
     fn write(
         &mut self,
         connection: ConnectionId,
@@ -2144,13 +2203,7 @@ impl Resolver {
             return Ok(());
         };
         conn.last_active = now;
-        #[cfg(feature = "tls")]
-        let payload = match &mut conn.tls {
-            Some(session) => session.send(message).map_err(Error::Tls)?,
-            None => message.to_vec(),
-        };
-        #[cfg(not(feature = "tls"))]
-        let payload = message.to_vec();
+        let payload = conn.encrypt(message)?;
         let server = conn.server;
         self.queue_write(connection, server, payload);
         Ok(())
@@ -2198,8 +2251,10 @@ impl Resolver {
                     .filter(|&i| conn.orphans.get(i).is_some_and(|o| reply.responds_to(o.id)))
                     .map(Matched::Orphan),
             );
-        let only = candidates.next();
-        candidates.next().map_or(only, |_| None)
+        match (candidates.next(), candidates.next()) {
+            (Some(only), None) => Some(only),
+            (None, _) | (Some(_), Some(_)) => None,
+        }
     }
 
     /// End `connection` for the reason `end`: forget it, with a `TcpClose`
@@ -2239,15 +2294,9 @@ impl Resolver {
     /// reported as the error (`tls::Session::alerted`), as after an error
     /// alert (§6).
     fn shut(&mut self, connection: ConnectionId) -> Option<Connection> {
-        #[cfg_attr(
-            not(feature = "tls"),
-            expect(unused_mut, reason = "only TLS changes it")
-        )]
         let mut conn = self.connections.remove(&connection)?;
-        #[cfg(feature = "tls")]
-        if let Some(session) = &mut conn.tls {
-            self.queue_write(connection, conn.server, session.close());
-        }
+        let last = conn.closing_bytes();
+        self.queue_write(connection, conn.server, last);
         self.transmits.push_back(Transmit {
             transport: Transport::TcpClose(connection),
             destination: conn.server,

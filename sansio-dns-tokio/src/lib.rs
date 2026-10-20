@@ -584,9 +584,7 @@ struct Io {
     /// Timers that abort the tasks of connections that take longer than
     /// `CLOSE_GRACE` to close.
     grace: JoinSet<()>,
-    /// Each query's socket, the server it is connected to, and the task
-    /// forwarding what it receives.
-    sockets: HashMap<QueryId, (Arc<UdpSocket>, SocketAddr, AbortHandle)>,
+    sockets: HashMap<QueryId, Socket>,
     streams: HashMap<ConnectionId, Stream>,
     /// Connections whose task reported their end. Their write queues are
     /// dropped once the transmits queued before the report are carried
@@ -594,6 +592,14 @@ struct Io {
     /// close_notify.
     ended: Vec<ConnectionId>,
     input: mpsc::UnboundedSender<Input>,
+}
+
+/// A query's socket, connected to one server, and the task forwarding
+/// what it receives.
+struct Socket {
+    socket: Arc<UdpSocket>,
+    server: SocketAddr,
+    task: AbortHandle,
 }
 
 /// A connection's write queue and task.
@@ -691,8 +697,8 @@ impl Io {
     /// left. Called once the resolver's last transmits, which close its
     /// connections, are carried out.
     async fn close(mut self) {
-        for (_, (_, _, task)) in self.sockets.drain() {
-            task.abort();
+        for (_, socket) in self.sockets.drain() {
+            socket.task.abort();
         }
         self.ended.clear();
         let streams: Vec<Stream> = self.streams.drain().map(|(_, stream)| stream).collect();
@@ -724,11 +730,11 @@ impl Io {
     /// server.
     async fn socket(&mut self, query: QueryId, to: SocketAddr) -> io::Result<Arc<UdpSocket>> {
         if let Entry::Occupied(entry) = self.sockets.entry(query) {
-            let (socket, peer, _) = entry.get();
-            if *peer == to {
-                return Ok(Arc::clone(socket));
+            let existing = entry.get();
+            if existing.server == to {
+                return Ok(Arc::clone(&existing.socket));
             }
-            entry.remove().2.abort();
+            entry.remove().task.abort();
         }
         let any = match to {
             SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -742,14 +748,19 @@ impl Io {
             to,
             self.input.clone(),
         ));
-        self.sockets.insert(query, (Arc::clone(&socket), to, task));
+        let entry = Socket {
+            socket: Arc::clone(&socket),
+            server: to,
+            task,
+        };
+        self.sockets.insert(query, entry);
         Ok(socket)
     }
 
     /// Close the socket of `query`, which is over.
     fn forget(&mut self, query: QueryId) {
-        if let Some((_, _, task)) = self.sockets.remove(&query) {
-            task.abort();
+        if let Some(socket) = self.sockets.remove(&query) {
+            socket.task.abort();
         }
     }
 }
